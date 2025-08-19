@@ -26,7 +26,7 @@ def get_documents_to_process():
                    NVL(q.face, 0) as face
             FROM PROFILE p
             LEFT JOIN TAGGING_QUEUE q ON p.docnumber = q.docnumber
-            WHERE p.form = :form_id and p.docnumber = 19664382
+            WHERE p.form = :form_id and p.docnumber >= 19664382 AND p.ABSTRACT IS NULL
             FETCH FIRST 10 ROWS ONLY
             """
             # AND (q.status IS NULL OR q.status != '4')

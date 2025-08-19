@@ -40,7 +40,7 @@ def process_document(doc, dms_session_token):
             if captions is not None: 
                 o_detected_status = 1
                 if captions and captions.strip():
-                    new_abstract += f"\n\ {captions}"
+                    new_abstract += f"\n {captions}"
 
         if not ocr_status:
             ocr_text = api_client.get_ocr_text(image_bytes, filename)
@@ -53,7 +53,11 @@ def process_document(doc, dms_session_token):
             if recognized_faces is not None:
                 face_status = 1
                 if recognized_faces:
-                    known_face_names = [face.get('name') for face in recognized_faces if face.get('name') != 'Unknown']
+                    known_face_names = [
+                        face.get('name').replace('_', ' ').title() 
+                        for face in recognized_faces 
+                        if face.get('name') and face.get('name') != 'Unknown'
+                    ]
                     
                     if known_face_names:
                         vips = ", ".join(known_face_names)
