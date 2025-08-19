@@ -2,3 +2,4 @@ Flask
 oracledb
 requests
 python-dotenv
+zeep
