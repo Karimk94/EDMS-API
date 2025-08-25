@@ -3,3 +3,4 @@ oracledb
 requests
 python-dotenv
 zeep
+flask-cors
