@@ -21,7 +21,7 @@ def process_document(doc, dms_session_token):
     o_detected_status = doc.get('o_detected', 0)
     ocr_status = doc.get('ocr', 0)
     face_status = doc.get('face', 0)
-    final_status = '1'
+    final_status = doc.get('status', 1)
     error_message = ''
     transcript_text = ''
 
@@ -64,12 +64,12 @@ def process_document(doc, dms_session_token):
                         new_abstract += f", VIPs: {vips}"
         
         if o_detected_status and ocr_status and face_status:
-            final_status = '4'
+            final_status = 3
 
     except Exception as e:
         logging.error(f"Error processing document {docnumber}", exc_info=True)
         error_message = str(e)
-        final_status = '99'
+        final_status = 2
 
     finally:
         db_connector.update_document_processing_status(
