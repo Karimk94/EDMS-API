@@ -23,12 +23,14 @@ def get_documents_to_process():
             SELECT p.docnumber, p.abstract,
                    NVL(q.o_detected, 0) as o_detected, 
                    NVL(q.OCR, 0) as ocr, 
-                   NVL(q.face, 0) as face
+                   NVL(q.face, 0) as face,
+                   NVL(q.attempts, 0) as attempts
             FROM PROFILE p
             LEFT JOIN TAGGING_QUEUE q ON p.docnumber = q.docnumber
             WHERE p.form = :form_id 
               AND p.docnumber >= 19662092
               AND (q.STATUS <> 3 OR q.STATUS IS NULL)
+              AND q.attempts <= 3
             FETCH FIRST 10 ROWS ONLY
             """
             cursor.execute(sql, {'form_id': 2740})
@@ -38,7 +40,7 @@ def get_documents_to_process():
             conn.close()
     return []
 
-def update_document_processing_status(docnumber, new_abstract, o_detected, ocr, face, status, error, transcript):
+def update_document_processing_status(docnumber, new_abstract, o_detected, ocr, face, status, error, transcript, attempts):
     conn = get_connection()
     if conn:
         cursor = conn.cursor()
@@ -49,15 +51,15 @@ def update_document_processing_status(docnumber, new_abstract, o_detected, ocr, 
             USING (SELECT :docnumber AS docnumber FROM dual) src ON (q.docnumber = src.docnumber)
             WHEN MATCHED THEN
                 UPDATE SET q.o_detected = :o_detected, q.OCR = :ocr, q.face = :face,
-                           q.status = :status, q.error = :error, q.transcript = :transcript
+                           q.status = :status, q.error = :error, q.transcript = :transcript, q.attempts = :attempts, q.LAST_UPDATE = SYSDATE
             WHEN NOT MATCHED THEN
-                INSERT (SYSTEM_ID, docnumber, o_detected, OCR, face, status, error, transcript, LAST_UPDATE, DISABLED)
-                VALUES ((SELECT NVL(MAX(SYSTEM_ID), 0) + 1 FROM TAGGING_QUEUE), :docnumber, :o_detected, :ocr, :face, :status, :error, :transcript, SYSDATE, 0)
+                INSERT (SYSTEM_ID, docnumber, o_detected, OCR, face, status, error, transcript, attempts, LAST_UPDATE, DISABLED)
+                VALUES ((SELECT NVL(MAX(SYSTEM_ID), 0) + 1 FROM TAGGING_QUEUE), :docnumber, :o_detected, :ocr, :face, :status, :error, :transcript, :attempts, SYSDATE, 0)
             """
             #print(f"docnumber : {docnumber}, o_detected : {o_detected}, ocr : {ocr}, face : {face}, status : {status}, error : {error}, transcript : {transcript}")
             cursor.execute(merge_sql, {
                 'docnumber': docnumber, 'o_detected': o_detected, 'ocr': ocr, 'face': face,
-                'status': status, 'error': error, 'transcript': transcript
+                'status': status, 'error': error, 'transcript': transcript, 'attempts' : attempts
             })
             conn.commit()
         finally:

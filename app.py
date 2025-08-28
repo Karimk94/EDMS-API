@@ -37,6 +37,7 @@ def process_document(doc, dms_session_token):
     ocr_status = doc.get('ocr', 0)
     face_status = doc.get('face', 0)
     final_status = doc.get('status', 1)
+    attempts = doc.get('attempts', 0)
     error_message = ''
     transcript_text = ''
 
@@ -89,10 +90,11 @@ def process_document(doc, dms_session_token):
         final_status = 2
 
     finally:
+        attempts += 1
         db_connector.update_document_processing_status(
             docnumber=docnumber, new_abstract=new_abstract, o_detected=o_detected_status,
             ocr=ocr_status, face=face_status, status=final_status,
-            error=error_message, transcript=transcript_text
+            error=error_message, transcript=transcript_text, attempts= attempts
         )
         logging.info(f"Finished processing document {docnumber} with status: {final_status}")
 
