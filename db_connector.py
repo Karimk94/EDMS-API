@@ -25,8 +25,10 @@ def get_documents_to_process():
                    NVL(q.OCR, 0) as ocr, 
                    NVL(q.face, 0) as face
             FROM PROFILE p
-            LEFT JOIN TAGGING_QUEUE q ON p.docnumber = q.docnumber AND q.STATUS <> 3
-            WHERE p.form = :form_id and p.docnumber >= 19662092
+            LEFT JOIN TAGGING_QUEUE q ON p.docnumber = q.docnumber
+            WHERE p.form = :form_id 
+              AND p.docnumber >= 19662092
+              AND (q.STATUS <> 3 OR q.STATUS IS NULL)
             FETCH FIRST 10 ROWS ONLY
             """
             cursor.execute(sql, {'form_id': 2740})
