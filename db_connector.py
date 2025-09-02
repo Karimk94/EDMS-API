@@ -7,24 +7,325 @@ import re
 from PIL import Image
 import io
 import shutil
+import logging
+from moviepy import VideoFileClip
 
 load_dotenv()
 
+# --- Cache Directory Setup ---
 thumbnail_cache_dir = os.path.join(os.path.dirname(__file__), 'thumbnail_cache')
 if not os.path.exists(thumbnail_cache_dir):
     os.makedirs(thumbnail_cache_dir)
 
-def get_connection():
+video_cache_dir = os.path.join(os.path.dirname(__file__), 'video_cache')
+if not os.path.exists(video_cache_dir):
+    os.makedirs(video_cache_dir)
+
+
+# --- DMS Communication ---
+
+def dms_login():
+    """Logs into the DMS SOAP service and returns a session token (DST)."""
     try:
-        dsn = f"{os.getenv('DB_HOST')}:{os.getenv('DB_PORT')}/{os.getenv('DB_SERVICE_NAME')}"
-        connection = oracledb.connect(user=os.getenv('DB_USERNAME'), password=os.getenv('DB_PASSWORD'), dsn=dsn)
-        return connection
-    except oracledb.Error as ex:
-        error, = ex.args
-        print(f"Database connection error: {error.message}")
+        settings = Settings(strict=False, xml_huge_tree=True)
+        wsdl_url = os.getenv("WSDL_URL")
+        client = Client(wsdl_url, settings=settings)
+        login_info_type = client.get_type('{http://schemas.datacontract.org/2004/07/OpenText.DMSvr.Serializable}DMSvrLoginInfo')
+        dms_user, dms_password = os.getenv("DMS_USER"), os.getenv("DMS_PASSWORD")
+        login_info_instance = login_info_type(network=0, loginContext='RTA_MAIN', username=dms_user, password=dms_password)
+        array_type = client.get_type('{http://schemas.datacontract.org/2004/07/OpenText.DMSvr.Serializable}ArrayOfDMSvrLoginInfo')
+        login_info_array_instance = array_type(DMSvrLoginInfo=[login_info_instance])
+        call_data = {'call': {'loginInfo': login_info_array_instance, 'authen': 1, 'dstIn': ''}}
+        response = client.service.LoginSvr5(**call_data)
+        if response and response.resultCode == 0 and response.DSTOut:
+            return response.DSTOut
+        return None
+    except Exception:
         return None
 
+def get_media_info_from_dms(dst, doc_number):
+    """
+    Efficiently retrieves only the metadata (like filename) for a document from the DMS
+    without downloading the full file content.
+    """
+    try:
+        settings = Settings(strict=False, xml_huge_tree=True)
+        wsdl_url = os.getenv("WSDL_URL")
+        svc_client = Client(wsdl_url, port_name='BasicHttpBinding_IDMSvc', settings=settings)
+        
+        get_doc_call = {
+            'call': {
+                'dstIn': dst,
+                'criteria': {
+                    'criteriaCount': 2,
+                    'criteriaNames': {'string': ['%TARGET_LIBRARY', '%DOCUMENT_NUMBER']},
+                    'criteriaValues': {'string': ['RTA_MAIN', str(doc_number)]}
+                }
+            }
+        }
+        doc_reply = svc_client.service.GetDocSvr3(**get_doc_call)
+
+        if not (doc_reply and doc_reply.resultCode == 0):
+            return None, 'image', ''
+
+        filename = f"{doc_number}"  # Default
+        if doc_reply.docProperties and doc_reply.docProperties.propertyValues:
+            try:
+                prop_names = doc_reply.docProperties.propertyNames.string
+                if '%VERSION_FILE_NAME' in prop_names:
+                    index = prop_names.index('%VERSION_FILE_NAME')
+                    version_file_name = doc_reply.docProperties.propertyValues.anyType[index]
+                    if version_file_name:
+                        filename = str(version_file_name)
+            except Exception as e:
+                print(f"Could not get filename for {doc_number}, using default. Error: {e}")
+        
+        video_extensions = ['.mp4', '.mov', '.avi', '.mkv']
+        file_ext = os.path.splitext(filename)[1].lower()
+        media_type = 'video' if file_ext in video_extensions else 'image'
+        
+        return filename, media_type, file_ext
+
+    except Fault as e:
+        print(f"DMS metadata fault for doc {doc_number}: {e}")
+        return None, 'image', ''
+
+
+def get_media_content_from_dms(dst, doc_number):
+    """
+    Retrieves the full binary content of a media file from the DMS.
+    """
+    obj_client, content_id, stream_id = None, None, None
+    try:
+        settings = Settings(strict=False, xml_huge_tree=True)
+        wsdl_url = os.getenv("WSDL_URL")
+        svc_client = Client(wsdl_url, port_name='BasicHttpBinding_IDMSvc', settings=settings)
+        obj_client = Client(wsdl_url, port_name='BasicHttpBinding_IDMObj', settings=settings)
+
+        get_doc_call = {
+            'call': {'dstIn': dst, 'criteria': {'criteriaCount': 2, 'criteriaNames': {'string': ['%TARGET_LIBRARY', '%DOCUMENT_NUMBER']}, 'criteriaValues': {'string': ['RTA_MAIN', str(doc_number)]}}}
+        }
+        doc_reply = svc_client.service.GetDocSvr3(**get_doc_call)
+        if not (doc_reply and doc_reply.resultCode == 0 and doc_reply.getDocID):
+            return None
+
+        content_id = doc_reply.getDocID
+        stream_reply = obj_client.service.GetReadStream(call={'dstIn': dst, 'contentID': content_id})
+        if not (stream_reply and stream_reply.resultCode == 0 and stream_reply.streamID):
+            return None
+
+        stream_id = stream_reply.streamID
+        doc_buffer = bytearray()
+        while True:
+            read_reply = obj_client.service.ReadStream(call={'streamID': stream_id, 'requestedBytes': 65536})
+            if not read_reply or read_reply.resultCode != 0: break
+            chunk_data = read_reply.streamData.streamBuffer if read_reply.streamData else None
+            if not chunk_data: break
+            doc_buffer.extend(chunk_data)
+        
+        return bytes(doc_buffer)
+    except Exception as e:
+        print(f"Error getting media content for {doc_number}: {e}")
+        return None
+    finally:
+        if obj_client:
+            if stream_id: 
+                try: obj_client.service.ReleaseObject(call={'objectID': stream_id})
+                except Exception: pass
+            if content_id: 
+                try: obj_client.service.ReleaseObject(call={'objectID': content_id})
+                except Exception: pass
+
+
+def get_dms_stream_details(dst, doc_number):
+    """
+    Opens a stream to a DMS document and returns the client and stream ID for reading.
+    """
+    try:
+        settings = Settings(strict=False, xml_huge_tree=True)
+        wsdl_url = os.getenv("WSDL_URL")
+        svc_client = Client(wsdl_url, port_name='BasicHttpBinding_IDMSvc', settings=settings)
+        obj_client = Client(wsdl_url, port_name='BasicHttpBinding_IDMObj', settings=settings)
+
+        get_doc_call = {'call': {'dstIn': dst, 'criteria': {'criteriaCount': 2, 'criteriaNames': {'string': ['%TARGET_LIBRARY', '%DOCUMENT_NUMBER']}, 'criteriaValues': {'string': ['RTA_MAIN', str(doc_number)]}}}}
+        doc_reply = svc_client.service.GetDocSvr3(**get_doc_call)
+        if not (doc_reply and doc_reply.resultCode == 0 and doc_reply.getDocID):
+            return None
+
+        content_id = doc_reply.getDocID
+        stream_reply = obj_client.service.GetReadStream(call={'dstIn': dst, 'contentID': content_id})
+        if not (stream_reply and stream_reply.resultCode == 0 and stream_reply.streamID):
+            obj_client.service.ReleaseObject(call={'objectID': content_id})
+            return None
+        
+        return {
+            "obj_client": obj_client,
+            "stream_id": stream_reply.streamID,
+            "content_id": content_id
+        }
+    except Exception as e:
+        print(f"Error opening DMS stream for {doc_number}: {e}")
+        return None
+
+# --- Caching, Streaming, and Thumbnail Logic ---
+
+def stream_and_cache_generator(obj_client, stream_id, content_id, final_cache_path):
+    """
+    A generator that streams data from DMS, yields it for the user,
+    and simultaneously saves it to a cache file.
+    """
+    temp_cache_path = final_cache_path + ".tmp"
+    try:
+        with open(temp_cache_path, "wb") as f:
+            while True:
+                read_reply = obj_client.service.ReadStream(call={'streamID': stream_id, 'requestedBytes': 65536})
+                if not read_reply or read_reply.resultCode != 0:
+                    break
+                chunk_data = read_reply.streamData.streamBuffer if read_reply.streamData else None
+                if not chunk_data:
+                    break
+                f.write(chunk_data)
+                yield chunk_data
+        
+        # Once fully downloaded, move the temp file to its final location
+        os.rename(temp_cache_path, final_cache_path)
+        logging.info(f"Successfully cached file to {final_cache_path}")
+    except Exception as e:
+        logging.error(f"Error during streaming/caching: {e}")
+    finally:
+        # CRITICAL: Always release DMS objects to prevent resource leaks
+        try:
+            if stream_id: obj_client.service.ReleaseObject(call={'objectID': stream_id})
+            if content_id: obj_client.service.ReleaseObject(call={'objectID': content_id})
+        except Exception as e:
+            logging.error(f"Failed to release DMS objects: {e}")
+        # Clean up temp file if it still exists on error
+        if os.path.exists(temp_cache_path):
+            os.remove(temp_cache_path)
+
+def create_thumbnail(doc_number, media_type, file_ext, media_bytes):
+    """Creates a thumbnail from media bytes and saves it to the cache."""
+    thumbnail_filename = f"{doc_number}.jpg"
+    cached_path = os.path.join(thumbnail_cache_dir, thumbnail_filename)
+    try:
+        if media_type == 'video':
+            temp_video_path = os.path.join(thumbnail_cache_dir, f"{doc_number}{file_ext}")
+            with open(temp_video_path, 'wb') as f: f.write(media_bytes)
+            with VideoFileClip(temp_video_path) as clip: clip.save_frame(cached_path, t=1)
+            os.remove(temp_video_path)
+        else:
+            with Image.open(io.BytesIO(media_bytes)) as img:
+                img.thumbnail((300, 300))
+                img.convert("RGB").save(cached_path, "JPEG", quality=95)
+        return f"cache/{thumbnail_filename}"
+    except Exception as e:
+        print(f"Could not create thumbnail for {doc_number}: {e}")
+        return None
+
+# --- Oracle Database Interaction ---
+
+def get_connection():
+    """Establishes a connection to the Oracle database."""
+    try:
+        dsn = f"{os.getenv('DB_HOST')}:{os.getenv('DB_PORT')}/{os.getenv('DB_SERVICE_NAME')}"
+        return oracledb.connect(user=os.getenv('DB_USERNAME'), password=os.getenv('DB_PASSWORD'), dsn=dsn)
+    except oracledb.Error as ex:
+        error, = ex.args
+        print(f"DB connection error: {error.message}")
+        return None
+
+def fetch_documents_from_oracle(page=1, page_size=10, search_term=None, date_from=None, date_to=None, persons=None, person_condition='any'):
+    """Fetches a paginated list of documents from Oracle, handling filtering and thumbnail logic."""
+    conn = get_connection()
+    if not conn: return [], 0
+
+    dst = dms_login()
+    if not dst:
+        print("Could not log into DMS. Aborting document fetch.")
+        return [], 0
+
+    offset = (page - 1) * page_size
+    documents = []
+    total_rows = 0
+
+    base_where = "WHERE docnumber >= 19662092 AND FORM = 2740 "
+    params = {}
+    where_clauses = []
+
+    if search_term:
+        words = re.findall(r'\w+', search_term.upper())
+        search_conditions = []
+        for i, word in enumerate(words):
+            key = f"search_word_{i}"
+            search_conditions.append(f"UPPER(ABSTRACT) LIKE :{key}")
+            params[key] = f"%{word}%"
+        where_clauses.append(" AND ".join(search_conditions))
+
+    if persons:
+        person_list = [p.strip().upper() for p in persons.split(',') if p.strip()]
+        if person_list:
+            op = " OR " if person_condition == 'any' else " AND "
+            person_conditions = []
+            for i, person in enumerate(person_list):
+                key = f'person_{i}'
+                person_conditions.append(f"UPPER(ABSTRACT) LIKE :{key}")
+                params[key] = f"%{person}%"
+            where_clauses.append(f"({op.join(person_conditions)})")
+
+    if date_from:
+        where_clauses.append("CREATION_DATE >= TO_DATE(:date_from, 'YYYY-MM-DD HH24:MI:SS')")
+        params['date_from'] = date_from
+    if date_to:
+        where_clauses.append("CREATION_DATE <= TO_DATE(:date_to, 'YYYY-MM-DD HH24:MI:SS')")
+        params['date_to'] = date_to
+    
+    final_where_clause = base_where + ("AND " + " AND ".join(where_clauses) if where_clauses else "")
+
+    try:
+        with conn.cursor() as cursor:
+            # Get total count for pagination
+            count_query = f"SELECT COUNT(DOCNUMBER) FROM PROFILE {final_where_clause}"
+            cursor.execute(count_query, params)
+            total_rows = cursor.fetchone()[0]
+
+            # Fetch the actual page of documents
+            fetch_query = f"SELECT DOCNUMBER, ABSTRACT, AUTHOR, CREATION_DATE, DOCNAME FROM PROFILE {final_where_clause}"
+            params['offset'] = offset
+            params['page_size'] = page_size
+            
+            cursor.execute(fetch_query + " ORDER BY DOCNUMBER DESC OFFSET :offset ROWS FETCH NEXT :page_size ROWS ONLY", params)
+            
+            for row in cursor:
+                doc_id, abstract, author, creation_date, docname = row
+                thumbnail_path = None
+                
+                original_filename, media_type, file_ext = get_media_info_from_dms(dst, doc_id)
+                
+                cached_thumbnail_file = f"{doc_id}.jpg"
+                cached_path = os.path.join(thumbnail_cache_dir, cached_thumbnail_file)
+
+                if os.path.exists(cached_path):
+                    thumbnail_path = f"cache/{cached_thumbnail_file}"
+                else:
+                    media_bytes = get_media_content_from_dms(dst, doc_id)
+                    if media_bytes:
+                        thumbnail_path = create_thumbnail(doc_id, media_type, file_ext, media_bytes)
+
+                documents.append({
+                    "doc_id": doc_id,
+                    "title": abstract or "No Title",
+                    "docname": docname or "",
+                    "author": author or "N/A",
+                    "date": creation_date.strftime('%Y-%m-%d') if creation_date else "N/A",
+                    "thumbnail_url": thumbnail_path or "https://placehold.co/100x100/e9ecef/6c757d?text=No+Image",
+                    "media_type": media_type
+                })
+    finally:
+        conn.close()
+    return documents, total_rows
+
 def get_documents_to_process():
+    """Gets a batch of documents that need AI processing."""
     conn = get_connection()
     if conn:
         cursor = conn.cursor()
@@ -51,6 +352,7 @@ def get_documents_to_process():
     return []
 
 def update_document_processing_status(docnumber, new_abstract, o_detected, ocr, face, status, error, transcript, attempts):
+    """Updates the processing status of a document in the database."""
     conn = get_connection()
     if conn:
         cursor = conn.cursor()
@@ -74,145 +376,8 @@ def update_document_processing_status(docnumber, new_abstract, o_detected, ocr, 
         finally:
             conn.close()
 
-def fetch_documents_from_oracle(page=1, page_size=10, search_term=None, date_from=None, date_to=None, persons=None, person_condition='any'):
-    conn = get_connection()
-    if not conn: return [], 0
-    offset = (page - 1) * page_size
-    documents = []
-    total_rows = 0
-
-    base_where = "WHERE docnumber >= 19662092 and FORM = 2740 "
-    count_query = f"SELECT COUNT(DOCNUMBER) FROM PROFILE {base_where}"
-    fetch_query = f"SELECT DOCNUMBER, ABSTRACT, AUTHOR, CREATION_DATE, DOCNAME FROM PROFILE {base_where}"
-
-    where_clause = ""
-    params = {}
-    if search_term:
-        words = re.findall(r'\w+', search_term.upper())
-        conditions = [f"UPPER(ABSTRACT) LIKE :search_word_{i}" for i in range(len(words))]
-        where_clause += "AND " + " AND ".join(conditions)
-        for i, word in enumerate(words):
-            params[f"search_word_{i}"] = f"%{word}%"
-
-    if persons:
-        person_list = [p.strip().upper() for p in persons.split(',') if p.strip()]
-        if person_list:
-            logical_operator = " OR " if person_condition == 'any' else " AND "
-            person_conditions = [f"UPPER(ABSTRACT) LIKE :person_{i}" for i in range(len(person_list))]
-            where_clause += " AND (" + logical_operator.join(person_conditions) + ")"
-            for i, person in enumerate(person_list):
-                params[f'person_{i}'] = f"%{person}%"
-
-    if date_from:
-        where_clause += " AND CREATION_DATE >= TO_DATE(:date_from, 'YYYY-MM-DD HH24:MI:SS')"
-        params['date_from'] = date_from
-
-    if date_to:
-        where_clause += " AND CREATION_DATE <= TO_DATE(:date_to, 'YYYY-MM-DD HH24:MI:SS')"
-        params['date_to'] = date_to
-
-    try:
-        with conn.cursor() as cursor:
-            cursor.execute(count_query + where_clause, params)
-            total_rows = cursor.fetchone()[0]
-            params['offset'] = offset
-            params['page_size'] = page_size
-            cursor.execute(fetch_query + where_clause + " ORDER BY DOCNUMBER DESC OFFSET :offset ROWS FETCH NEXT :page_size ROWS ONLY", params)
-            for row in cursor:
-                doc_id = row[0]
-                thumbnail_path = get_thumbnail_from_edms(doc_id)
-                documents.append({
-                    "doc_id": doc_id,
-                    "title": row[1] or "No Title",
-                    "docname": row[4] or "",
-                    "author": row[2] or "N/A",
-                    "date": row[3].strftime('%Y-%m-%d') if row[3] else "N/A",
-                    "thumbnail_url": thumbnail_path or "https://placehold.co/100x100/e9ecef/6c757d?text=No+Image"
-                })
-    finally:
-        conn.close()
-    return documents, total_rows
-
-def get_image_from_edms(doc_number):
-    """
-    Retrieves a single document's full-size image bytes from the DMS.
-    """
-    dst = dms_login()
-    if not dst:
-        return None
-
-    svc_client, obj_client, content_id, stream_id = None, None, None, None
-    try:
-        settings = Settings(strict=False, xml_huge_tree=True)
-        wsdl_url = os.getenv("WSDL_URL")
-        svc_client = Client(wsdl_url, port_name='BasicHttpBinding_IDMSvc', settings=settings)
-        obj_client = Client(wsdl_url, port_name='BasicHttpBinding_IDMObj', settings=settings)
-
-        get_doc_call = {
-            'call': {
-                'dstIn': dst,
-                'criteria': {
-                    'criteriaCount': 2,
-                    'criteriaNames': {'string': ['%TARGET_LIBRARY', '%DOCUMENT_NUMBER']},
-                    'criteriaValues': {'string': ['RTA_MAIN', str(doc_number)]}
-                }
-            }
-        }
-        doc_reply = svc_client.service.GetDocSvr3(**get_doc_call)
-
-        if not (doc_reply and doc_reply.resultCode == 0 and doc_reply.getDocID):
-            return None
-
-        content_id = doc_reply.getDocID
-        stream_reply = obj_client.service.GetReadStream(call={'dstIn': dst, 'contentID': content_id})
-
-        if not (stream_reply and stream_reply.resultCode == 0 and stream_reply.streamID):
-            raise Exception("Failed to get read stream.")
-
-        stream_id = stream_reply.streamID
-        doc_buffer = bytearray()
-        while True:
-            read_reply = obj_client.service.ReadStream(call={'streamID': stream_id, 'requestedBytes': 65536})
-            if not read_reply or read_reply.resultCode != 0: break
-            chunk_data = read_reply.streamData.streamBuffer if read_reply.streamData else None
-            if not chunk_data: break
-            doc_buffer.extend(chunk_data)
-
-        return bytes(doc_buffer)
-
-    except Fault as e:
-        print(f"DMS server fault for doc: {doc_number}. Error: {e}")
-        return None
-    finally:
-        if obj_client:
-            if stream_id:
-                try: obj_client.service.ReleaseObject(call={'objectID': stream_id})
-                except Exception: pass
-            if content_id:
-                try: obj_client.service.ReleaseObject(call={'objectID': content_id})
-                except Exception: pass
-
-def get_thumbnail_from_edms(doc_number):
-    thumbnail_filename = f"{doc_number}.jpg"
-    cached_path = os.path.join(thumbnail_cache_dir, thumbnail_filename)
-    if os.path.exists(cached_path):
-        return f"cache/{thumbnail_filename}"
-    image_bytes = get_image_from_edms(doc_number)
-    if not image_bytes: return None
-    try:
-        with Image.open(io.BytesIO(image_bytes)) as img:
-            img.thumbnail((300, 300))
-            img.convert("RGB").save(cached_path, "JPEG", quality=95)
-            return f"cache/{thumbnail_filename}"
-    except Exception as e:
-        print(f"Error creating thumbnail for {doc_number}: {e}")
-        return None
-    
-def clear_thumbnail_cache():
-    shutil.rmtree(thumbnail_cache_dir)
-    os.makedirs(thumbnail_cache_dir)
-
 def update_abstract_with_vips(doc_id, vip_names):
+    """Appends VIP names to a document's abstract."""
     conn = get_connection()
     if not conn: return False, "Could not connect to the database."
     try:
@@ -221,6 +386,11 @@ def update_abstract_with_vips(doc_id, vip_names):
             result = cursor.fetchone()
             if result is None: return False, f"Document with ID {doc_id} not found."
             current_abstract = result[0] or ""
+            
+            # Avoid duplicating the VIPs section
+            if "VIPs :" in current_abstract:
+                return True, "Abstract already contains VIPs section."
+
             names_str = ", ".join(vip_names)
             vips_section = f" VIPs : {names_str}"
             new_abstract = current_abstract + (" " if current_abstract else "") + vips_section
@@ -233,9 +403,9 @@ def update_abstract_with_vips(doc_id, vip_names):
         conn.close()
 
 def add_person_to_lkp(person_name):
+    """Adds a new person to the LKP_PERSON lookup table."""
     conn = get_connection()
-    if not conn:
-        return False, "Could not connect to the database."
+    if not conn: return False, "Could not connect to the database."
     try:
         with conn.cursor() as cursor:
             cursor.execute("SELECT COUNT(SYSTEM_ID) FROM LKP_PERSON WHERE NAME_ENGLISH = :1", [person_name])
@@ -254,18 +424,16 @@ def add_person_to_lkp(person_name):
     finally:
         if conn:
             conn.close()
-
+    
 def fetch_lkp_persons(page=1, page_size=20, search=''):
+    """Fetches a paginated list of people from the LKP_PERSON table."""
     conn = get_connection()
-    if not conn:
-        return [], 0
+    if not conn: return [], 0
 
     offset = (page - 1) * page_size
     persons = []
     total_rows = 0
-
     search_term = f"%{search.upper()}%"
-
     count_query = "SELECT COUNT(SYSTEM_ID) FROM LKP_PERSON WHERE UPPER(NAME_ENGLISH) LIKE :search OR UPPER(NAME_ARABIC) LIKE :search"
     fetch_query = "SELECT SYSTEM_ID, NAME_ENGLISH, NVL(NAME_ARABIC, '') FROM LKP_PERSON WHERE UPPER(NAME_ENGLISH) LIKE :search OR UPPER(NAME_ARABIC) LIKE :search ORDER BY NAME_ENGLISH OFFSET :offset ROWS FETCH NEXT :page_size ROWS ONLY"
 
@@ -276,40 +444,21 @@ def fetch_lkp_persons(page=1, page_size=20, search=''):
 
             cursor.execute(fetch_query, search=search_term, offset=offset, page_size=page_size)
             for row in cursor:
-                persons.append({
-                    "id": row[0],
-                    "name_english": row[1],
-                    "name_arabic": row[2]
-                })
+                persons.append({"id": row[0], "name_english": row[1], "name_arabic": row[2]})
     except oracledb.Error as e:
         print(f"❌ Oracle Database error in fetch_lkp_persons: {e}")
     finally:
         conn.close()
-
     return persons, total_rows
 
-def dms_login():
-    """Logs into the DMS SOAP service and returns a session token (DST)."""
-    try:
-        settings = Settings(strict=False, xml_huge_tree=True)
-        wsdl_url = os.getenv("WSDL_URL")
-        client = Client(wsdl_url, settings=settings)
+def clear_thumbnail_cache():
+    """Deletes all files in the thumbnail cache directory."""
+    if os.path.exists(thumbnail_cache_dir):
+        shutil.rmtree(thumbnail_cache_dir)
+    os.makedirs(thumbnail_cache_dir)
 
-        login_info_type = client.get_type('{http://schemas.datacontract.org/2004/07/OpenText.DMSvr.Serializable}DMSvrLoginInfo')
-        dms_user = os.getenv("DMS_USER")
-        dms_password = os.getenv("DMS_PASSWORD")
-        login_info_instance = login_info_type(network=0, loginContext='RTA_MAIN', username=dms_user, password=dms_password)
-
-        array_type = client.get_type('{http://schemas.datacontract.org/2004/07/OpenText.DMSvr.Serializable}ArrayOfDMSvrLoginInfo')
-        login_info_array_instance = array_type(DMSvrLoginInfo=[login_info_instance])
-
-        call_data = {'call': {'loginInfo': login_info_array_instance, 'authen': 1, 'dstIn': ''}}
-
-        response = client.service.LoginSvr5(**call_data)
-
-        if response and response.resultCode == 0 and response.DSTOut:
-            return response.DSTOut
-        else:
-            return None
-    except Exception as e:
-        return None
+def clear_video_cache():
+    """Deletes all files in the video cache directory."""
+    if os.path.exists(video_cache_dir):
+        shutil.rmtree(video_cache_dir)
+    os.makedirs(video_cache_dir)

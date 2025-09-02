@@ -5,6 +5,7 @@ pycache/
 *.pyo
 *.pyd
 /thumbnail_cache
+/video_cache
 __pycache__/
 *.pyc
 
