@@ -341,7 +341,7 @@ def get_documents_to_process():
             WHERE p.form = :form_id
               AND p.docnumber >= 19662092
               AND (q.STATUS <> 3 OR q.STATUS IS NULL)
-              AND q.attempts <= 3
+              AND (q.ATTEMPTS <= 3 OR q.ATTEMPTS IS NULL)
             FETCH FIRST 10 ROWS ONLY
             """
             cursor.execute(sql, {'form_id': 2740})
@@ -352,12 +352,21 @@ def get_documents_to_process():
     return []
 
 def update_document_processing_status(docnumber, new_abstract, o_detected, ocr, face, status, error, transcript, attempts):
-    """Updates the processing status of a document in the database."""
+    """Updates the processing status of a document in the database with robust transaction handling."""
     conn = get_connection()
-    if conn:
-        cursor = conn.cursor()
-        try:
+    if not conn:
+        logging.error(f"DB_UPDATE_FAILURE: Could not get a database connection for docnumber {docnumber}.")
+        return  # Exit if no connection
+    
+    try:
+        with conn.cursor() as cursor:
+            # Start a transaction
+            conn.begin()
+            
+            # 1. Update the abstract in the PROFILE table
             cursor.execute("UPDATE PROFILE SET abstract = :1 WHERE docnumber = :2", (new_abstract, docnumber))
+            
+            # 2. Merge the status into the TAGGING_QUEUE table
             merge_sql = """
             MERGE INTO TAGGING_QUEUE q
             USING (SELECT :docnumber AS docnumber FROM dual) src ON (q.docnumber = src.docnumber)
@@ -372,8 +381,23 @@ def update_document_processing_status(docnumber, new_abstract, o_detected, ocr, 
                 'docnumber': docnumber, 'o_detected': o_detected, 'ocr': ocr, 'face': face,
                 'status': status, 'error': error, 'transcript': transcript, 'attempts' : attempts
             })
+            
+            # If all commands succeed, commit the transaction
             conn.commit()
-        finally:
+            logging.info(f"DB_UPDATE_SUCCESS: Successfully updated status for docnumber {docnumber}.")
+            
+    except oracledb.Error as e:
+        # If any error occurs, log it and roll back the transaction
+        logging.error(f"DB_UPDATE_ERROR: Oracle error while updating docnumber {docnumber}: {e}", exc_info=True)
+        try:
+            conn.rollback()
+            logging.info(f"DB_ROLLBACK: Transaction for docnumber {docnumber} was rolled back.")
+        except oracledb.Error as rb_e:
+            logging.error(f"DB_ROLLBACK_ERROR: Failed to rollback transaction for docnumber {docnumber}: {rb_e}", exc_info=True)
+            
+    finally:
+        # Ensure the connection is always closed
+        if conn:
             conn.close()
 
 def update_abstract_with_vips(doc_id, vip_names):

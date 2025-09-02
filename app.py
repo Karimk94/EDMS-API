@@ -5,100 +5,122 @@ import api_client
 import wsdl_client
 import logging
 from werkzeug.serving import run_simple
-import re
 import math
 import os
+import json
+from threading import Thread
 
 # --- Logging Setup ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 app = Flask(__name__)
-CORS(app, resources={r"/api/*": {"origins": "http://localhost:3000"}})
+CORS(app, resources={r"/api/*": {"origins": "*"}})
 
 # --- AI Processing Routes ---
 def process_document(doc, dms_session_token):
     """
-    Processes a single document using the provided DMS session token.
+    Processes a single document, handling its own errors and returning a dictionary 
+    ready for database update.
     """
     docnumber = doc['docnumber']
-    logging.info(f"Processing document: {docnumber}")
+    logging.info(f"Starting processing for document: {docnumber}")
 
+    # Initialize variables with data from the document
     original_abstract = doc.get('abstract') or ''
-    
-    # Safely extract existing AI parts from the abstract
+    base_abstract = original_abstract.split('\n\nCaption:')[0].strip()
     ai_abstract_parts = {}
-    parts = re.split(r'\n\n(Caption:|OCR:|VIPs:)', original_abstract, flags=re.IGNORECASE)
-    base_abstract = parts[0].strip()
-    if len(parts) > 1:
-        it = iter(parts[1:])
-        for tag in it:
-            key = tag.strip().replace(':', '').upper()
-            value = next(it, '').strip()
-            ai_abstract_parts[key] = value
 
-    o_detected_status = doc.get('o_detected', 0)
-    ocr_status = doc.get('ocr', 0)
-    face_status = doc.get('face', 0)
-    final_status = doc.get('status', 1)
-    attempts = doc.get('attempts', 0)
-    error_message = ''
-    transcript_text = ''
+    results = {
+        "docnumber": docnumber,
+        "new_abstract": original_abstract,
+        "o_detected": doc.get('o_detected', 0),
+        "ocr": doc.get('ocr', 0),
+        "face": doc.get('face', 0),
+        "transcript": '',
+        "status": 1, # Default status: In Progress
+        "error": '',
+        "attempts": doc.get('attempts', 0) + 1
+    }
 
     try:
-        image_bytes, filename = wsdl_client.get_image_by_docnumber(dms_session_token, docnumber)
-        if not image_bytes:
-            raise Exception(f"Failed to retrieve image for docnumber {docnumber} from WSDL service.")
-        logging.info(f"Image for {docnumber} ({filename}) fetched successfully.")
+        # Step 1: Fetch media and determine type
+        media_bytes, filename = wsdl_client.get_image_by_docnumber(dms_session_token, docnumber)
+        if not media_bytes:
+            raise Exception(f"Failed to retrieve media for docnumber {docnumber} from WSDL service.")
+        logging.info(f"Media for {docnumber} ({filename}) fetched successfully.")
 
-        if not o_detected_status:
-            captions = api_client.get_captions(image_bytes, filename)
-            if captions is not None:
-                o_detected_status = 1
-                ai_abstract_parts['CAPTION'] = captions.strip()
+        video_extensions = ['.mp4', '.mov', '.avi', '.mkv']
+        is_video = any(filename.lower().endswith(ext) for ext in video_extensions)
 
-        if not ocr_status:
-            ocr_text = api_client.get_ocr_text(image_bytes, filename)
-            if ocr_text is not None:
-                ocr_status = 1
-                ai_abstract_parts['OCR'] = ocr_text.strip()
+        # Step 2: Execute AI workflows based on media type
+        if is_video:
+            video_summary = api_client.summarize_video(media_bytes, filename)
+            caption_parts = []
+            
+            if video_summary.get('objects'):
+                caption_parts.extend(video_summary['objects'])
+                results['o_detected'] = 1 # Mark as success if objects are found
 
-        if not face_status:
-            recognized_faces = api_client.recognize_faces(image_bytes, filename)
-            if recognized_faces is not None:
-                face_status = 1
-                known_face_names = [
-                    face.get('name').replace('_', ' ').title()
-                    for face in recognized_faces
-                    if face.get('name') and face.get('name') != 'Unknown'
-                ]
-                if known_face_names:
-                    ai_abstract_parts['VIPS'] = ", ".join(known_face_names)
+            if video_summary.get('faces'):
+                recognized_faces = api_client.recognize_faces_from_list(video_summary['faces'])
+                # Use a set to automatically handle duplicates
+                unique_known_faces = {f.get('name').replace('_', ' ').title() for f in recognized_faces if f.get('name') and f.get('name') != 'Unknown'}
+                if unique_known_faces:
+                    ai_abstract_parts['VIPS'] = ", ".join(sorted(list(unique_known_faces)))
+                results['face'] = 1 # Mark as success if face analysis was run
 
+            # As requested, the full transcript is not stored in the database
+            # results['transcript'] = video_summary['transcript']
+            if video_summary.get('transcript'):
+                tokenized_json = api_client.tokenize_transcript(video_summary['transcript'])
+                try:
+                    caption_parts.extend(json.loads(tokenized_json).get('english_tags', []))
+                except json.JSONDecodeError:
+                    logging.warning(f"Could not decode tokenized transcript for {docnumber}")
+            
+            if caption_parts:
+                ai_abstract_parts['CAPTION'] = ", ".join(sorted(list(set(caption_parts))))
+            
+            results['ocr'] = 1 # OCR is not applicable for videos, so mark as complete
+
+        else: # Is an image
+            captions = api_client.get_captions(media_bytes, filename)
+            if captions:
+                ai_abstract_parts['CAPTION'] = captions
+                results['o_detected'] = 1
+
+            ocr_text = api_client.get_ocr_text(media_bytes, filename)
+            if ocr_text:
+                ai_abstract_parts['OCR'] = ocr_text
+                results['ocr'] = 1
+
+            recognized_faces = api_client.recognize_faces(media_bytes, filename)
+            if recognized_faces:
+                # Use a set to automatically handle duplicates
+                unique_known_faces = {f.get('name').replace('_', ' ').title() for f in recognized_faces if f.get('name') and f.get('name') != 'Unknown'}
+                if unique_known_faces:
+                    ai_abstract_parts['VIPS'] = ", ".join(sorted(list(unique_known_faces)))
+                results['face'] = 1
+        
+        # Step 3: Assemble the final abstract and set success status
         final_abstract_parts = [base_abstract]
         if ai_abstract_parts.get('CAPTION'): final_abstract_parts.append(f"Caption: {ai_abstract_parts['CAPTION']}")
         if ai_abstract_parts.get('OCR'): final_abstract_parts.append(f"OCR: {ai_abstract_parts['OCR']}")
         if ai_abstract_parts.get('VIPS'): final_abstract_parts.append(f"VIPs: {ai_abstract_parts['VIPS']}")
-
-        new_abstract = "\n\n".join(filter(None, final_abstract_parts))
-
-        if o_detected_status and ocr_status and face_status:
-            final_status = 3
+        
+        results['new_abstract'] = "\n\n".join(filter(None, final_abstract_parts))
+        
+        # Final status is success only if all relevant parts succeeded
+        if results['o_detected'] and results['ocr'] and results['face']:
+            results['status'] = 3 # Success
 
     except Exception as e:
+        # If any error occurs, log it and set the error status
         logging.error(f"Error processing document {docnumber}", exc_info=True)
-        error_message = str(e)
-        final_status = 2
+        results['status'] = 2 # Error status
+        results['error'] = str(e)
 
-    finally:
-        attempts += 1
-        db_connector.update_document_processing_status(
-            docnumber=docnumber, new_abstract=new_abstract, o_detected=o_detected_status,
-            ocr=ocr_status, face=face_status, status=final_status,
-            error=error_message, transcript=transcript_text, attempts= attempts
-        )
-        logging.info(f"Finished processing document {docnumber} with status: {final_status}")
-
-
+    return results
 @app.route('/process-batch', methods=['POST'])
 def process_batch():
     """API endpoint to trigger the processing of a batch of documents."""
@@ -110,27 +132,37 @@ def process_batch():
         return jsonify({"status": "error", "message": "Failed to authenticate with DMS."}), 500
 
     logging.info("DMS login successful. Fetching documents from database.")
+    documents = db_connector.get_documents_to_process()
+    if not documents:
+        logging.info("No new documents to process.")
+        return jsonify({"status": "success", "message": "No new documents to process.", "processed_count": 0}), 200
+
     processed_count = 0
-    try:
-        documents = db_connector.get_documents_to_process()
-        if not documents:
-            logging.info("No new documents to process.")
-            return jsonify({"status": "success", "message": "No new documents to process.", "processed_count": 0}), 200
+    for doc in documents:
+        result_data = process_document(doc, dms_session_token)
+        
+        # --- New Timeout Logic ---
+        # Run the database update in a thread so it can't freeze the main loop
+        db_thread = Thread(
+            target=db_connector.update_document_processing_status, 
+            kwargs=result_data
+        )
+        db_thread.start()
+        db_thread.join(timeout=20.0) # Wait a maximum of 20 seconds for the DB to respond
 
-        for doc in documents:
-            try:
-                process_document(doc, dms_session_token)
+        if db_thread.is_alive():
+            # If the thread is still running after 20 seconds, it's hung.
+            logging.critical(f"DATABASE HANG: The update for doc {doc['docnumber']} timed out. Skipping to next document.")
+        else:
+            # If the thread finished, the update was successful.
+            if result_data['status'] == 3: # Success
                 processed_count += 1
-            except Exception as e:
-                docnumber = doc.get('docnumber', 'N/A')
-                logging.error(f"A critical error occurred while processing docnumber {docnumber}. Skipping.", exc_info=True)
-
-        logging.info(f"Successfully processed a batch of {processed_count} out of {len(documents)} documents.")
-        return jsonify({"status": "success", "message": f"Processed {processed_count} documents.", "processed_count": processed_count}), 200
-
-    except Exception as e:
-        logging.error("An unhandled error occurred in the /process-batch endpoint.", exc_info=True)
-        return jsonify({"status": "error", "message": str(e)}), 500
+                logging.info(f"Successfully processed and updated DB for document {doc['docnumber']}.")
+            else:
+                logging.warning(f"Failed to process document {doc['docnumber']}. Error has been logged to the database.")
+            
+    logging.info(f"Batch finished. Successfully processed {processed_count} out of {len(documents)} documents.")
+    return jsonify({"status": "success", "message": f"Processed {processed_count} documents.", "processed_count": processed_count}), 200
 
 # --- Viewer API Routes ---
 @app.route('/api/documents')
@@ -214,7 +246,6 @@ def api_get_video(doc_id):
     # Return a streaming response
     return Response(stream_with_context(stream_generator), mimetype="video/mp4")
 
-
 @app.route('/cache/<path:filename>')
 def serve_cached_thumbnail(filename):
     """Serves cached thumbnail images."""
@@ -267,7 +298,6 @@ def api_get_persons():
         'options': persons,
         'hasMore': (page * 20) < total_rows
     })
-
 
 if __name__ == '__main__':
     run_simple(
