@@ -2,7 +2,6 @@ import requests
 import os
 import io
 import time
-import json
 
 def get_captions(image_data, filename):
     api_url = os.getenv("CAPTIONING_API_URL")
@@ -29,8 +28,6 @@ def recognize_faces(image_data, filename):
 def recognize_faces_from_list(base64_faces_list):
     """Processes a list of pre-cropped, base64-encoded faces from a video."""
     base_api_url = os.getenv("FACE_API_URL")
-    # Assumes the base URL points to '/analyze_image', so we replace it
-    # to target the correct endpoint for pre-cropped faces.
     endpoint = base_api_url.replace('/analyze_image', '/recognize_faces')
     
     payload = {'faces': base64_faces_list}
@@ -70,6 +67,25 @@ def tokenize_transcript(transcript):
     response = requests.post(f"{api_url}/generate", json=payload, timeout=300, stream=True)
     response.raise_for_status()
     
+    result_text = ""
+    for line in response.iter_lines():
+        if line:
+            decoded_line = line.decode('utf-8')
+            if decoded_line.startswith('data: '):
+                data = decoded_line[6:]
+                if data.strip() == '[END_OF_STREAM]':
+                    break
+                result_text += data
+    # Strip any whitespace and ensure the result is a valid JSON object before returning
+    return result_text.strip()
+
+def translate_text(text):
+    """Calls the translator/rephraser API to translate text."""
+    api_url = os.getenv("TRANSLATOR_REPHRASER_API_URL")
+    payload = {"text": text, "task": "translate"}
+    response = requests.post(f"{api_url}/generate", json=payload, timeout=300, stream=True)
+    response.raise_for_status()
+
     result_text = ""
     for line in response.iter_lines():
         if line:

@@ -8,6 +8,7 @@ from werkzeug.serving import run_simple
 import math
 import os
 import json
+import re
 from threading import Thread
 
 # --- Logging Setup ---
@@ -19,7 +20,7 @@ CORS(app, resources={r"/api/*": {"origins": "*"}})
 # --- AI Processing Routes ---
 def process_document(doc, dms_session_token):
     """
-    Processes a single document, handling its own errors and returning a dictionary 
+    Processes a single document, handling its own errors and returning a dictionary
     ready for database update.
     """
     docnumber = doc['docnumber']
@@ -56,10 +57,14 @@ def process_document(doc, dms_session_token):
         if is_video:
             video_summary = api_client.summarize_video(media_bytes, filename)
             caption_parts = []
-            
+            keywords_to_insert = []
+
             if video_summary.get('objects'):
                 caption_parts.extend(video_summary['objects'])
                 results['o_detected'] = 1 # Mark as success if objects are found
+                for obj in video_summary['objects']:
+                    arabic_translation = api_client.translate_text(obj)
+                    keywords_to_insert.append({'english': obj, 'arabic': arabic_translation})
 
             if video_summary.get('faces'):
                 recognized_faces = api_client.recognize_faces_from_list(video_summary['faces'])
@@ -69,18 +74,42 @@ def process_document(doc, dms_session_token):
                     ai_abstract_parts['VIPS'] = ", ".join(sorted(list(unique_known_faces)))
                 results['face'] = 1 # Mark as success if face analysis was run
 
-            # As requested, the full transcript is not stored in the database
-            # results['transcript'] = video_summary['transcript']
             if video_summary.get('transcript'):
-                tokenized_json = api_client.tokenize_transcript(video_summary['transcript'])
+                tokenized_json_str = api_client.tokenize_transcript(video_summary['transcript'])
+                english_tags = []
                 try:
-                    caption_parts.extend(json.loads(tokenized_json).get('english_tags', []))
+                    # "Happy Path": The response is valid JSON
+                    tokenized_data = json.loads(tokenized_json_str)
+                    english_tags = tokenized_data.get('english_tags', [])
+
                 except json.JSONDecodeError:
-                    logging.warning(f"Could not decode tokenized transcript for {docnumber}")
-            
+                    # "Smart Fallback": The response is broken, so we parse the raw string
+                    logging.warning(f"Could not decode tokenized transcript for {docnumber} as JSON. Attempting to salvage tags.")
+
+                    # Use regex to find the content within "english_tags": [...]
+                    english_match = re.search(r'"english_tags"\s*:\s*\[([^\]]+)\]', tokenized_json_str, re.IGNORECASE)
+                    if english_match:
+                        raw_english = english_match.group(1)
+                        # Clean the extracted string and split into a list
+                        english_tags = [tag.strip() for tag in raw_english.replace('"', '').split(',') if tag.strip()]
+                        logging.info(f"Salvaged English tags: {english_tags}")
+                    else:
+                        logging.warning(f"Could not salvage any English tags from the malformed response for {docnumber}.")
+
+                if english_tags:
+                    caption_parts.extend(english_tags) # Add to abstract
+                    # Translate each tag for keyword insertion
+                    for tag in english_tags:
+                        arabic_translation = api_client.translate_text(tag)
+                        keywords_to_insert.append({'english': tag, 'arabic': arabic_translation})
+
+
+            if keywords_to_insert:
+                db_connector.insert_keywords_and_tags(docnumber, keywords_to_insert)
+
             if caption_parts:
                 ai_abstract_parts['CAPTION'] = ", ".join(sorted(list(set(caption_parts))))
-            
+
             results['ocr'] = 1 # OCR is not applicable for videos, so mark as complete
 
         else: # Is an image
@@ -101,15 +130,15 @@ def process_document(doc, dms_session_token):
                 if unique_known_faces:
                     ai_abstract_parts['VIPS'] = ", ".join(sorted(list(unique_known_faces)))
                 results['face'] = 1
-        
+
         # Step 3: Assemble the final abstract and set success status
         final_abstract_parts = [base_abstract]
-        if ai_abstract_parts.get('CAPTION'): final_abstract_parts.append(f"Caption: {ai_abstract_parts['CAPTION']}")
-        if ai_abstract_parts.get('OCR'): final_abstract_parts.append(f"OCR: {ai_abstract_parts['OCR']}")
+        if ai_abstract_parts.get('CAPTION'): final_abstract_parts.append(f"Caption: {ai_abstract_parts['CAPTION']} ")
+        if ai_abstract_parts.get('OCR'): final_abstract_parts.append(f"OCR: {ai_abstract_parts['OCR']} ")
         if ai_abstract_parts.get('VIPS'): final_abstract_parts.append(f"VIPs: {ai_abstract_parts['VIPS']}")
-        
+
         results['new_abstract'] = "\n\n".join(filter(None, final_abstract_parts))
-        
+
         # Final status is success only if all relevant parts succeeded
         if results['o_detected'] and results['ocr'] and results['face']:
             results['status'] = 3 # Success
@@ -140,11 +169,11 @@ def process_batch():
     processed_count = 0
     for doc in documents:
         result_data = process_document(doc, dms_session_token)
-        
+
         # --- New Timeout Logic ---
         # Run the database update in a thread so it can't freeze the main loop
         db_thread = Thread(
-            target=db_connector.update_document_processing_status, 
+            target=db_connector.update_document_processing_status,
             kwargs=result_data
         )
         db_thread.start()
@@ -160,7 +189,7 @@ def process_batch():
                 logging.info(f"Successfully processed and updated DB for document {doc['docnumber']}.")
             else:
                 logging.warning(f"Failed to process document {doc['docnumber']}. Error has been logged to the database.")
-            
+
     logging.info(f"Batch finished. Successfully processed {processed_count} out of {len(documents)} documents.")
     return jsonify({"status": "success", "message": f"Processed {processed_count} documents.", "processed_count": processed_count}), 200
 
@@ -198,10 +227,10 @@ def api_get_image(doc_id):
     """Serves the full image content for a given document ID."""
     dst = db_connector.dms_login()
     if not dst: return jsonify({'error': 'DMS login failed.'}), 500
-    
-    image_bytes = db_connector.get_media_content_from_dms(dst, doc_id)
-    if image_bytes:
-        return Response(image_bytes, mimetype='image/jpeg')
+
+    image_data, _ = wsdl_client.get_image_by_docnumber(dst, doc_id)
+    if image_data:
+        return Response(bytes(image_data), mimetype='image/jpeg')
     return jsonify({'error': 'Image not found in EDMS.'}), 404
 
 @app.route('/api/video/<doc_id>')
@@ -217,13 +246,13 @@ def api_get_video(doc_id):
     original_filename, media_type, file_ext = db_connector.get_media_info_from_dms(dst, doc_id)
     if not original_filename:
         return jsonify({'error': 'Video metadata not found in EDMS.'}), 404
-    
+
     if media_type != 'video':
         return jsonify({'error': 'Requested document is not a video.'}), 400
 
     if not file_ext: file_ext = '.mp4' # Default extension
     cached_video_path = os.path.join(db_connector.video_cache_dir, f"{doc_id}{file_ext}")
-    
+
     # If the file is already cached, serve it directly and quickly.
     if os.path.exists(cached_video_path):
         logging.info(f"Serving video {doc_id} from cache.")
@@ -237,12 +266,12 @@ def api_get_video(doc_id):
 
     # Create the generator that will stream to the user and save to a file
     stream_generator = db_connector.stream_and_cache_generator(
-        obj_client=stream_details['obj_client'], 
-        stream_id=stream_details['stream_id'], 
+        obj_client=stream_details['obj_client'],
+        stream_id=stream_details['stream_id'],
         content_id=stream_details['content_id'],
         final_cache_path=cached_video_path
     )
-    
+
     # Return a streaming response
     return Response(stream_with_context(stream_generator), mimetype="video/mp4")
 

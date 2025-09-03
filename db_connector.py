@@ -486,3 +486,104 @@ def clear_video_cache():
     if os.path.exists(video_cache_dir):
         shutil.rmtree(video_cache_dir)
     os.makedirs(video_cache_dir)
+
+def insert_keywords_and_tags(docnumber, keywords):
+    """
+    Inserts keywords and links them to a document. Handles duplicates gracefully.
+    'keywords' is a list of dictionaries, with each dictionary having 'english' and 'arabic' keys.
+    """
+    conn = get_connection()
+    if not conn:
+        logging.error(f"DB_KEYWORD_FAILURE: Could not get a database connection for docnumber {docnumber}.")
+        return
+
+    try:
+        with conn.cursor() as cursor:
+            # Use a set to track keywords already processed in this batch to avoid redundant DB queries
+            processed_keywords = set()
+
+            for keyword in keywords:
+                english_keyword_orig = keyword.get('english')
+                arabic_keyword = keyword.get('arabic')
+
+                if not english_keyword_orig or not arabic_keyword:
+                    continue
+
+                # Standardize to lowercase for case-insensitive matching
+                english_keyword = english_keyword_orig.lower()
+
+                # Skip if already processed in this same document's batch
+                if english_keyword in processed_keywords:
+                    continue
+
+                # Skip keywords that are too long for the database column
+                if len(english_keyword) > 30:
+                    logging.warning(f"Skipping keyword '{english_keyword_orig}' for docnumber {docnumber} because its length ({len(english_keyword_orig)}) exceeds the 30-character limit.")
+                    continue
+
+                keyword_system_id = None
+
+                # Check if the keyword already exists
+                cursor.execute("SELECT SYSTEM_ID FROM KEYWORD WHERE KEYWORD_ID = :keyword_id", keyword_id=english_keyword)
+                result = cursor.fetchone()
+
+                if result:
+                    keyword_system_id = result[0]
+                else:
+                    # If it doesn't exist, try to insert it.
+                    try:
+                        cursor.execute("SELECT NVL(MAX(SYSTEM_ID), 0) + 1 FROM KEYWORD")
+                        keyword_system_id = cursor.fetchone()[0]
+                        
+                        cursor.execute("""
+                            INSERT INTO KEYWORD (KEYWORD_ID, DESCRIPTION, SYSTEM_ID)
+                            VALUES (:keyword_id, :description, :system_id)
+                        """, keyword_id=english_keyword, description=arabic_keyword, system_id=keyword_system_id)
+
+                    except oracledb.IntegrityError as ie:
+                        # This handles the rare case where another process inserted the keyword
+                        # between our SELECT and INSERT. We can ignore the error and fetch the ID.
+                        error, = ie.args
+                        if "ORA-00001" in error.message:
+                            logging.warning(f"Keyword '{english_keyword}' was inserted by another process. Fetching existing ID.")
+                            cursor.execute("SELECT SYSTEM_ID FROM KEYWORD WHERE KEYWORD_ID = :keyword_id", keyword_id=english_keyword)
+                            result = cursor.fetchone()
+                            if result:
+                                keyword_system_id = result[0]
+                            else:
+                                # This should almost never happen, but it's a safeguard.
+                                logging.error(f"Failed to fetch SYSTEM_ID for '{english_keyword}' after integrity error.")
+                                continue # Skip this keyword
+                        else:
+                            raise # Re-raise other integrity errors
+
+                # If we have a keyword ID, link it to the document
+                if keyword_system_id:
+                    cursor.execute("SELECT COUNT(*) FROM LKP_DOCUMENT_TAGS WHERE DOCNUMBER = :docnumber AND TAG_ID = :tag_id",
+                                   docnumber=docnumber, tag_id=keyword_system_id)
+                    
+                    if cursor.fetchone()[0] == 0:
+                        cursor.execute("SELECT NVL(MAX(SYSTEM_ID), 0) + 1 FROM LKP_DOCUMENT_TAGS")
+                        lkp_system_id = cursor.fetchone()[0]
+                        cursor.execute("""
+                            INSERT INTO LKP_DOCUMENT_TAGS (DOCNUMBER, TAG_ID, SYSTEM_ID, LAST_UPDATE, DISABLED)
+                            VALUES (:docnumber, :tag_id, :system_id, SYSDATE, 0)
+                        """, docnumber=docnumber, tag_id=keyword_system_id, system_id=lkp_system_id)
+                
+                # Mark this keyword as processed for this document
+                processed_keywords.add(english_keyword)
+
+            conn.commit()
+            logging.info(f"DB_KEYWORD_SUCCESS: Successfully processed keywords for docnumber {docnumber}.")
+
+    except oracledb.Error as e:
+        logging.error(f"DB_KEYWORD_ERROR: Oracle error while processing keywords for docnumber {docnumber}: {e}", exc_info=True)
+        try:
+            conn.rollback()
+            logging.info(f"DB_ROLLBACK: Transaction for docnumber {docnumber} keywords was rolled back.")
+        except oracledb.Error as rb_e:
+            logging.error(f"DB_ROLLBACK_ERROR: Failed to rollback transaction for docnumber {docnumber} keywords: {rb_e}", exc_info=True)
+
+    finally:
+        if conn:
+            conn.close()
