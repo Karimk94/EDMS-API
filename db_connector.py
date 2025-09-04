@@ -22,7 +22,6 @@ video_cache_dir = os.path.join(os.path.dirname(__file__), 'video_cache')
 if not os.path.exists(video_cache_dir):
     os.makedirs(video_cache_dir)
 
-
 # --- DMS Communication ---
 
 def dms_login():
@@ -244,7 +243,7 @@ def get_connection():
         print(f"DB connection error: {error.message}")
         return None
 
-def fetch_documents_from_oracle(page=1, page_size=10, search_term=None, date_from=None, date_to=None, persons=None, person_condition='any'):
+def fetch_documents_from_oracle(page=1, page_size=10, search_term=None, date_from=None, date_to=None, persons=None, person_condition='any', tags=None):
     """Fetches a paginated list of documents from Oracle, handling filtering and thumbnail logic."""
     conn = get_connection()
     if not conn: return [], 0
@@ -258,7 +257,7 @@ def fetch_documents_from_oracle(page=1, page_size=10, search_term=None, date_fro
     documents = []
     total_rows = 0
 
-    base_where = "WHERE docnumber >= 19662092 AND FORM = 2740 "
+    base_where = "WHERE p.docnumber >= 19662092 AND p.FORM = 2740 "
     params = {}
     where_clauses = []
 
@@ -267,7 +266,7 @@ def fetch_documents_from_oracle(page=1, page_size=10, search_term=None, date_fro
         search_conditions = []
         for i, word in enumerate(words):
             key = f"search_word_{i}"
-            search_conditions.append(f"UPPER(ABSTRACT) LIKE :{key}")
+            search_conditions.append(f"UPPER(p.ABSTRACT) LIKE :{key}")
             params[key] = f"%{word}%"
         where_clauses.append(" AND ".join(search_conditions))
 
@@ -278,39 +277,63 @@ def fetch_documents_from_oracle(page=1, page_size=10, search_term=None, date_fro
             person_conditions = []
             for i, person in enumerate(person_list):
                 key = f'person_{i}'
-                person_conditions.append(f"UPPER(ABSTRACT) LIKE :{key}")
+                person_conditions.append(f"UPPER(p.ABSTRACT) LIKE :{key}")
                 params[key] = f"%{person}%"
             where_clauses.append(f"({op.join(person_conditions)})")
 
     if date_from:
-        where_clauses.append("CREATION_DATE >= TO_DATE(:date_from, 'YYYY-MM-DD HH24:MI:SS')")
+        where_clauses.append("p.CREATION_DATE >= TO_DATE(:date_from, 'YYYY-MM-DD HH24:MI:SS')")
         params['date_from'] = date_from
     if date_to:
-        where_clauses.append("CREATION_DATE <= TO_DATE(:date_to, 'YYYY-MM-DD HH24:MI:SS')")
+        where_clauses.append("p.CREATION_DATE <= TO_DATE(:date_to, 'YYYY-MM-DD HH24:MI:SS')")
         params['date_to'] = date_to
     
+    # New logic for filtering by tags (keywords or persons)
+    if tags:
+        tag_list = [t.strip().upper() for t in tags.split(',') if t.strip()]
+        if tag_list:
+            tag_conditions = []
+            for i, tag in enumerate(tag_list):
+                key = f'tag_{i}'
+                # Condition for matching in keywords via LKP_DOCUMENT_TAGS
+                keyword_subquery = f"""
+                EXISTS (
+                    SELECT 1 FROM LKP_DOCUMENT_TAGS ldt
+                    JOIN KEYWORD k ON ldt.TAG_ID = k.SYSTEM_ID
+                    WHERE ldt.DOCNUMBER = p.DOCNUMBER AND UPPER(k.KEYWORD_ID) = :{key}
+                )
+                """
+                # Condition for matching in abstract for persons
+                person_subquery = f"UPPER(p.ABSTRACT) LIKE '%' || :{key} || '%'"
+                
+                tag_conditions.append(f"({keyword_subquery} OR {person_subquery})")
+                params[key] = tag
+            
+            # All selected tags must be present in the document
+            where_clauses.append(" AND ".join(tag_conditions))
+
     final_where_clause = base_where + ("AND " + " AND ".join(where_clauses) if where_clauses else "")
 
     try:
         with conn.cursor() as cursor:
             # Get total count for pagination
-            count_query = f"SELECT COUNT(DOCNUMBER) FROM PROFILE {final_where_clause}"
+            count_query = f"SELECT COUNT(p.DOCNUMBER) FROM PROFILE p {final_where_clause}"
             cursor.execute(count_query, params)
             total_rows = cursor.fetchone()[0]
 
             # Fetch the actual page of documents
-            fetch_query = f"SELECT DOCNUMBER, ABSTRACT, AUTHOR, CREATION_DATE, DOCNAME FROM PROFILE {final_where_clause}"
+            fetch_query = f"SELECT p.DOCNUMBER, p.ABSTRACT, p.AUTHOR, p.CREATION_DATE, p.DOCNAME FROM PROFILE p {final_where_clause}"
             params['offset'] = offset
             params['page_size'] = page_size
             
-            cursor.execute(fetch_query + " ORDER BY DOCNUMBER DESC OFFSET :offset ROWS FETCH NEXT :page_size ROWS ONLY", params)
+            cursor.execute(fetch_query + " ORDER BY p.DOCNUMBER DESC OFFSET :offset ROWS FETCH NEXT :page_size ROWS ONLY", params)
             
             for row in cursor:
                 doc_id, abstract, author, creation_date, docname = row
                 thumbnail_path = None
-                tags = []
+                doc_tags = set() # Use a set to avoid duplicates
 
-                # Fetch tags for the current document
+                # Fetch keyword tags for the current document
                 with conn.cursor() as tag_cursor:
                     tag_query = """
                         SELECT k.KEYWORD_ID
@@ -320,8 +343,20 @@ def fetch_documents_from_oracle(page=1, page_size=10, search_term=None, date_fro
                     """
                     tag_cursor.execute(tag_query, doc_id=doc_id)
                     for tag_row in tag_cursor:
-                        tags.append(tag_row[0])
+                        doc_tags.add(tag_row[0])
                 
+                # Fetch person tags from LKP_PERSON if they exist in the abstract
+                if abstract:
+                    with conn.cursor() as person_cursor:
+                        person_query = """
+                            SELECT NAME_ENGLISH
+                            FROM LKP_PERSON
+                            WHERE :abstract LIKE '%' || UPPER(NAME_ENGLISH) || '%'
+                        """
+                        person_cursor.execute(person_query, abstract=abstract.upper())
+                        for person_row in person_cursor:
+                            doc_tags.add(person_row[0])
+
                 original_filename, media_type, file_ext = get_media_info_from_dms(dst, doc_id)
                 
                 cached_thumbnail_file = f"{doc_id}.jpg"
@@ -342,7 +377,7 @@ def fetch_documents_from_oracle(page=1, page_size=10, search_term=None, date_fro
                     "date": creation_date.strftime('%Y-%m-%d') if creation_date else "N/A",
                     "thumbnail_url": thumbnail_path or "https://placehold.co/100x100/e9ecef/6c757d?text=No+Image",
                     "media_type": media_type,
-                    "tags": tags
+                    "tags": sorted(list(doc_tags))
                 })
     finally:
         conn.close()
@@ -498,6 +533,33 @@ def fetch_lkp_persons(page=1, page_size=20, search=''):
     finally:
         conn.close()
     return persons, total_rows
+
+def fetch_all_tags():
+    """Fetches all unique keywords and person names to be used as tags."""
+    conn = get_connection()
+    if not conn: return []
+    
+    tags = set()
+    try:
+        with conn.cursor() as cursor:
+            # Fetch all keywords
+            cursor.execute("SELECT KEYWORD_ID FROM KEYWORD")
+            for row in cursor:
+                if row[0]:  # Check if the value is not None
+                    tags.add(row[0].strip())
+            
+            # Fetch all person names
+            cursor.execute("SELECT NAME_ENGLISH FROM LKP_PERSON")
+            for row in cursor:
+                if row[0]:  # Check if the value is not None
+                    tags.add(row[0].strip())
+    except oracledb.Error as e:
+        print(f"❌ Oracle Database error in fetch_all_tags: {e}")
+    finally:
+        conn.close()
+    
+    return sorted(list(tags))
+
 
 def clear_thumbnail_cache():
     """Deletes all files in the thumbnail cache directory."""

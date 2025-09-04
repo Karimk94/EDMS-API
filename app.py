@@ -249,6 +249,7 @@ def api_get_documents():
     date_to = request.args.get('date_to', None, type=str)
     persons = request.args.get('persons', None, type=str)
     person_condition = request.args.get('person_condition', 'any', type=str)
+    tags = request.args.get('tags', None, type=str)
 
     page_size = 20
     documents, total_rows = db_connector.fetch_documents_from_oracle(
@@ -258,7 +259,8 @@ def api_get_documents():
         date_from=date_from,
         date_to=date_to,
         persons=persons,
-        person_condition=person_condition
+        person_condition=person_condition,
+        tags=tags
     )
 
     total_pages = math.ceil(total_rows / page_size) if total_rows > 0 else 1
@@ -384,6 +386,12 @@ def api_get_persons():
         'options': persons,
         'hasMore': (page * 20) < total_rows
     })
+
+@app.route('/api/tags')
+def api_get_tags():
+    """Fetches all unique tags (keywords and persons) for the filter dropdown."""
+    tags = db_connector.fetch_all_tags()
+    return jsonify(tags)
 
 if __name__ == '__main__':
     run_simple(
