@@ -6,3 +6,4 @@ zeep
 flask-cors
 Pillow
 moviepy
+PyMuPDF

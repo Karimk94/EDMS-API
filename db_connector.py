@@ -9,6 +9,7 @@ import io
 import shutil
 import logging
 from moviepy import VideoFileClip
+import fitz
 
 load_dotenv()
 
@@ -81,8 +82,11 @@ def get_media_info_from_dms(dst, doc_number):
                 print(f"Could not get filename for {doc_number}, using default. Error: {e}")
         
         video_extensions = ['.mp4', '.mov', '.avi', '.mkv']
+        pdf_extensions = ['.pdf']
         file_ext = os.path.splitext(filename)[1].lower()
         media_type = 'video' if file_ext in video_extensions else 'image'
+        if file_ext in pdf_extensions:
+            media_type = 'pdf'
         
         return filename, media_type, file_ext
 
@@ -213,6 +217,12 @@ def create_thumbnail(doc_number, media_type, file_ext, media_bytes):
             with open(temp_video_path, 'wb') as f: f.write(media_bytes)
             with VideoFileClip(temp_video_path) as clip: clip.save_frame(cached_path, t=1)
             os.remove(temp_video_path)
+        elif media_type == 'pdf':
+            with fitz.open(stream=media_bytes, filetype="pdf") as doc:
+                page = doc.load_page(0)  # Load the first page
+                pix = page.get_pixmap()
+                with Image.frombytes("RGB", [pix.width, pix.height], pix.samples) as img:
+                    img.save(cached_path, "JPEG", quality=95)
         else:
             with Image.open(io.BytesIO(media_bytes)) as img:
                 img.thumbnail((300, 300))

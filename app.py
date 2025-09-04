@@ -233,6 +233,17 @@ def api_get_image(doc_id):
         return Response(bytes(image_data), mimetype='image/jpeg')
     return jsonify({'error': 'Image not found in EDMS.'}), 404
 
+@app.route('/api/pdf/<doc_id>')
+def api_get_pdf(doc_id):
+    """Serves the full PDF content for a given document ID."""
+    dst = db_connector.dms_login()
+    if not dst: return jsonify({'error': 'DMS login failed.'}), 500
+
+    pdf_data, _ = wsdl_client.get_image_by_docnumber(dst, doc_id)
+    if pdf_data:
+        return Response(bytes(pdf_data), mimetype='application/pdf')
+    return jsonify({'error': 'PDF not found in EDMS.'}), 404
+
 @app.route('/api/video/<doc_id>')
 def api_get_video(doc_id):
     """
