@@ -308,6 +308,19 @@ def fetch_documents_from_oracle(page=1, page_size=10, search_term=None, date_fro
             for row in cursor:
                 doc_id, abstract, author, creation_date, docname = row
                 thumbnail_path = None
+                tags = []
+
+                # Fetch tags for the current document
+                with conn.cursor() as tag_cursor:
+                    tag_query = """
+                        SELECT k.KEYWORD_ID
+                        FROM LKP_DOCUMENT_TAGS ldt
+                        JOIN KEYWORD k ON ldt.TAG_ID = k.SYSTEM_ID
+                        WHERE ldt.DOCNUMBER = :doc_id
+                    """
+                    tag_cursor.execute(tag_query, doc_id=doc_id)
+                    for tag_row in tag_cursor:
+                        tags.append(tag_row[0])
                 
                 original_filename, media_type, file_ext = get_media_info_from_dms(dst, doc_id)
                 
@@ -328,7 +341,8 @@ def fetch_documents_from_oracle(page=1, page_size=10, search_term=None, date_fro
                     "author": author or "N/A",
                     "date": creation_date.strftime('%Y-%m-%d') if creation_date else "N/A",
                     "thumbnail_url": thumbnail_path or "https://placehold.co/100x100/e9ecef/6c757d?text=No+Image",
-                    "media_type": media_type
+                    "media_type": media_type,
+                    "tags": tags
                 })
     finally:
         conn.close()
