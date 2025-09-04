@@ -543,7 +543,7 @@ def fetch_all_tags():
     try:
         with conn.cursor() as cursor:
             # Fetch all keywords
-            cursor.execute("SELECT KEYWORD_ID FROM KEYWORD")
+            cursor.execute("SELECT KEYWORD_ID FROM KEYWORD WHERE system_id > 255196032")
             for row in cursor:
                 if row[0]:  # Check if the value is not None
                     tags.add(row[0].strip())
