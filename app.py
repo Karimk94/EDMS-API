@@ -44,17 +44,16 @@ def process_document(doc, dms_session_token):
     }
 
     try:
-        # Step 1: Fetch media and determine type
+        # Step 1: Fetch media and determine type from DMS
         media_bytes, filename = wsdl_client.get_image_by_docnumber(dms_session_token, docnumber)
         if not media_bytes:
             raise Exception(f"Failed to retrieve media for docnumber {docnumber} from WSDL service.")
-        logging.info(f"Media for {docnumber} ({filename}) fetched successfully.")
-
-        video_extensions = ['.mp4', '.mov', '.avi', '.mkv']
-        is_video = any(filename.lower().endswith(ext) for ext in video_extensions)
+        
+        _, media_type, _ = db_connector.get_media_info_from_dms(dms_session_token, docnumber)
+        logging.info(f"Media for {docnumber} ({filename}) fetched successfully. Type: {media_type}")
 
         # Step 2: Execute AI workflows based on media type
-        if is_video:
+        if media_type == 'video':
             video_summary = api_client.summarize_video(media_bytes, filename)
             caption_parts = []
             keywords_to_insert = []
@@ -112,6 +111,49 @@ def process_document(doc, dms_session_token):
 
             results['ocr'] = 1 # OCR is not applicable for videos, so mark as complete
 
+        elif media_type == 'pdf':
+            logging.info(f"Processing PDF document: {docnumber}")
+            keywords_to_insert = []
+            caption_parts = []
+            
+            # Perform OCR on the PDF
+            ocr_text = api_client.get_ocr_text_from_pdf(media_bytes, filename)
+            if ocr_text:
+                results['ocr'] = 1
+                
+                # Tokenize the OCR text to get keywords
+                tokenized_json_str = api_client.tokenize_transcript(ocr_text)
+                english_tags = []
+                try:
+                    tokenized_data = json.loads(tokenized_json_str)
+                    english_tags = tokenized_data.get('english_tags', [])
+                except json.JSONDecodeError:
+                    logging.warning(f"Could not decode tokenized transcript for PDF {docnumber} as JSON. Attempting to salvage tags.")
+                    english_match = re.search(r'"english_tags"\s*:\s*\[([^\]]+)\]', tokenized_json_str, re.IGNORECASE)
+                    if english_match:
+                        raw_english = english_match.group(1)
+                        english_tags = [tag.strip() for tag in raw_english.replace('"', '').split(',') if tag.strip()]
+                        logging.info(f"Salvaged English tags from PDF OCR: {english_tags}")
+                    else:
+                        logging.warning(f"Could not salvage any English tags from the malformed response for PDF {docnumber}.")
+
+                if english_tags:
+                    caption_parts.extend(english_tags)
+                    # Translate each tag for keyword insertion
+                    for tag in english_tags:
+                        arabic_translation = api_client.translate_text(tag)
+                        keywords_to_insert.append({'english': tag, 'arabic': arabic_translation})
+            
+            if keywords_to_insert:
+                db_connector.insert_keywords_and_tags(docnumber, keywords_to_insert)
+
+            # As per requirements, these steps are considered complete for PDFs
+            results['o_detected'] = 1
+            results['face'] = 1
+            
+            if caption_parts:
+                ai_abstract_parts['CAPTION'] = ", ".join(sorted(list(set(caption_parts))))
+
         else: # Is an image
             captions = api_client.get_captions(media_bytes, filename)
             if captions:
@@ -131,7 +173,7 @@ def process_document(doc, dms_session_token):
                     ai_abstract_parts['VIPS'] = ", ".join(sorted(list(unique_known_faces)))
                 results['face'] = 1
 
-        # Step 3: Assemble the final abstract and set success status
+        # Step 3: Assemble the final abstract
         final_abstract_parts = [base_abstract]
         if ai_abstract_parts.get('CAPTION'): final_abstract_parts.append(f"Caption: {ai_abstract_parts['CAPTION']} ")
         if ai_abstract_parts.get('OCR'): final_abstract_parts.append(f"OCR: {ai_abstract_parts['OCR']} ")
@@ -139,9 +181,12 @@ def process_document(doc, dms_session_token):
 
         results['new_abstract'] = "\n\n".join(filter(None, final_abstract_parts))
 
-        # Final status is success only if all relevant parts succeeded
-        if results['o_detected'] and results['ocr'] and results['face']:
-            results['status'] = 3 # Success
+        # Step 4: Set success status based on media type
+        if media_type == 'pdf' and results['ocr']:
+             results['status'] = 3 # Success for PDF is just OCR
+        elif media_type != 'pdf' and results['o_detected'] and results['ocr'] and results['face']:
+            results['status'] = 3 # Success for others requires all three
+
 
     except Exception as e:
         # If any error occurs, log it and set the error status
@@ -150,6 +195,7 @@ def process_document(doc, dms_session_token):
         results['error'] = str(e)
 
     return results
+
 @app.route('/process-batch', methods=['POST'])
 def process_batch():
     """API endpoint to trigger the processing of a batch of documents."""

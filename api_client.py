@@ -11,9 +11,19 @@ def get_captions(image_data, filename):
     return response.json().get('caption', '')
 
 def get_ocr_text(image_data, filename):
-    api_url = os.getenv("OCR_API_URL")
+    api_url = f"${os.getenv("OCR_API_URL")}/translate_image"
     files = {'image_file': (filename, io.BytesIO(image_data), 'application/octet-stream')}
     response = requests.post(api_url, files=files, timeout=300)
+    response.raise_for_status()
+    return response.json().get('text', '')
+
+def get_ocr_text_from_pdf(pdf_data, filename):
+    """Calls the new PDF processing endpoint in the OCR service."""
+    base_api_url = os.getenv("OCR_API_URL")
+    pdf_api_url = f"{base_api_url}/process_pdf"
+    
+    files = {'pdf_file': (filename, io.BytesIO(pdf_data), 'application/pdf')}
+    response = requests.post(pdf_api_url, files=files, timeout=300)
     response.raise_for_status()
     return response.json().get('text', '')
 
