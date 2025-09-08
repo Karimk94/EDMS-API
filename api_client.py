@@ -61,7 +61,7 @@ def summarize_video(video_data, filename):
     status_endpoint = f"{api_url}/status/{task_id}"
     while True:
         time.sleep(5)
-        status_response = requests.get(status_endpoint, timeout=60)
+        status_response = requests.get(status_endpoint, timeout=300)
         status_response.raise_for_status()
         status_data = status_response.json()
 

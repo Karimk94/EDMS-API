@@ -101,15 +101,43 @@ def process_document(doc, dms_session_token):
                     for tag in english_tags:
                         arabic_translation = api_client.translate_text(tag)
                         keywords_to_insert.append({'english': tag, 'arabic': arabic_translation})
-
+            
+            # --- Process OCR texts from video ---
+            if video_summary.get('ocr_texts'):
+                results['ocr'] = 1 # Mark OCR as successful since we have data
+                for ocr_text in video_summary['ocr_texts']:
+                    if not ocr_text: continue
+                    
+                    tokenized_json_str = api_client.tokenize_transcript(ocr_text)
+                    english_tags = []
+                    try:
+                        tokenized_data = json.loads(tokenized_json_str)
+                        english_tags = tokenized_data.get('english_tags', [])
+                    except json.JSONDecodeError:
+                        logging.warning(f"Could not decode tokenized video OCR for {docnumber} as JSON. Attempting to salvage tags.")
+                        english_match = re.search(r'"english_tags"\s*:\s*\[([^\]]+)\]', tokenized_json_str, re.IGNORECASE)
+                        if english_match:
+                            raw_english = english_match.group(1)
+                            english_tags = [tag.strip() for tag in raw_english.replace('"', '').split(',') if tag.strip()]
+                            logging.info(f"Salvaged English tags from video OCR: {english_tags}")
+                        else:
+                            logging.warning(f"Could not salvage any English tags from the malformed video OCR response for {docnumber}.")
+                    
+                    if english_tags:
+                        caption_parts.extend(english_tags)
+                        for tag in english_tags:
+                            arabic_translation = api_client.translate_text(tag)
+                            keywords_to_insert.append({'english': tag, 'arabic': arabic_translation})
+            else:
+                # If video has no text, still mark as completed for processing purposes.
+                results['ocr'] = 1
+            # --- END OF OCR LOGIC ---
 
             if keywords_to_insert:
                 db_connector.insert_keywords_and_tags(docnumber, keywords_to_insert)
 
             if caption_parts:
                 ai_abstract_parts['CAPTION'] = ", ".join(sorted(list(set(caption_parts))))
-
-            results['ocr'] = 1 # OCR is not applicable for videos, so mark as complete
 
         elif media_type == 'pdf':
             logging.info(f"Processing PDF document: {docnumber}")
@@ -183,7 +211,7 @@ def process_document(doc, dms_session_token):
 
         # Step 4: Set success status based on media type
         if media_type == 'pdf' and results['ocr']:
-             results['status'] = 3 # Success for PDF is just OCR
+                results['status'] = 3 # Success for PDF is just OCR
         elif media_type != 'pdf' and results['o_detected'] and results['ocr'] and results['face']:
             results['status'] = 3 # Success for others requires all three
 
