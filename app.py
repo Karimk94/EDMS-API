@@ -429,5 +429,5 @@ if __name__ == '__main__':
         use_reloader=False,
         use_debugger=True,
         threaded=True,
-        exclude_patterns=['*venv*', '*__pycache__*']
+        exclude_patterns=['*venv*', '*__pycache__*', '*video_cache*','*thumbnail_cache*']
     )

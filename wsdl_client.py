@@ -102,3 +102,52 @@ def get_image_by_docnumber(dst, doc_number):
             if content_id:
                 try: obj_client.service.ReleaseObject(call={'objectID': content_id})
                 except Exception: pass
+
+def get_dms_stream_details(dst, doc_number):
+    """Opens a stream to a DMS document and returns the client and stream ID for reading."""
+    try:
+        settings = Settings(strict=False, xml_huge_tree=True)
+        wsdl_url = os.getenv("WSDL_URL")
+        svc_client = Client(wsdl_url, port_name='BasicHttpBinding_IDMSvc', settings=settings)
+        obj_client = Client(wsdl_url, port_name='BasicHttpBinding_IDMObj', settings=settings)
+
+        get_doc_call = {'call': {'dstIn': dst, 'criteria': {'criteriaCount': 2, 'criteriaNames': {'string': ['%TARGET_LIBRARY', '%DOCUMENT_NUMBER']}, 'criteriaValues': {'string': ['RTA_MAIN', str(doc_number)]}}}}
+        doc_reply = svc_client.service.GetDocSvr3(**get_doc_call)
+        if not (doc_reply and doc_reply.resultCode == 0 and doc_reply.getDocID):
+            return None
+
+        content_id = doc_reply.getDocID
+        stream_reply = obj_client.service.GetReadStream(call={'dstIn': dst, 'contentID': content_id})
+        if not (stream_reply and stream_reply.resultCode == 0 and stream_reply.streamID):
+            obj_client.service.ReleaseObject(call={'objectID': content_id})
+            return None
+        
+        return {
+            "obj_client": obj_client,
+            "stream_id": stream_reply.streamID,
+            "content_id": content_id
+        }
+    except Exception as e:
+        print(f"Error opening DMS stream for {doc_number}: {e}")
+        return None
+
+def stream_image_by_docnumber(obj_client, stream_id, content_id):
+    """A generator that streams data from an open DMS stream."""
+    try:
+        while True:
+            read_reply = obj_client.service.ReadStream(call={'streamID': stream_id, 'requestedBytes': 65536})
+            if not read_reply or read_reply.resultCode != 0:
+                break
+            chunk_data = read_reply.streamData.streamBuffer if read_reply.streamData else None
+            if not chunk_data:
+                break
+            yield chunk_data
+    finally:
+        logging.info(f"DMS stream for doc closed.")
+        if obj_client:
+            if stream_id: 
+                try: obj_client.service.ReleaseObject(call={'objectID': stream_id})
+                except Exception: pass
+            if content_id: 
+                try: obj_client.service.ReleaseObject(call={'objectID': content_id})
+                except Exception: pass
