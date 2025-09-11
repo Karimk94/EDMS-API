@@ -1,0 +1,18 @@
+{
+  "meaningless_english": [
+    "a", "an", "the", "and", "is", "in", "it", "of", "for", "on", "with", "at",
+    "by", "to", "up", "as", "be", "do", "if", "so", "am", "are", "was", "were",
+    "has", "had", "not", "but", "or", "so", "me", "my", "he", "she", "we", "they"
+  ],
+  "profanity_english": [
+    "shit", "fuck", "bitch", "cunt", "asshole", "damn", "hell", "piss", "dick",
+    "pussy", "gay"
+  ],
+  "meaningless_arabic": [
+    "ال", "و", "في", "من", "الى", "على", "يا", "هو", "هي", "هم", "هن", "نحن",
+    "أنا", "أنت", "هذا", "هذه"
+  ],
+  "profanity_arabic": [
+    "كلب", "حقير", "حيوان", "خرا", "تبا", "عاهرة"
+  ]
+}

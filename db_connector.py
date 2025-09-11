@@ -331,31 +331,6 @@ def fetch_documents_from_oracle(page=1, page_size=10, search_term=None, date_fro
             for row in cursor:
                 doc_id, abstract, author, creation_date, docname = row
                 thumbnail_path = None
-                doc_tags = set() # Use a set to avoid duplicates
-
-                # Fetch keyword tags for the current document
-                with conn.cursor() as tag_cursor:
-                    tag_query = """
-                        SELECT k.KEYWORD_ID
-                        FROM LKP_DOCUMENT_TAGS ldt
-                        JOIN KEYWORD k ON ldt.TAG_ID = k.SYSTEM_ID
-                        WHERE ldt.DOCNUMBER = :doc_id
-                    """
-                    tag_cursor.execute(tag_query, doc_id=doc_id)
-                    for tag_row in tag_cursor:
-                        doc_tags.add(tag_row[0])
-                
-                # Fetch person tags from LKP_PERSON if they exist in the abstract
-                if abstract:
-                    with conn.cursor() as person_cursor:
-                        person_query = """
-                            SELECT NAME_ENGLISH
-                            FROM LKP_PERSON
-                            WHERE :abstract LIKE '%' || UPPER(NAME_ENGLISH) || '%'
-                        """
-                        person_cursor.execute(person_query, abstract=abstract.upper())
-                        for person_row in person_cursor:
-                            doc_tags.add(person_row[0])
 
                 original_filename, media_type, file_ext = get_media_info_from_dms(dst, doc_id)
                 
@@ -375,9 +350,8 @@ def fetch_documents_from_oracle(page=1, page_size=10, search_term=None, date_fro
                     "docname": docname or "",
                     "author": author or "N/A",
                     "date": creation_date.strftime('%Y-%m-%d') if creation_date else "N/A",
-                    "thumbnail_url": thumbnail_path or "https://placehold.co/100x100/e9ecef/6c757d?text=No+Image",
-                    "media_type": media_type,
-                    "tags": sorted(list(doc_tags))
+                    "thumbnail_url": thumbnail_path or "",
+                    "media_type": media_type
                 })
     finally:
         conn.close()
@@ -543,7 +517,7 @@ def fetch_all_tags():
     try:
         with conn.cursor() as cursor:
             # Fetch all keywords
-            cursor.execute("SELECT KEYWORD_ID FROM KEYWORD WHERE system_id > 255196032")
+            cursor.execute("SELECT KEYWORD_ID FROM KEYWORD k JOIN LKP_DOCUMENT_TAGS ldt ON ldt.TAG_ID = k.SYSTEM_ID")
             for row in cursor:
                 if row[0]:  # Check if the value is not None
                     tags.add(row[0].strip())
@@ -560,6 +534,50 @@ def fetch_all_tags():
     
     return sorted(list(tags))
 
+def fetch_tags_for_document(doc_id):
+    """Fetches all keyword and person tags for a single document."""
+    conn = get_connection()
+    if not conn:
+        return []
+
+    doc_tags = set()
+    try:
+        with conn.cursor() as cursor:
+            # First, get the abstract for the document to find person tags
+            cursor.execute("SELECT ABSTRACT FROM PROFILE WHERE DOCNUMBER = :doc_id", {'doc_id': doc_id})
+            result = cursor.fetchone()
+            abstract = result[0] if result else None
+
+            # Fetch keyword tags from LKP_DOCUMENT_TAGS
+            tag_query = """
+                SELECT k.KEYWORD_ID
+                FROM LKP_DOCUMENT_TAGS ldt
+                JOIN KEYWORD k ON ldt.TAG_ID = k.SYSTEM_ID
+                WHERE ldt.DOCNUMBER = :doc_id
+            """
+            cursor.execute(tag_query, {'doc_id': doc_id})
+            for tag_row in cursor:
+                if tag_row[0]:
+                    doc_tags.add(tag_row[0])
+
+            # Fetch person tags by checking the abstract against LKP_PERSON
+            if abstract:
+                person_query = """
+                    SELECT NAME_ENGLISH
+                    FROM LKP_PERSON
+                    WHERE :abstract LIKE '%' || UPPER(NAME_ENGLISH) || '%'
+                """
+                cursor.execute(person_query, {'abstract': abstract.upper()})
+                for person_row in cursor:
+                    if person_row[0]:
+                        doc_tags.add(person_row[0])
+    except oracledb.Error as e:
+        print(f"❌ Oracle Database error in fetch_tags_for_document for doc_id {doc_id}: {e}")
+    finally:
+        if conn:
+            conn.close()
+    
+    return sorted(list(doc_tags))
 
 def clear_thumbnail_cache():
     """Deletes all files in the thumbnail cache directory."""

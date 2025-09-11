@@ -421,6 +421,12 @@ def api_get_tags():
     tags = db_connector.fetch_all_tags()
     return jsonify(tags)
 
+@app.route('/api/tags/<int:doc_id>')
+def api_get_tags_for_document(doc_id):
+    """Fetches all tags for a specific document ID."""
+    tags = db_connector.fetch_tags_for_document(doc_id)
+    return jsonify({"tags": tags})
+
 if __name__ == '__main__':
     run_simple(
         '127.0.0.1',
