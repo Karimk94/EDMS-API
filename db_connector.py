@@ -243,6 +243,66 @@ def get_connection():
         print(f"DB connection error: {error.message}")
         return None
 
+def get_app_id_from_extension(extension):
+    """
+    Looks up the APPLICATION (APP_ID) from the APPS table based on the file extension.
+    """
+    conn = get_connection()
+    if not conn:
+        return None
+    
+    app_id = None
+    try:
+        with conn.cursor() as cursor:
+            # First, check the DEFAULT_EXTENSION column
+            cursor.execute("SELECT APPLICATION FROM APPS WHERE DEFAULT_EXTENSION = :ext", ext=extension)
+            result = cursor.fetchone()
+            if result:
+                app_id = result[0]
+            else:
+                # If not found, check the FILE_TYPES column
+                cursor.execute("SELECT APPLICATION FROM APPS WHERE FILE_TYPES LIKE :ext_like", ext_like=f"%{extension}%")
+                result = cursor.fetchone()
+                if result:
+                    app_id = result[0]
+    except oracledb.Error as e:
+        print(f"❌ Oracle Database error in get_app_id_from_extension: {e}")
+    finally:
+        if conn:
+            conn.close()
+    return app_id
+
+def get_specific_documents_for_processing(docnumbers):
+    """Gets details for a specific list of docnumbers that need AI processing."""
+    if not docnumbers:
+        return []
+        
+    conn = get_connection()
+    if not conn:
+        return []
+
+    try:
+        with conn.cursor() as cursor:
+            # Create placeholders for the IN clause
+            placeholders = ','.join([':' + str(i+1) for i in range(len(docnumbers))])
+            
+            sql = f"""
+            SELECT p.docnumber, p.abstract,
+                   NVL(q.o_detected, 0) as o_detected,
+                   NVL(q.OCR, 0) as ocr,
+                   NVL(q.face, 0) as face,
+                   NVL(q.attempts, 0) as attempts
+            FROM PROFILE p
+            LEFT JOIN TAGGING_QUEUE q ON p.docnumber = q.docnumber
+            WHERE p.docnumber IN ({placeholders})
+            """
+            cursor.execute(sql, docnumbers)
+            columns = [col[0].lower() for col in cursor.description]
+            return [dict(zip(columns, row)) for row in cursor.fetchall()]
+    finally:
+        if conn:
+            conn.close()
+
 def fetch_documents_from_oracle(page=1, page_size=10, search_term=None, date_from=None, date_to=None, persons=None, person_condition='any', tags=None):
     """Fetches a paginated list of documents from Oracle, handling filtering and thumbnail logic."""
     conn = get_connection()
@@ -691,3 +751,4 @@ def insert_keywords_and_tags(docnumber, keywords):
     finally:
         if conn:
             conn.close()
+

@@ -5,6 +5,7 @@ import api_client
 import wsdl_client
 import logging
 from werkzeug.serving import run_simple
+from werkzeug.utils import secure_filename
 import math
 import os
 import json
@@ -266,6 +267,92 @@ def process_batch():
 
     logging.info(f"Batch finished. Successfully processed {processed_count} out of {len(documents)} documents.")
     return jsonify({"status": "success", "message": f"Processed {processed_count} documents.", "processed_count": processed_count}), 200
+
+@app.route('/api/upload_document', methods=['POST'])
+def api_upload_document():
+    if 'file' not in request.files:
+        return jsonify({"success": False, "error": "No file part in the request"}), 400
+    
+    file = request.files['file']
+    if file.filename == '':
+        return jsonify({"success": False, "error": "No selected file"}), 400
+
+    filename = secure_filename(file.filename)
+    file_extension = os.path.splitext(filename)[1].lstrip('.').upper()
+    
+    app_id = db_connector.get_app_id_from_extension(file_extension)
+    if not app_id:
+        logging.warning(f"Could not find APP_ID for extension: {file_extension}. Defaulting to 'UNKNOWN'.")
+        app_id = 'UNKNOWN'
+
+    logging.info(f"Upload request received for file: {filename}. Mapped to APP_ID: {app_id}")
+
+    docname = request.form.get('docname', os.path.splitext(filename)[0])
+    abstract = request.form.get('abstract', 'Uploaded via EDMS Viewer')
+    
+    dst = wsdl_client.dms_login()
+    if not dst:
+        return jsonify({"success": False, "error": "Failed to authenticate with DMS."}), 500
+
+    metadata = {
+        "docname": docname,
+        "abstract": abstract,
+        "app_id": app_id,
+        "filename": filename
+    }
+    
+    # FINAL FIX: Pass the file's stream object directly to the upload function to handle streaming correctly.
+    new_doc_number = wsdl_client.upload_document_to_dms(dst, file.stream, metadata)
+
+    if new_doc_number:
+        logging.info(f"Successfully uploaded {filename} as docnumber {new_doc_number}.")
+        return jsonify({"success": True, "docnumber": new_doc_number, "filename": filename})
+    else:
+        logging.error(f"Failed to upload {filename} to DMS.")
+        return jsonify({"success": False, "error": "Failed to upload file to DMS."}), 500
+
+
+@app.route('/api/process_uploaded_documents', methods=['POST'])
+def api_process_uploaded_documents():
+    data = request.get_json()
+    docnumbers = data.get('docnumbers')
+    
+    if not docnumbers or not isinstance(docnumbers, list):
+        return jsonify({"status": "error", "message": "Invalid data provided. 'docnumbers' list is required."}), 400
+
+    logging.info(f"Processing request for docnumbers: {docnumbers}")
+
+    dms_session_token = db_connector.dms_login()
+    if not dms_session_token:
+        logging.critical("Could not log into DMS for processing. Aborting.")
+        return jsonify({"status": "error", "message": "Failed to authenticate with DMS."}), 500
+
+    results = {"processed": [], "failed": []}
+    
+    docs_to_process = db_connector.get_specific_documents_for_processing(docnumbers)
+
+    for doc in docs_to_process:
+        result_data = process_document(doc, dms_session_token)
+        
+        db_thread = Thread(
+            target=db_connector.update_document_processing_status,
+            kwargs=result_data
+        )
+        db_thread.start()
+        db_thread.join(timeout=20.0)
+
+        if db_thread.is_alive():
+            logging.critical(f"DATABASE HANG: The update for doc {doc['docnumber']} timed out.")
+            results["failed"].append(doc['docnumber'])
+        else:
+            if result_data['status'] == 3: # Success
+                results["processed"].append(doc['docnumber'])
+                logging.info(f"Successfully processed uploaded doc {doc['docnumber']}.")
+            else:
+                results["failed"].append(doc['docnumber'])
+                logging.warning(f"Failed to process uploaded doc {doc['docnumber']}. Error: {result_data.get('error')}")
+
+    return jsonify(results), 200
 
 # --- Viewer API Routes ---
 @app.route('/api/documents')
