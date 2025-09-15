@@ -21,7 +21,7 @@ def get_captions(image_data, filename):
     response = requests.post(stream_api_url, data=data_chunk_generator(image_data), headers=headers, timeout=300)
     
     response.raise_for_status()
-    return response.json().get('caption', '')
+    return response.json()
 
 def get_ocr_text(image_data, filename):
     """Calls the OCR service for images using a stream."""

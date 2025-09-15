@@ -184,16 +184,21 @@ def process_document(doc, dms_session_token):
                 ai_abstract_parts['CAPTION'] = ", ".join(sorted(list(set(caption_parts))))
 
         else: # Is an image
-            captions = api_client.get_captions(media_bytes, filename)
-            if captions:
-                ai_abstract_parts['CAPTION'] = captions
+            keywords_to_insert = []
+            result = api_client.get_captions(media_bytes, filename)
+            if result:
+                ai_abstract_parts['CAPTION'] = result.get('caption', '')
                 results['o_detected'] = 1
+                tags = result.get('tags',[])
+                for tag in tags:
+                    arabic_translation = api_client.translate_text(tag)
+                    keywords_to_insert.append({'english': tag, 'arabic': arabic_translation})
 
             ocr_text = api_client.get_ocr_text(media_bytes, filename)
+            results['ocr'] = 1 # Mark OCR as complete, even if no text is found
             if ocr_text:
                 ai_abstract_parts['OCR'] = ocr_text
-                results['ocr'] = 1
-
+                
             recognized_faces = api_client.recognize_faces(media_bytes, filename)
             if recognized_faces:
                 # Use a set to automatically handle duplicates
@@ -201,6 +206,9 @@ def process_document(doc, dms_session_token):
                 if unique_known_faces:
                     ai_abstract_parts['VIPS'] = ", ".join(sorted(list(unique_known_faces)))
                 results['face'] = 1
+            
+            if keywords_to_insert:
+                db_connector.insert_keywords_and_tags(docnumber, keywords_to_insert)
 
         # Step 3: Assemble the final abstract
         final_abstract_parts = [base_abstract]
