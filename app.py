@@ -535,6 +535,41 @@ def api_processing_status():
     
     return jsonify({"processing": still_processing})
 
+@app.route('/api/tags/<int:doc_id>', methods=['POST'])
+def api_add_tag(doc_id):
+    """Adds a new tag to a document."""
+    data = request.get_json()
+    tag = data.get('tag')
+    if not tag:
+        return jsonify({'error': 'Invalid data provided.'}), 400
+    success, message = db_connector.add_tag_to_document(doc_id, tag)
+    if success:
+        return jsonify({'message': message})
+    else:
+        return jsonify({'error': message}), 500
+
+@app.route('/api/tags/<int:doc_id>/<tag>', methods=['PUT'])
+def api_update_tag(doc_id, tag):
+    """Updates a tag for a document."""
+    data = request.get_json()
+    new_tag = data.get('tag')
+    if not new_tag:
+        return jsonify({'error': 'Invalid data provided.'}), 400
+    success, message = db_connector.update_tag_for_document(doc_id, tag, new_tag)
+    if success:
+        return jsonify({'message': message})
+    else:
+        return jsonify({'error': message}), 500
+
+@app.route('/api/tags/<int:doc_id>/<tag>', methods=['DELETE'])
+def api_delete_tag(doc_id, tag):
+    """Deletes a tag from a document."""
+    success, message = db_connector.delete_tag_from_document(doc_id, tag)
+    if success:
+        return jsonify({'message': message})
+    else:
+        return jsonify({'error': message}), 500
+    
 if __name__ == '__main__':
     run_simple(
         '127.0.0.1',

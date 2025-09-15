@@ -756,3 +756,108 @@ def insert_keywords_and_tags(docnumber, keywords):
     finally:
         if conn:
             conn.close()
+
+def add_tag_to_document(doc_id, tag):
+    """Adds a new tag to a document, handling existing keywords."""
+    conn = get_connection()
+    if not conn:
+        return False, "Could not connect to the database."
+    try:
+        with conn.cursor() as cursor:
+            # Check if the keyword already exists
+            cursor.execute("SELECT SYSTEM_ID FROM KEYWORD WHERE KEYWORD_ID = :1", [tag.lower()])
+            result = cursor.fetchone()
+            if result:
+                keyword_id = result[0]
+            else:
+                # Insert new keyword if it doesn't exist
+                cursor.execute("SELECT NVL(MAX(SYSTEM_ID), 0) + 1 FROM KEYWORD")
+                keyword_id = cursor.fetchone()[0]
+                cursor.execute("INSERT INTO KEYWORD (KEYWORD_ID, SYSTEM_ID) VALUES (:1, :2)", [tag.lower(), keyword_id])
+
+            # Check if the document is already tagged with this keyword
+            cursor.execute("SELECT COUNT(*) FROM LKP_DOCUMENT_TAGS WHERE DOCNUMBER = :1 AND TAG_ID = :2", [doc_id, keyword_id])
+            if cursor.fetchone()[0] > 0:
+                return True, "Tag already exists on this document."
+
+            # Link the keyword to the document
+            cursor.execute("SELECT NVL(MAX(SYSTEM_ID), 0) + 1 FROM LKP_DOCUMENT_TAGS")
+            lkp_system_id = cursor.fetchone()[0]
+            cursor.execute("""
+                INSERT INTO LKP_DOCUMENT_TAGS (DOCNUMBER, TAG_ID, SYSTEM_ID, LAST_UPDATE, DISABLED)
+                VALUES (:docnumber, :tag_id, :system_id, SYSDATE, 0)
+            """, docnumber=doc_id, tag_id=keyword_id, system_id=lkp_system_id)
+            conn.commit()
+            return True, "Tag added successfully."
+    except oracledb.Error as e:
+        conn.rollback()
+        return False, f"Database error: {e}"
+    finally:
+        if conn:
+            conn.close()
+
+def update_tag_for_document(doc_id, old_tag, new_tag):
+    """Updates a tag for a document."""
+    conn = get_connection()
+    if not conn:
+        return False, "Could not connect to the database."
+    try:
+        with conn.cursor() as cursor:
+            # Find the old keyword ID
+            cursor.execute("SELECT SYSTEM_ID FROM KEYWORD WHERE KEYWORD_ID = :1", [old_tag.lower()])
+            result = cursor.fetchone()
+            if not result:
+                return False, "Old tag not found."
+            old_keyword_id = result[0]
+
+            # Check if the new keyword exists
+            cursor.execute("SELECT SYSTEM_ID FROM KEYWORD WHERE KEYWORD_ID = :1", [new_tag.lower()])
+            result = cursor.fetchone()
+            if result:
+                new_keyword_id = result[0]
+            else:
+                # Insert new keyword
+                cursor.execute("SELECT NVL(MAX(SYSTEM_ID), 0) + 1 FROM KEYWORD")
+                new_keyword_id = cursor.fetchone()[0]
+                cursor.execute("INSERT INTO KEYWORD (KEYWORD_ID, SYSTEM_ID) VALUES (:1, :2)", [new_tag.lower(), new_keyword_id])
+
+            # Update the link in LKP_DOCUMENT_TAGS
+            cursor.execute("""
+                UPDATE LKP_DOCUMENT_TAGS
+                SET TAG_ID = :new_tag_id
+                WHERE DOCNUMBER = :doc_id AND TAG_ID = :old_tag_id
+            """, new_tag_id=new_keyword_id, doc_id=doc_id, old_tag_id=old_keyword_id)
+            conn.commit()
+            return True, "Tag updated successfully."
+    except oracledb.Error as e:
+        return False, f"Database error: {e}"
+    finally:
+        if conn:
+            conn.close()
+
+def delete_tag_from_document(doc_id, tag):
+    """Deletes a tag from a document."""
+    conn = get_connection()
+    if not conn:
+        return False, "Could not connect to the database."
+    try:
+        with conn.cursor() as cursor:
+            # Find the keyword ID
+            cursor.execute("SELECT SYSTEM_ID FROM KEYWORD WHERE KEYWORD_ID = :1", [tag.lower()])
+            result = cursor.fetchone()
+            if not result:
+                return False, "Tag not found."
+            keyword_id = result[0]
+
+            # Delete the link from LKP_DOCUMENT_TAGS
+            cursor.execute("""
+                DELETE FROM LKP_DOCUMENT_TAGS
+                WHERE DOCNUMBER = :doc_id AND TAG_ID = :tag_id
+            """, doc_id=doc_id, tag_id=keyword_id)
+            conn.commit()
+            return True, "Tag deleted successfully."
+    except oracledb.Error as e:
+        return False, f"Database error: {e}"
+    finally:
+        if conn:
+            conn.close()
