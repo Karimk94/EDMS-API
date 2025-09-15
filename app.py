@@ -522,6 +522,19 @@ def api_get_tags_for_document(doc_id):
     tags = db_connector.fetch_tags_for_document(doc_id)
     return jsonify({"tags": tags})
 
+@app.route('/api/processing_status', methods=['POST'])
+def api_processing_status():
+    """Checks the processing status of a list of documents."""
+    data = request.get_json()
+    docnumbers = data.get('docnumbers')
+    
+    if not docnumbers or not isinstance(docnumbers, list):
+        return jsonify({"status": "error", "message": "Invalid data provided. 'docnumbers' list is required."}), 400
+
+    still_processing = db_connector.check_processing_status(docnumbers)
+    
+    return jsonify({"processing": still_processing})
+
 if __name__ == '__main__':
     run_simple(
         '127.0.0.1',

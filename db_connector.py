@@ -303,6 +303,40 @@ def get_specific_documents_for_processing(docnumbers):
         if conn:
             conn.close()
 
+def check_processing_status(docnumbers):
+    """
+    Checks the TAGGING_QUEUE for a list of docnumbers and returns those
+    that are not yet successfully processed (status != 3).
+    """
+    if not docnumbers:
+        return []
+        
+    conn = get_connection()
+    if not conn:
+        return docnumbers # Assume still processing if DB is down
+
+    try:
+        with conn.cursor() as cursor:
+            placeholders = ','.join([':' + str(i+1) for i in range(len(docnumbers))])
+            
+            sql = f"""
+            SELECT COLUMN_VALUE FROM TABLE(SYS.ODCINUMBERLIST({placeholders})) input_docs
+            WHERE input_docs.COLUMN_VALUE NOT IN (
+                SELECT docnumber FROM TAGGING_QUEUE WHERE docnumber IN ({placeholders}) AND STATUS = 3
+            )
+            """
+            
+            cursor.execute(sql, docnumbers + docnumbers)
+            still_processing = [row[0] for row in cursor.fetchall()]
+            return still_processing
+    except oracledb.Error as e:
+        print(f"❌ Oracle Database error in check_processing_status: {e}")
+        return docnumbers
+    finally:
+        if conn:
+            conn.close()
+
+
 def fetch_documents_from_oracle(page=1, page_size=10, search_term=None, date_from=None, date_to=None, persons=None, person_condition='any', tags=None):
     """Fetches a paginated list of documents from Oracle, handling filtering and thumbnail logic."""
     conn = get_connection()
@@ -348,14 +382,12 @@ def fetch_documents_from_oracle(page=1, page_size=10, search_term=None, date_fro
         where_clauses.append("p.CREATION_DATE <= TO_DATE(:date_to, 'YYYY-MM-DD HH24:MI:SS')")
         params['date_to'] = date_to
     
-    # New logic for filtering by tags (keywords or persons)
     if tags:
         tag_list = [t.strip().upper() for t in tags.split(',') if t.strip()]
         if tag_list:
             tag_conditions = []
             for i, tag in enumerate(tag_list):
                 key = f'tag_{i}'
-                # Condition for matching in keywords via LKP_DOCUMENT_TAGS
                 keyword_subquery = f"""
                 EXISTS (
                     SELECT 1 FROM LKP_DOCUMENT_TAGS ldt
@@ -363,25 +395,21 @@ def fetch_documents_from_oracle(page=1, page_size=10, search_term=None, date_fro
                     WHERE ldt.DOCNUMBER = p.DOCNUMBER AND UPPER(k.KEYWORD_ID) = :{key}
                 )
                 """
-                # Condition for matching in abstract for persons
                 person_subquery = f"UPPER(p.ABSTRACT) LIKE '%' || :{key} || '%'"
                 
                 tag_conditions.append(f"({keyword_subquery} OR {person_subquery})")
                 params[key] = tag
             
-            # All selected tags must be present in the document
             where_clauses.append(" AND ".join(tag_conditions))
 
     final_where_clause = base_where + ("AND " + " AND ".join(where_clauses) if where_clauses else "")
 
     try:
         with conn.cursor() as cursor:
-            # Get total count for pagination
             count_query = f"SELECT COUNT(p.DOCNUMBER) FROM PROFILE p {final_where_clause}"
             cursor.execute(count_query, params)
             total_rows = cursor.fetchone()[0]
 
-            # Fetch the actual page of documents
             fetch_query = f"SELECT p.DOCNUMBER, p.ABSTRACT, p.AUTHOR, p.CREATION_DATE, p.DOCNAME FROM PROFILE p {final_where_clause}"
             params['offset'] = offset
             params['page_size'] = page_size
@@ -449,17 +477,14 @@ def update_document_processing_status(docnumber, new_abstract, o_detected, ocr, 
     conn = get_connection()
     if not conn:
         logging.error(f"DB_UPDATE_FAILURE: Could not get a database connection for docnumber {docnumber}.")
-        return  # Exit if no connection
+        return
     
     try:
         with conn.cursor() as cursor:
-            # Start a transaction
             conn.begin()
             
-            # 1. Update the abstract in the PROFILE table
             cursor.execute("UPDATE PROFILE SET abstract = :1 WHERE docnumber = :2", (new_abstract, docnumber))
             
-            # 2. Merge the status into the TAGGING_QUEUE table
             merge_sql = """
             MERGE INTO TAGGING_QUEUE q
             USING (SELECT :docnumber AS docnumber FROM dual) src ON (q.docnumber = src.docnumber)
@@ -475,12 +500,10 @@ def update_document_processing_status(docnumber, new_abstract, o_detected, ocr, 
                 'status': status, 'error': error, 'transcript': transcript, 'attempts' : attempts
             })
             
-            # If all commands succeed, commit the transaction
             conn.commit()
             logging.info(f"DB_UPDATE_SUCCESS: Successfully updated status for docnumber {docnumber}.")
             
     except oracledb.Error as e:
-        # If any error occurs, log it and roll back the transaction
         logging.error(f"DB_UPDATE_ERROR: Oracle error while updating docnumber {docnumber}: {e}", exc_info=True)
         try:
             conn.rollback()
@@ -489,7 +512,6 @@ def update_document_processing_status(docnumber, new_abstract, o_detected, ocr, 
             logging.error(f"DB_ROLLBACK_ERROR: Failed to rollback transaction for docnumber {docnumber}: {rb_e}", exc_info=True)
             
     finally:
-        # Ensure the connection is always closed
         if conn:
             conn.close()
 
@@ -504,7 +526,6 @@ def update_abstract_with_vips(doc_id, vip_names):
             if result is None: return False, f"Document with ID {doc_id} not found."
             current_abstract = result[0] or ""
             
-            # Avoid duplicating the VIPs section
             if "VIPs :" in current_abstract:
                 return True, "Abstract already contains VIPs section."
 
@@ -576,16 +597,14 @@ def fetch_all_tags():
     tags = set()
     try:
         with conn.cursor() as cursor:
-            # Fetch all keywords
             cursor.execute("SELECT KEYWORD_ID FROM KEYWORD k JOIN LKP_DOCUMENT_TAGS ldt ON ldt.TAG_ID = k.SYSTEM_ID")
             for row in cursor:
-                if row[0]:  # Check if the value is not None
+                if row[0]:
                     tags.add(row[0].strip())
             
-            # Fetch all person names
             cursor.execute("SELECT NAME_ENGLISH FROM LKP_PERSON")
             for row in cursor:
-                if row[0]:  # Check if the value is not None
+                if row[0]:
                     tags.add(row[0].strip())
     except oracledb.Error as e:
         print(f"❌ Oracle Database error in fetch_all_tags: {e}")
@@ -603,12 +622,10 @@ def fetch_tags_for_document(doc_id):
     doc_tags = set()
     try:
         with conn.cursor() as cursor:
-            # First, get the abstract for the document to find person tags
             cursor.execute("SELECT ABSTRACT FROM PROFILE WHERE DOCNUMBER = :doc_id", {'doc_id': doc_id})
             result = cursor.fetchone()
             abstract = result[0] if result else None
 
-            # Fetch keyword tags from LKP_DOCUMENT_TAGS
             tag_query = """
                 SELECT k.KEYWORD_ID
                 FROM LKP_DOCUMENT_TAGS ldt
@@ -620,7 +637,6 @@ def fetch_tags_for_document(doc_id):
                 if tag_row[0]:
                     doc_tags.add(tag_row[0])
 
-            # Fetch person tags by checking the abstract against LKP_PERSON
             if abstract:
                 person_query = """
                     SELECT NAME_ENGLISH
@@ -663,7 +679,6 @@ def insert_keywords_and_tags(docnumber, keywords):
 
     try:
         with conn.cursor() as cursor:
-            # Use a set to track keywords already processed in this batch to avoid redundant DB queries
             processed_keywords = set()
 
             for keyword in keywords:
@@ -673,28 +688,23 @@ def insert_keywords_and_tags(docnumber, keywords):
                 if not english_keyword_orig or not arabic_keyword:
                     continue
 
-                # Standardize to lowercase for case-insensitive matching
                 english_keyword = english_keyword_orig.lower()
 
-                # Skip if already processed in this same document's batch
                 if english_keyword in processed_keywords:
                     continue
 
-                # Skip keywords that are too long for the database column
                 if len(english_keyword) > 30:
                     logging.warning(f"Skipping keyword '{english_keyword_orig}' for docnumber {docnumber} because its length ({len(english_keyword_orig)}) exceeds the 30-character limit.")
                     continue
 
                 keyword_system_id = None
 
-                # Check if the keyword already exists
                 cursor.execute("SELECT SYSTEM_ID FROM KEYWORD WHERE KEYWORD_ID = :keyword_id", keyword_id=english_keyword)
                 result = cursor.fetchone()
 
                 if result:
                     keyword_system_id = result[0]
                 else:
-                    # If it doesn't exist, try to insert it.
                     try:
                         cursor.execute("SELECT NVL(MAX(SYSTEM_ID), 0) + 1 FROM KEYWORD")
                         keyword_system_id = cursor.fetchone()[0]
@@ -705,8 +715,6 @@ def insert_keywords_and_tags(docnumber, keywords):
                         """, keyword_id=english_keyword, description=arabic_keyword, system_id=keyword_system_id)
 
                     except oracledb.IntegrityError as ie:
-                        # This handles the rare case where another process inserted the keyword
-                        # between our SELECT and INSERT. We can ignore the error and fetch the ID.
                         error, = ie.args
                         if "ORA-00001" in error.message:
                             logging.warning(f"Keyword '{english_keyword}' was inserted by another process. Fetching existing ID.")
@@ -715,13 +723,11 @@ def insert_keywords_and_tags(docnumber, keywords):
                             if result:
                                 keyword_system_id = result[0]
                             else:
-                                # This should almost never happen, but it's a safeguard.
                                 logging.error(f"Failed to fetch SYSTEM_ID for '{english_keyword}' after integrity error.")
-                                continue # Skip this keyword
+                                continue
                         else:
-                            raise # Re-raise other integrity errors
+                            raise
 
-                # If we have a keyword ID, link it to the document
                 if keyword_system_id:
                     cursor.execute("SELECT COUNT(*) FROM LKP_DOCUMENT_TAGS WHERE DOCNUMBER = :docnumber AND TAG_ID = :tag_id",
                                    docnumber=docnumber, tag_id=keyword_system_id)
@@ -734,7 +740,6 @@ def insert_keywords_and_tags(docnumber, keywords):
                             VALUES (:docnumber, :tag_id, :system_id, SYSDATE, 0)
                         """, docnumber=docnumber, tag_id=keyword_system_id, system_id=lkp_system_id)
                 
-                # Mark this keyword as processed for this document
                 processed_keywords.add(english_keyword)
 
             conn.commit()
@@ -751,4 +756,3 @@ def insert_keywords_and_tags(docnumber, keywords):
     finally:
         if conn:
             conn.close()
-
