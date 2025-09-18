@@ -7,3 +7,4 @@ flask-cors
 Pillow
 moviepy
 PyMuPDF
+waitress

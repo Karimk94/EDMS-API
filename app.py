@@ -4,7 +4,7 @@ import db_connector
 import api_client
 import wsdl_client
 import logging
-from werkzeug.serving import run_simple
+from waitress import serve
 from werkzeug.utils import secure_filename
 import math
 import os
@@ -29,7 +29,7 @@ def process_document(doc, dms_session_token):
 
     # Initialize variables with data from the document
     original_abstract = doc.get('abstract') or ''
-    base_abstract = original_abstract.split('\n\nCaption:')[0].strip()
+    base_abstract = re.split(r'\s*\n*\s*Caption:', original_abstract, 1, flags=re.IGNORECASE)[0].strip()
     ai_abstract_parts = {}
 
     results = {
@@ -187,7 +187,11 @@ def process_document(doc, dms_session_token):
             keywords_to_insert = []
             result = api_client.get_captions(media_bytes, filename)
             if result:
-                ai_abstract_parts['CAPTION'] = result.get('caption', '')
+                raw_caption = result.get('caption', '')
+                # Clean the stuttering words using the new helper function
+                cleaned_caption = clean_repeated_words(raw_caption)
+                # Assign the cleaned caption to the abstract
+                ai_abstract_parts['CAPTION'] = cleaned_caption
                 results['o_detected'] = 1
                 tags = result.get('tags',[])
                 for tag in tags:
@@ -361,6 +365,30 @@ def api_process_uploaded_documents():
                 logging.warning(f"Failed to process uploaded doc {doc['docnumber']}. Error: {result_data.get('error')}")
 
     return jsonify(results), 200
+
+def clean_repeated_words(text):
+    """Removes consecutive repeated words from a string, keeping the last one's punctuation."""
+    if not text:
+        return ""
+    words = text.split()
+    if not words:
+        return ""
+
+    result_words = [words[0]]
+    for i in range(1, len(words)):
+        # Normalize current word and the last word in the result for comparison
+        current_word_norm = re.sub(r'[^\w]', '', words[i]).lower()
+        last_result_word_norm = re.sub(r'[^\w]', '', result_words[-1]).lower()
+
+        # Check that the normalized words are not empty and are identical
+        if current_word_norm and current_word_norm == last_result_word_norm:
+            # Overwrite the last word with the current one to keep the punctuation of the final word
+            result_words[-1] = words[i]
+        else:
+            # It's a new word, so append it
+            result_words.append(words[i])
+
+    return " ".join(result_words)
 
 # --- Viewer API Routes ---
 @app.route('/api/documents')
@@ -571,12 +599,4 @@ def api_delete_tag(doc_id, tag):
         return jsonify({'error': message}), 500
     
 if __name__ == '__main__':
-    run_simple(
-        '127.0.0.1',
-        5000,
-        app,
-        use_reloader=False,
-        use_debugger=True,
-        threaded=True,
-        exclude_patterns=['*venv*', '*__pycache__*', '*video_cache*','*thumbnail_cache*']
-    )
+    serve(app, host='127.0.0.1', port=5000, threads=1000)
