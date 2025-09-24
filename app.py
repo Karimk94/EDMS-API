@@ -599,4 +599,5 @@ def api_delete_tag(doc_id, tag):
         return jsonify({'error': message}), 500
     
 if __name__ == '__main__':
-    serve(app, host='127.0.0.1', port=5000, threads=1000)
+    port = os.environ.get('HTTP_PLATFORM_PORT', 5000)
+    serve(app, host='localhost', port=port, threads=1000)
