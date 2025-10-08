@@ -1,4 +1,4 @@
-from flask import Flask, jsonify, request, Response, send_from_directory, stream_with_context, send_file
+from flask import Flask, jsonify, request, Response, send_from_directory, stream_with_context, send_file, session
 from flask_cors import CORS
 import db_connector
 import api_client
@@ -11,14 +11,58 @@ import os
 import json
 import re
 from threading import Thread
+import mimetypes
 
 # --- Logging Setup ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 app = Flask(__name__)
-CORS(app, resources={r"/api/*": {"origins": "*"}})
+# Added a default secret key for session management, move to .env in production
+app.secret_key = os.getenv('FLASK_SECRET_KEY', 'a-secure-default-secret-key-for-development')
+# Enabled supports_credentials for CORS to handle session cookies
+CORS(app, supports_credentials=True, resources={r"/api/*": {"origins": "*"}})
 
-# --- AI Processing Routes ---
+
+# --- Authentication Routes (from Archiving Backend) ---
+@app.route('/api/auth/login', methods=['POST'])
+def login():
+    data = request.get_json()
+    username = data.get('username')
+    password = data.get('password')
+
+    if not username or not password:
+        return jsonify({"error": "Username and password are required"}), 400
+
+    # Use the DMS user login function for authentication
+    dst = wsdl_client.dms_user_login(username, password)
+
+    if dst:
+        # If DMS login is successful, create a session for the user
+        session['user'] = {'username': username}
+        session['dst'] = dst  # Store the DMS token in the session
+        return jsonify({"message": "Login successful", "user": {"username": username}}), 200
+    else:
+        return jsonify({"error": "Invalid DMS credentials"}), 401
+
+
+@app.route('/api/auth/logout', methods=['POST'])
+def logout():
+    session.pop('user', None)
+    session.pop('dst', None)
+    return jsonify({"message": "Logout successful"}), 200
+
+
+@app.route('/api/auth/user', methods=['GET'])
+def get_user():
+    user = session.get('user')
+    if user:
+        return jsonify({'user': user}), 200
+    else:
+        # Return an error if no user is in the session
+        return jsonify({'error': 'Not authenticated'}), 401
+
+
+# --- AI Processing Routes (Original Middleware) ---
 def process_document(doc, dms_session_token):
     """
     Processes a single document, handling its own errors and returning a dictionary
@@ -39,7 +83,7 @@ def process_document(doc, dms_session_token):
         "ocr": doc.get('ocr', 0),
         "face": doc.get('face', 0),
         "transcript": '',
-        "status": 1, # Default status: In Progress
+        "status": 1,  # Default status: In Progress
         "error": '',
         "attempts": doc.get('attempts', 0) + 1
     }
@@ -49,7 +93,7 @@ def process_document(doc, dms_session_token):
         media_bytes, filename = wsdl_client.get_image_by_docnumber(dms_session_token, docnumber)
         if not media_bytes:
             raise Exception(f"Failed to retrieve media for docnumber {docnumber} from WSDL service.")
-        
+
         _, media_type, _ = db_connector.get_media_info_from_dms(dms_session_token, docnumber)
         logging.info(f"Media for {docnumber} ({filename}) fetched successfully. Type: {media_type}")
 
@@ -61,7 +105,7 @@ def process_document(doc, dms_session_token):
 
             if video_summary.get('objects'):
                 caption_parts.extend(video_summary['objects'])
-                results['o_detected'] = 1 # Mark as success if objects are found
+                results['o_detected'] = 1  # Mark as success if objects are found
                 for obj in video_summary['objects']:
                     arabic_translation = api_client.translate_text(obj)
                     keywords_to_insert.append({'english': obj, 'arabic': arabic_translation})
@@ -69,10 +113,11 @@ def process_document(doc, dms_session_token):
             if video_summary.get('faces'):
                 recognized_faces = api_client.recognize_faces_from_list(video_summary['faces'])
                 # Use a set to automatically handle duplicates
-                unique_known_faces = {f.get('name').replace('_', ' ').title() for f in recognized_faces if f.get('name') and f.get('name') != 'Unknown'}
+                unique_known_faces = {f.get('name').replace('_', ' ').title() for f in recognized_faces if
+                                      f.get('name') and f.get('name') != 'Unknown'}
                 if unique_known_faces:
                     ai_abstract_parts['VIPS'] = ", ".join(sorted(list(unique_known_faces)))
-                results['face'] = 1 # Mark as success if face analysis was run
+                results['face'] = 1  # Mark as success if face analysis was run
 
             if video_summary.get('transcript'):
                 tokenized_json_str = api_client.tokenize_transcript(video_summary['transcript'])
@@ -84,46 +129,54 @@ def process_document(doc, dms_session_token):
 
                 except json.JSONDecodeError:
                     # "Smart Fallback": The response is broken, so we parse the raw string
-                    logging.warning(f"Could not decode tokenized transcript for {docnumber} as JSON. Attempting to salvage tags.")
+                    logging.warning(
+                        f"Could not decode tokenized transcript for {docnumber} as JSON. Attempting to salvage tags.")
 
                     # Use regex to find the content within "english_tags": [...]
-                    english_match = re.search(r'"english_tags"\s*:\s*\[([^\]]+)\]', tokenized_json_str, re.IGNORECASE)
+                    english_match = re.search(r'"english_tags"\s*:\s*\[([^\]]+)\]', tokenized_json_str,
+                                              re.IGNORECASE)
                     if english_match:
                         raw_english = english_match.group(1)
                         # Clean the extracted string and split into a list
-                        english_tags = [tag.strip() for tag in raw_english.replace('"', '').split(',') if tag.strip()]
+                        english_tags = [tag.strip() for tag in raw_english.replace('"', '').split(',') if
+                                        tag.strip()]
                         logging.info(f"Salvaged English tags: {english_tags}")
                     else:
-                        logging.warning(f"Could not salvage any English tags from the malformed response for {docnumber}.")
+                        logging.warning(
+                            f"Could not salvage any English tags from the malformed response for {docnumber}.")
 
                 if english_tags:
-                    caption_parts.extend(english_tags) # Add to abstract
+                    caption_parts.extend(english_tags)  # Add to abstract
                     # Translate each tag for keyword insertion
                     for tag in english_tags:
                         arabic_translation = api_client.translate_text(tag)
                         keywords_to_insert.append({'english': tag, 'arabic': arabic_translation})
-            
+
             # --- Process OCR texts from video ---
             if video_summary.get('ocr_texts'):
-                results['ocr'] = 1 # Mark OCR as successful since we have data
+                results['ocr'] = 1  # Mark OCR as successful since we have data
                 for ocr_text in video_summary['ocr_texts']:
                     if not ocr_text: continue
-                    
+
                     tokenized_json_str = api_client.tokenize_transcript(ocr_text)
                     english_tags = []
                     try:
                         tokenized_data = json.loads(tokenized_json_str)
                         english_tags = tokenized_data.get('english_tags', [])
                     except json.JSONDecodeError:
-                        logging.warning(f"Could not decode tokenized video OCR for {docnumber} as JSON. Attempting to salvage tags.")
-                        english_match = re.search(r'"english_tags"\s*:\s*\[([^\]]+)\]', tokenized_json_str, re.IGNORECASE)
+                        logging.warning(
+                            f"Could not decode tokenized video OCR for {docnumber} as JSON. Attempting to salvage tags.")
+                        english_match = re.search(r'"english_tags"\s*:\s*\[([^\]]+)\]', tokenized_json_str,
+                                                  re.IGNORECASE)
                         if english_match:
                             raw_english = english_match.group(1)
-                            english_tags = [tag.strip() for tag in raw_english.replace('"', '').split(',') if tag.strip()]
+                            english_tags = [tag.strip() for tag in raw_english.replace('"', '').split(',') if
+                                            tag.strip()]
                             logging.info(f"Salvaged English tags from video OCR: {english_tags}")
                         else:
-                            logging.warning(f"Could not salvage any English tags from the malformed video OCR response for {docnumber}.")
-                    
+                            logging.warning(
+                                f"Could not salvage any English tags from the malformed video OCR response for {docnumber}.")
+
                     if english_tags:
                         caption_parts.extend(english_tags)
                         for tag in english_tags:
@@ -144,12 +197,12 @@ def process_document(doc, dms_session_token):
             logging.info(f"Processing PDF document: {docnumber}")
             keywords_to_insert = []
             caption_parts = []
-            
+
             # Perform OCR on the PDF
             ocr_text = api_client.get_ocr_text_from_pdf(media_bytes, filename)
             if ocr_text:
                 results['ocr'] = 1
-                
+
                 # Tokenize the OCR text to get keywords
                 tokenized_json_str = api_client.tokenize_transcript(ocr_text)
                 english_tags = []
@@ -157,14 +210,18 @@ def process_document(doc, dms_session_token):
                     tokenized_data = json.loads(tokenized_json_str)
                     english_tags = tokenized_data.get('english_tags', [])
                 except json.JSONDecodeError:
-                    logging.warning(f"Could not decode tokenized transcript for PDF {docnumber} as JSON. Attempting to salvage tags.")
-                    english_match = re.search(r'"english_tags"\s*:\s*\[([^\]]+)\]', tokenized_json_str, re.IGNORECASE)
+                    logging.warning(
+                        f"Could not decode tokenized transcript for PDF {docnumber} as JSON. Attempting to salvage tags.")
+                    english_match = re.search(r'"english_tags"\s*:\s*\[([^\]]+)\]', tokenized_json_str,
+                                              re.IGNORECASE)
                     if english_match:
                         raw_english = english_match.group(1)
-                        english_tags = [tag.strip() for tag in raw_english.replace('"', '').split(',') if tag.strip()]
+                        english_tags = [tag.strip() for tag in raw_english.replace('"', '').split(',') if
+                                        tag.strip()]
                         logging.info(f"Salvaged English tags from PDF OCR: {english_tags}")
                     else:
-                        logging.warning(f"Could not salvage any English tags from the malformed response for PDF {docnumber}.")
+                        logging.warning(
+                            f"Could not salvage any English tags from the malformed response for PDF {docnumber}.")
 
                 if english_tags:
                     caption_parts.extend(english_tags)
@@ -172,18 +229,18 @@ def process_document(doc, dms_session_token):
                     for tag in english_tags:
                         arabic_translation = api_client.translate_text(tag)
                         keywords_to_insert.append({'english': tag, 'arabic': arabic_translation})
-            
+
             if keywords_to_insert:
                 db_connector.insert_keywords_and_tags(docnumber, keywords_to_insert)
 
             # As per requirements, these steps are considered complete for PDFs
             results['o_detected'] = 1
             results['face'] = 1
-            
+
             if caption_parts:
                 ai_abstract_parts['CAPTION'] = ", ".join(sorted(list(set(caption_parts))))
 
-        else: # Is an image
+        else:  # Is an image
             keywords_to_insert = []
             result = api_client.get_captions(media_bytes, filename)
             if result:
@@ -193,24 +250,25 @@ def process_document(doc, dms_session_token):
                 # Assign the cleaned caption to the abstract
                 ai_abstract_parts['CAPTION'] = cleaned_caption
                 results['o_detected'] = 1
-                tags = result.get('tags',[])
+                tags = result.get('tags', [])
                 for tag in tags:
                     arabic_translation = api_client.translate_text(tag)
                     keywords_to_insert.append({'english': tag, 'arabic': arabic_translation})
 
             ocr_text = api_client.get_ocr_text(media_bytes, filename)
-            results['ocr'] = 1 # Mark OCR as complete, even if no text is found
+            results['ocr'] = 1  # Mark OCR as complete, even if no text is found
             if ocr_text:
                 ai_abstract_parts['OCR'] = ocr_text
-                
+
             recognized_faces = api_client.recognize_faces(media_bytes, filename)
             if recognized_faces:
                 # Use a set to automatically handle duplicates
-                unique_known_faces = {f.get('name').replace('_', ' ').title() for f in recognized_faces if f.get('name') and f.get('name') != 'Unknown'}
+                unique_known_faces = {f.get('name').replace('_', ' ').title() for f in recognized_faces if
+                                      f.get('name') and f.get('name') != 'Unknown'}
                 if unique_known_faces:
                     ai_abstract_parts['VIPS'] = ", ".join(sorted(list(unique_known_faces)))
                 results['face'] = 1
-            
+
             if keywords_to_insert:
                 db_connector.insert_keywords_and_tags(docnumber, keywords_to_insert)
 
@@ -224,25 +282,26 @@ def process_document(doc, dms_session_token):
 
         # Step 4: Set success status based on media type
         if media_type == 'pdf' and results['ocr']:
-                results['status'] = 3 # Success for PDF is just OCR
+            results['status'] = 3  # Success for PDF is just OCR
         elif media_type != 'pdf' and results['o_detected'] and results['ocr'] and results['face']:
-            results['status'] = 3 # Success for others requires all three
+            results['status'] = 3  # Success for others requires all three
 
 
     except Exception as e:
         # If any error occurs, log it and set the error status
         logging.error(f"Error processing document {docnumber}", exc_info=True)
-        results['status'] = 2 # Error status
+        results['status'] = 2  # Error status
         results['error'] = str(e)
 
     return results
+
 
 @app.route('/process-batch', methods=['POST'])
 def process_batch():
     """API endpoint to trigger the processing of a batch of documents."""
     logging.info("'/process-batch' endpoint called.")
 
-    dms_session_token = db_connector.dms_login()
+    dms_session_token = db_connector.dms_system_login()
     if not dms_session_token:
         logging.critical("Could not log into DMS. Aborting batch.")
         return jsonify({"status": "error", "message": "Failed to authenticate with DMS."}), 500
@@ -251,47 +310,51 @@ def process_batch():
     documents = db_connector.get_documents_to_process()
     if not documents:
         logging.info("No new documents to process.")
-        return jsonify({"status": "success", "message": "No new documents to process.", "processed_count": 0}), 200
+        return jsonify(
+            {"status": "success", "message": "No new documents to process.", "processed_count": 0}), 200
 
     processed_count = 0
     for doc in documents:
         result_data = process_document(doc, dms_session_token)
 
-        # --- New Timeout Logic ---
         # Run the database update in a thread so it can't freeze the main loop
         db_thread = Thread(
             target=db_connector.update_document_processing_status,
             kwargs=result_data
         )
         db_thread.start()
-        db_thread.join(timeout=20.0) # Wait a maximum of 20 seconds for the DB to respond
+        db_thread.join(timeout=20.0)  # Wait a maximum of 20 seconds for the DB to respond
 
         if db_thread.is_alive():
             # If the thread is still running after 20 seconds, it's hung.
-            logging.critical(f"DATABASE HANG: The update for doc {doc['docnumber']} timed out. Skipping to next document.")
+            logging.critical(
+                f"DATABASE HANG: The update for doc {doc['docnumber']} timed out. Skipping to next document.")
         else:
             # If the thread finished, the update was successful.
-            if result_data['status'] == 3: # Success
+            if result_data['status'] == 3:  # Success
                 processed_count += 1
                 logging.info(f"Successfully processed and updated DB for document {doc['docnumber']}.")
             else:
-                logging.warning(f"Failed to process document {doc['docnumber']}. Error has been logged to the database.")
+                logging.warning(
+                    f"Failed to process document {doc['docnumber']}. Error has been logged to the database.")
 
     logging.info(f"Batch finished. Successfully processed {processed_count} out of {len(documents)} documents.")
-    return jsonify({"status": "success", "message": f"Processed {processed_count} documents.", "processed_count": processed_count}), 200
+    return jsonify(
+        {"status": "success", "message": f"Processed {processed_count} documents.", "processed_count": processed_count}), 200
+
 
 @app.route('/api/upload_document', methods=['POST'])
 def api_upload_document():
     if 'file' not in request.files:
         return jsonify({"success": False, "error": "No file part in the request"}), 400
-    
+
     file = request.files['file']
     if file.filename == '':
         return jsonify({"success": False, "error": "No selected file"}), 400
 
     filename = secure_filename(file.filename)
     file_extension = os.path.splitext(filename)[1].lstrip('.').upper()
-    
+
     app_id = db_connector.get_app_id_from_extension(file_extension)
     if not app_id:
         logging.warning(f"Could not find APP_ID for extension: {file_extension}. Defaulting to 'UNKNOWN'.")
@@ -301,8 +364,8 @@ def api_upload_document():
 
     docname = request.form.get('docname', os.path.splitext(filename)[0])
     abstract = request.form.get('abstract', 'Uploaded via EDMS Viewer')
-    
-    dst = wsdl_client.dms_login()
+
+    dst = wsdl_client.dms_system_login()
     if not dst:
         return jsonify({"success": False, "error": "Failed to authenticate with DMS."}), 500
 
@@ -312,8 +375,7 @@ def api_upload_document():
         "app_id": app_id,
         "filename": filename
     }
-    
-    # FINAL FIX: Pass the file's stream object directly to the upload function to handle streaming correctly.
+
     new_doc_number = wsdl_client.upload_document_to_dms(dst, file.stream, metadata)
 
     if new_doc_number:
@@ -328,24 +390,25 @@ def api_upload_document():
 def api_process_uploaded_documents():
     data = request.get_json()
     docnumbers = data.get('docnumbers')
-    
+
     if not docnumbers or not isinstance(docnumbers, list):
-        return jsonify({"status": "error", "message": "Invalid data provided. 'docnumbers' list is required."}), 400
+        return jsonify(
+            {"status": "error", "message": "Invalid data provided. 'docnumbers' list is required."}), 400
 
     logging.info(f"Processing request for docnumbers: {docnumbers}")
 
-    dms_session_token = db_connector.dms_login()
+    dms_session_token = db_connector.dms_system_login()
     if not dms_session_token:
         logging.critical("Could not log into DMS for processing. Aborting.")
         return jsonify({"status": "error", "message": "Failed to authenticate with DMS."}), 500
 
     results = {"processed": [], "failed": []}
-    
+
     docs_to_process = db_connector.get_specific_documents_for_processing(docnumbers)
 
     for doc in docs_to_process:
         result_data = process_document(doc, dms_session_token)
-        
+
         db_thread = Thread(
             target=db_connector.update_document_processing_status,
             kwargs=result_data
@@ -357,14 +420,16 @@ def api_process_uploaded_documents():
             logging.critical(f"DATABASE HANG: The update for doc {doc['docnumber']} timed out.")
             results["failed"].append(doc['docnumber'])
         else:
-            if result_data['status'] == 3: # Success
+            if result_data['status'] == 3:  # Success
                 results["processed"].append(doc['docnumber'])
                 logging.info(f"Successfully processed uploaded doc {doc['docnumber']}.")
             else:
                 results["failed"].append(doc['docnumber'])
-                logging.warning(f"Failed to process uploaded doc {doc['docnumber']}. Error: {result_data.get('error')}")
+                logging.warning(
+                    f"Failed to process uploaded doc {doc['docnumber']}. Error: {result_data.get('error')}")
 
     return jsonify(results), 200
+
 
 def clean_repeated_words(text):
     """Removes consecutive repeated words from a string, keeping the last one's punctuation."""
@@ -390,7 +455,8 @@ def clean_repeated_words(text):
 
     return " ".join(result_words)
 
-# --- Viewer API Routes ---
+
+# --- Viewer API Routes (Original Middleware) ---
 @app.route('/api/documents')
 def api_get_documents():
     """Handles fetching documents for the frontend viewer."""
@@ -421,10 +487,11 @@ def api_get_documents():
         "total_pages": total_pages, "total_documents": total_rows
     })
 
+
 @app.route('/api/image/<doc_id>')
 def api_get_image(doc_id):
     """Serves the full image content for a given document ID."""
-    dst = db_connector.dms_login()
+    dst = db_connector.dms_system_login()
     if not dst: return jsonify({'error': 'DMS login failed.'}), 500
 
     image_data, _ = wsdl_client.get_image_by_docnumber(dst, doc_id)
@@ -432,10 +499,11 @@ def api_get_image(doc_id):
         return Response(bytes(image_data), mimetype='image/jpeg')
     return jsonify({'error': 'Image not found in EDMS.'}), 404
 
+
 @app.route('/api/pdf/<doc_id>')
 def api_get_pdf(doc_id):
     """Serves the full PDF content for a given document ID."""
-    dst = db_connector.dms_login()
+    dst = db_connector.dms_system_login()
     if not dst: return jsonify({'error': 'DMS login failed.'}), 500
 
     pdf_data, _ = wsdl_client.get_image_by_docnumber(dst, doc_id)
@@ -443,12 +511,13 @@ def api_get_pdf(doc_id):
         return Response(bytes(pdf_data), mimetype='application/pdf')
     return jsonify({'error': 'PDF not found in EDMS.'}), 404
 
+
 @app.route('/api/video/<doc_id>')
 def api_get_video(doc_id):
     """
     Handles video requests using a hybrid stream-through cache model.
     """
-    dst = db_connector.dms_login()
+    dst = db_connector.dms_system_login()
     if not dst:
         return jsonify({'error': 'DMS login failed.'}), 500
 
@@ -460,7 +529,7 @@ def api_get_video(doc_id):
     if media_type != 'video':
         return jsonify({'error': 'Requested document is not a video.'}), 400
 
-    if not file_ext: file_ext = '.mp4' # Default extension
+    if not file_ext: file_ext = '.mp4'  # Default extension
     cached_video_path = os.path.join(db_connector.video_cache_dir, f"{doc_id}{file_ext}")
 
     # If the file is already cached, serve it directly and quickly.
@@ -485,10 +554,12 @@ def api_get_video(doc_id):
     # Return a streaming response
     return Response(stream_with_context(stream_generator), mimetype="video/mp4")
 
+
 @app.route('/cache/<path:filename>')
 def serve_cached_thumbnail(filename):
     """Serves cached thumbnail images."""
     return send_from_directory(db_connector.thumbnail_cache_dir, filename)
+
 
 @app.route('/api/clear_cache', methods=['POST'])
 def api_clear_cache():
@@ -499,6 +570,7 @@ def api_clear_cache():
         return jsonify({"message": "All caches cleared successfully."})
     except Exception as e:
         return jsonify({"error": f"Failed to clear cache: {e}"}), 500
+
 
 @app.route('/api/update_abstract', methods=['POST'])
 def api_update_abstract():
@@ -514,6 +586,7 @@ def api_update_abstract():
     else:
         return jsonify({'error': message}), 500
 
+
 @app.route('/api/add_person', methods=['POST'])
 def api_add_person():
     """Adds a person to the lookup table."""
@@ -527,6 +600,7 @@ def api_add_person():
     else:
         return jsonify({'error': message}), 500
 
+
 @app.route('/api/persons')
 def api_get_persons():
     """Fetches people from the lookup table for autocomplete."""
@@ -538,11 +612,13 @@ def api_get_persons():
         'hasMore': (page * 20) < total_rows
     })
 
+
 @app.route('/api/tags')
 def api_get_tags():
     """Fetches all unique tags (keywords and persons) for the filter dropdown."""
     tags = db_connector.fetch_all_tags()
     return jsonify(tags)
+
 
 @app.route('/api/tags/<int:doc_id>')
 def api_get_tags_for_document(doc_id):
@@ -550,18 +626,21 @@ def api_get_tags_for_document(doc_id):
     tags = db_connector.fetch_tags_for_document(doc_id)
     return jsonify({"tags": tags})
 
+
 @app.route('/api/processing_status', methods=['POST'])
 def api_processing_status():
     """Checks the processing status of a list of documents."""
     data = request.get_json()
     docnumbers = data.get('docnumbers')
-    
+
     if not docnumbers or not isinstance(docnumbers, list):
-        return jsonify({"status": "error", "message": "Invalid data provided. 'docnumbers' list is required."}), 400
+        return jsonify(
+            {"status": "error", "message": "Invalid data provided. 'docnumbers' list is required."}), 400
 
     still_processing = db_connector.check_processing_status(docnumbers)
-    
+
     return jsonify({"processing": still_processing})
+
 
 @app.route('/api/tags/<int:doc_id>', methods=['POST'])
 def api_add_tag(doc_id):
@@ -576,6 +655,7 @@ def api_add_tag(doc_id):
     else:
         return jsonify({'error': message}), 500
 
+
 @app.route('/api/tags/<int:doc_id>/<tag>', methods=['PUT'])
 def api_update_tag(doc_id, tag):
     """Updates a tag for a document."""
@@ -589,6 +669,7 @@ def api_update_tag(doc_id, tag):
     else:
         return jsonify({'error': message}), 500
 
+
 @app.route('/api/tags/<int:doc_id>/<tag>', methods=['DELETE'])
 def api_delete_tag(doc_id, tag):
     """Deletes a tag from a document."""
@@ -597,7 +678,146 @@ def api_delete_tag(doc_id, tag):
         return jsonify({'message': message})
     else:
         return jsonify({'error': message}), 500
-    
+
+
+# --- Archiving API Routes (from Archiving Backend) ---
+@app.route('/api/dashboard_counts', methods=['GET'])
+def get_dashboard_counts():
+    if 'user' not in session:
+        return jsonify({"error": "Unauthorized"}), 401
+    counts = db_connector.get_dashboard_counts()
+    return jsonify(counts)
+
+
+@app.route('/api/employees', methods=['GET'])
+def get_employees():
+    if 'user' not in session: return jsonify({"error": "Unauthorized"}), 401
+    employees, total_rows = db_connector.fetch_archived_employees(
+        search_term=request.args.get('search'),
+        status=request.args.get('status'),
+        filter_type=request.args.get('filter_type')
+    )
+    return jsonify({"employees": employees, "total_employees": total_rows})
+
+
+@app.route('/api/employees', methods=['POST'])
+def add_employee_archive():
+    if 'user' not in session or 'dst' not in session:
+        return jsonify({"error": "Unauthorized"}), 401
+
+    try:
+        dms_user = session['user']['username']
+        employee_data = json.loads(request.form.get('employee_data'))
+
+        documents = []
+        i = 0
+        while f'new_documents[{i}][file]' in request.files:
+            documents.append({
+                "file": request.files[f'new_documents[{i}][file]'],
+                "doc_type_id": request.form.get(f'new_documents[{i}][doc_type_id]'),
+                "doc_type_name": request.form.get(f'new_documents[{i}][doc_type_name]'),
+                "expiry": request.form.get(f'new_documents[{i}][expiry]'),
+                "legislation_id": request.form.get(f'new_documents[{i}][legislation_id]')
+            })
+            i += 1
+
+        success, message = db_connector.add_employee_archive_with_docs(session['dst'], dms_user, employee_data,
+                                                                         documents)
+        return (jsonify({"message": message}), 201) if success else (jsonify({"error": message}), 500)
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/employees/<int:archive_id>', methods=['GET'])
+def get_employee_details(archive_id):
+    if 'user' not in session: return jsonify({"error": "Unauthorized"}), 401
+    details = db_connector.fetch_single_archived_employee(archive_id)
+    return jsonify(details) if details else (jsonify({"error": "Not found"}), 404)
+
+
+@app.route('/api/employees/<int:archive_id>', methods=['PUT'])
+def update_employee_archive(archive_id):
+    if 'user' not in session or 'dst' not in session: return jsonify({"error": "Unauthorized"}), 401
+
+    dms_user = session['user']['username']
+    employee_data = json.loads(request.form.get('employee_data'))
+
+    new_documents = []
+    i = 0
+    while f'new_documents[{i}][file]' in request.files:
+        new_documents.append({
+            "file": request.files[f'new_documents[{i}][file]'],
+            "doc_type_id": request.form.get(f'new_documents[{i}][doc_type_id]'),
+            "doc_type_name": request.form.get(f'new_documents[{i}][doc_type_name]'),
+            "expiry": request.form.get(f'new_documents[{i}][expiry]'),
+            "legislation_id": request.form.get(f'new_documents[{i}][legislation_id]')
+        })
+        i += 1
+
+    deleted_doc_ids = json.loads(request.form.get('deleted_documents', '[]'))
+    success, message = db_connector.update_archived_employee(session['dst'], dms_user, archive_id, employee_data,
+                                                               new_documents, deleted_doc_ids)
+
+    return (jsonify({"message": message}), 200) if success else (jsonify({"error": message}), 500)
+
+
+@app.route('/api/hr_employees', methods=['GET'])
+def get_hr_employees():
+    if 'user' not in session: return jsonify({"error": "Unauthorized"}), 401
+    search = request.args.get('search', "", type=str)
+    page = request.args.get('page', 1, type=int)
+    employees, total_rows = db_connector.fetch_hr_employees_paginated(search_term=search, page=page)
+    has_more = (page * 10) < total_rows
+    return jsonify({"employees": employees, "hasMore": has_more})
+
+
+@app.route('/api/hr_employees/<int:employee_id>', methods=['GET'])
+def get_hr_employee_details(employee_id):
+    if 'user' not in session: return jsonify({"error": "Unauthorized"}), 401
+    details = db_connector.fetch_hr_employee_details(employee_id)
+    return jsonify(details) if details else (jsonify({"error": "Not found"}), 404)
+
+
+@app.route('/api/statuses', methods=['GET'])
+def get_statuses():
+    if 'user' not in session: return jsonify({"error": "Unauthorized"}), 401
+    statuses = db_connector.fetch_statuses()
+    return jsonify(statuses)
+
+
+@app.route('/api/document_types', methods=['GET'])
+def get_document_types():
+    if 'user' not in session: return jsonify({"error": "Unauthorized"}), 401
+    doc_types = db_connector.fetch_document_types()
+    return jsonify(doc_types)
+
+
+@app.route('/api/legislations', methods=['GET'])
+def get_legislations():
+    if 'user' not in session: return jsonify({"error": "Unauthorized"}), 401
+    legislations = db_connector.fetch_legislations()
+    return jsonify(legislations)
+
+
+@app.route('/api/document/<int:docnumber>', methods=['GET'])
+def get_document_file(docnumber):
+    """
+    Securely streams a document from the DMS to the client.
+    """
+    if 'user' not in session or 'dst' not in session:
+        return jsonify({"error": "Unauthorized"}), 401
+
+    dst = session['dst']
+    file_bytes, filename = wsdl_client.get_document_from_dms(dst, docnumber)
+
+    if file_bytes and filename:
+        mimetype = mimetypes.guess_type(filename)[0] or 'application/octet-stream'
+        return Response(file_bytes, mimetype=mimetype)
+    else:
+        return jsonify({"error": "Document not found or could not be retrieved from DMS."}), 404
+
+
 if __name__ == '__main__':
     port = os.environ.get('HTTP_PLATFORM_PORT', 5000)
     serve(app, host='localhost', port=port, threads=1000)

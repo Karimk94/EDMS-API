@@ -10,6 +10,9 @@ import shutil
 import logging
 from moviepy import VideoFileClip
 import fitz
+from datetime import datetime, timedelta
+import wsdl_client
+
 
 load_dotenv()
 
@@ -22,26 +25,13 @@ video_cache_dir = os.path.join(os.path.dirname(__file__), 'video_cache')
 if not os.path.exists(video_cache_dir):
     os.makedirs(video_cache_dir)
 
+
 # --- DMS Communication ---
 
-def dms_login():
-    """Logs into the DMS SOAP service and returns a session token (DST)."""
-    try:
-        settings = Settings(strict=False, xml_huge_tree=True)
-        wsdl_url = os.getenv("WSDL_URL")
-        client = Client(wsdl_url, settings=settings)
-        login_info_type = client.get_type('{http://schemas.datacontract.org/2004/07/OpenText.DMSvr.Serializable}DMSvrLoginInfo')
-        dms_user, dms_password = os.getenv("DMS_USER"), os.getenv("DMS_PASSWORD")
-        login_info_instance = login_info_type(network=0, loginContext='RTA_MAIN', username=dms_user, password=dms_password)
-        array_type = client.get_type('{http://schemas.datacontract.org/2004/07/OpenText.DMSvr.Serializable}ArrayOfDMSvrLoginInfo')
-        login_info_array_instance = array_type(DMSvrLoginInfo=[login_info_instance])
-        call_data = {'call': {'loginInfo': login_info_array_instance, 'authen': 1, 'dstIn': ''}}
-        response = client.service.LoginSvr5(**call_data)
-        if response and response.resultCode == 0 and response.DSTOut:
-            return response.DSTOut
-        return None
-    except Exception:
-        return None
+def dms_system_login():
+    """Logs into the DMS SOAP service using system credentials from .env and returns a session token (DST)."""
+    return wsdl_client.dms_system_login()
+
 
 def get_media_info_from_dms(dst, doc_number):
     """
@@ -52,7 +42,7 @@ def get_media_info_from_dms(dst, doc_number):
         settings = Settings(strict=False, xml_huge_tree=True)
         wsdl_url = os.getenv("WSDL_URL")
         svc_client = Client(wsdl_url, port_name='BasicHttpBinding_IDMSvc', settings=settings)
-        
+
         get_doc_call = {
             'call': {
                 'dstIn': dst,
@@ -79,14 +69,14 @@ def get_media_info_from_dms(dst, doc_number):
                         filename = str(version_file_name)
             except Exception as e:
                 print(f"Could not get filename for {doc_number}, using default. Error: {e}")
-        
+
         video_extensions = ['.mp4', '.mov', '.avi', '.mkv']
         pdf_extensions = ['.pdf']
         file_ext = os.path.splitext(filename)[1].lower()
         media_type = 'video' if file_ext in video_extensions else 'image'
         if file_ext in pdf_extensions:
             media_type = 'pdf'
-        
+
         return filename, media_type, file_ext
 
     except Fault as e:
@@ -106,7 +96,9 @@ def get_media_content_from_dms(dst, doc_number):
         obj_client = Client(wsdl_url, port_name='BasicHttpBinding_IDMObj', settings=settings)
 
         get_doc_call = {
-            'call': {'dstIn': dst, 'criteria': {'criteriaCount': 2, 'criteriaNames': {'string': ['%TARGET_LIBRARY', '%DOCUMENT_NUMBER']}, 'criteriaValues': {'string': ['RTA_MAIN', str(doc_number)]}}}
+            'call': {'dstIn': dst,
+                     'criteria': {'criteriaCount': 2, 'criteriaNames': {'string': ['%TARGET_LIBRARY', '%DOCUMENT_NUMBER']},
+                                  'criteriaValues': {'string': ['RTA_MAIN', str(doc_number)]}}}
         }
         doc_reply = svc_client.service.GetDocSvr3(**get_doc_call)
         if not (doc_reply and doc_reply.resultCode == 0 and doc_reply.getDocID):
@@ -125,50 +117,30 @@ def get_media_content_from_dms(dst, doc_number):
             chunk_data = read_reply.streamData.streamBuffer if read_reply.streamData else None
             if not chunk_data: break
             doc_buffer.extend(chunk_data)
-        
+
         return bytes(doc_buffer)
     except Exception as e:
         print(f"Error getting media content for {doc_number}: {e}")
         return None
     finally:
         if obj_client:
-            if stream_id: 
-                try: obj_client.service.ReleaseObject(call={'objectID': stream_id})
-                except Exception: pass
-            if content_id: 
-                try: obj_client.service.ReleaseObject(call={'objectID': content_id})
-                except Exception: pass
+            if stream_id:
+                try:
+                    obj_client.service.ReleaseObject(call={'objectID': stream_id})
+                except Exception:
+                    pass
+            if content_id:
+                try:
+                    obj_client.service.ReleaseObject(call={'objectID': content_id})
+                except Exception:
+                    pass
 
 
 def get_dms_stream_details(dst, doc_number):
     """
     Opens a stream to a DMS document and returns the client and stream ID for reading.
     """
-    try:
-        settings = Settings(strict=False, xml_huge_tree=True)
-        wsdl_url = os.getenv("WSDL_URL")
-        svc_client = Client(wsdl_url, port_name='BasicHttpBinding_IDMSvc', settings=settings)
-        obj_client = Client(wsdl_url, port_name='BasicHttpBinding_IDMObj', settings=settings)
-
-        get_doc_call = {'call': {'dstIn': dst, 'criteria': {'criteriaCount': 2, 'criteriaNames': {'string': ['%TARGET_LIBRARY', '%DOCUMENT_NUMBER']}, 'criteriaValues': {'string': ['RTA_MAIN', str(doc_number)]}}}}
-        doc_reply = svc_client.service.GetDocSvr3(**get_doc_call)
-        if not (doc_reply and doc_reply.resultCode == 0 and doc_reply.getDocID):
-            return None
-
-        content_id = doc_reply.getDocID
-        stream_reply = obj_client.service.GetReadStream(call={'dstIn': dst, 'contentID': content_id})
-        if not (stream_reply and stream_reply.resultCode == 0 and stream_reply.streamID):
-            obj_client.service.ReleaseObject(call={'objectID': content_id})
-            return None
-        
-        return {
-            "obj_client": obj_client,
-            "stream_id": stream_reply.streamID,
-            "content_id": content_id
-        }
-    except Exception as e:
-        print(f"Error opening DMS stream for {doc_number}: {e}")
-        return None
+    return wsdl_client.get_dms_stream_details(dst, doc_number)
 
 # --- Caching, Streaming, and Thumbnail Logic ---
 
@@ -189,7 +161,7 @@ def stream_and_cache_generator(obj_client, stream_id, content_id, final_cache_pa
                     break
                 f.write(chunk_data)
                 yield chunk_data
-        
+
         # Once fully downloaded, move the temp file to its final location
         os.rename(temp_cache_path, final_cache_path)
         logging.info(f"Successfully cached file to {final_cache_path}")
@@ -205,6 +177,7 @@ def stream_and_cache_generator(obj_client, stream_id, content_id, final_cache_pa
         # Clean up temp file if it still exists on error
         if os.path.exists(temp_cache_path):
             os.remove(temp_cache_path)
+
 
 def create_thumbnail(doc_number, media_type, file_ext, media_bytes):
     """Creates a thumbnail from media bytes and saves it to the cache."""
@@ -231,6 +204,7 @@ def create_thumbnail(doc_number, media_type, file_ext, media_bytes):
         print(f"Could not create thumbnail for {doc_number}: {e}")
         return None
 
+
 # --- Oracle Database Interaction ---
 
 def get_connection():
@@ -243,6 +217,7 @@ def get_connection():
         print(f"DB connection error: {error.message}")
         return None
 
+
 def get_app_id_from_extension(extension):
     """
     Looks up the APPLICATION (APP_ID) from the APPS table based on the file extension.
@@ -250,7 +225,7 @@ def get_app_id_from_extension(extension):
     conn = get_connection()
     if not conn:
         return None
-    
+
     app_id = None
     try:
         with conn.cursor() as cursor:
@@ -261,7 +236,8 @@ def get_app_id_from_extension(extension):
                 app_id = result[0]
             else:
                 # If not found, check the FILE_TYPES column
-                cursor.execute("SELECT APPLICATION FROM APPS WHERE FILE_TYPES LIKE :ext_like", ext_like=f"%{extension}%")
+                cursor.execute("SELECT APPLICATION FROM APPS WHERE FILE_TYPES LIKE :ext_like",
+                               ext_like=f"%{extension}%")
                 result = cursor.fetchone()
                 if result:
                     app_id = result[0]
@@ -272,11 +248,12 @@ def get_app_id_from_extension(extension):
             conn.close()
     return app_id
 
+
 def get_specific_documents_for_processing(docnumbers):
     """Gets details for a specific list of docnumbers that need AI processing."""
     if not docnumbers:
         return []
-        
+
     conn = get_connection()
     if not conn:
         return []
@@ -284,8 +261,8 @@ def get_specific_documents_for_processing(docnumbers):
     try:
         with conn.cursor() as cursor:
             # Create placeholders for the IN clause
-            placeholders = ','.join([':' + str(i+1) for i in range(len(docnumbers))])
-            
+            placeholders = ','.join([':' + str(i + 1) for i in range(len(docnumbers))])
+
             sql = f"""
             SELECT p.docnumber, p.abstract,
                    NVL(q.o_detected, 0) as o_detected,
@@ -303,6 +280,7 @@ def get_specific_documents_for_processing(docnumbers):
         if conn:
             conn.close()
 
+
 def check_processing_status(docnumbers):
     """
     Checks the TAGGING_QUEUE for a list of docnumbers and returns those
@@ -310,22 +288,22 @@ def check_processing_status(docnumbers):
     """
     if not docnumbers:
         return []
-        
+
     conn = get_connection()
     if not conn:
-        return docnumbers # Assume still processing if DB is down
+        return docnumbers  # Assume still processing if DB is down
 
     try:
         with conn.cursor() as cursor:
-            placeholders = ','.join([':' + str(i+1) for i in range(len(docnumbers))])
-            
+            placeholders = ','.join([':' + str(i + 1) for i in range(len(docnumbers))])
+
             sql = f"""
             SELECT COLUMN_VALUE FROM TABLE(SYS.ODCINUMBERLIST({placeholders})) input_docs
             WHERE input_docs.COLUMN_VALUE NOT IN (
                 SELECT docnumber FROM TAGGING_QUEUE WHERE docnumber IN ({placeholders}) AND STATUS = 3
             )
             """
-            
+
             cursor.execute(sql, docnumbers + docnumbers)
             still_processing = [row[0] for row in cursor.fetchall()]
             return still_processing
@@ -337,12 +315,13 @@ def check_processing_status(docnumbers):
             conn.close()
 
 
-def fetch_documents_from_oracle(page=1, page_size=10, search_term=None, date_from=None, date_to=None, persons=None, person_condition='any', tags=None):
+def fetch_documents_from_oracle(page=1, page_size=10, search_term=None, date_from=None, date_to=None,
+                                persons=None, person_condition='any', tags=None):
     """Fetches a paginated list of documents from Oracle, handling filtering and thumbnail logic."""
     conn = get_connection()
     if not conn: return [], 0
 
-    dst = dms_login()
+    dst = dms_system_login()
     if not dst:
         print("Could not log into DMS. Aborting document fetch.")
         return [], 0
@@ -381,7 +360,7 @@ def fetch_documents_from_oracle(page=1, page_size=10, search_term=None, date_fro
     if date_to:
         where_clauses.append("p.CREATION_DATE <= TO_DATE(:date_to, 'YYYY-MM-DD HH24:MI:SS')")
         params['date_to'] = date_to
-    
+
     if tags:
         tag_list = [t.strip().upper() for t in tags.split(',') if t.strip()]
         if tag_list:
@@ -396,10 +375,10 @@ def fetch_documents_from_oracle(page=1, page_size=10, search_term=None, date_fro
                 )
                 """
                 person_subquery = f"UPPER(p.ABSTRACT) LIKE '%' || :{key} || '%'"
-                
+
                 tag_conditions.append(f"({keyword_subquery} OR {person_subquery})")
                 params[key] = tag
-            
+
             where_clauses.append(" AND ".join(tag_conditions))
 
     final_where_clause = base_where + ("AND " + " AND ".join(where_clauses) if where_clauses else "")
@@ -413,15 +392,17 @@ def fetch_documents_from_oracle(page=1, page_size=10, search_term=None, date_fro
             fetch_query = f"SELECT p.DOCNUMBER, p.ABSTRACT, p.AUTHOR, p.CREATION_DATE, p.DOCNAME FROM PROFILE p {final_where_clause}"
             params['offset'] = offset
             params['page_size'] = page_size
-            
-            cursor.execute(fetch_query + " ORDER BY p.DOCNUMBER DESC OFFSET :offset ROWS FETCH NEXT :page_size ROWS ONLY", params)
-            
+
+            cursor.execute(
+                fetch_query + " ORDER BY p.DOCNUMBER DESC OFFSET :offset ROWS FETCH NEXT :page_size ROWS ONLY",
+                params)
+
             for row in cursor:
                 doc_id, abstract, author, creation_date, docname = row
                 thumbnail_path = None
 
                 original_filename, media_type, file_ext = get_media_info_from_dms(dst, doc_id)
-                
+
                 cached_thumbnail_file = f"{doc_id}.jpg"
                 cached_path = os.path.join(thumbnail_cache_dir, cached_thumbnail_file)
 
@@ -444,6 +425,7 @@ def fetch_documents_from_oracle(page=1, page_size=10, search_term=None, date_fro
     finally:
         conn.close()
     return documents, total_rows
+
 
 def get_documents_to_process():
     """Gets a batch of documents that need AI processing."""
@@ -472,19 +454,21 @@ def get_documents_to_process():
             conn.close()
     return []
 
-def update_document_processing_status(docnumber, new_abstract, o_detected, ocr, face, status, error, transcript, attempts):
+
+def update_document_processing_status(docnumber, new_abstract, o_detected, ocr, face, status, error, transcript,
+                                      attempts):
     """Updates the processing status of a document in the database with robust transaction handling."""
     conn = get_connection()
     if not conn:
         logging.error(f"DB_UPDATE_FAILURE: Could not get a database connection for docnumber {docnumber}.")
         return
-    
+
     try:
         with conn.cursor() as cursor:
             conn.begin()
-            
+
             cursor.execute("UPDATE PROFILE SET abstract = :1 WHERE docnumber = :2", (new_abstract, docnumber))
-            
+
             merge_sql = """
             MERGE INTO TAGGING_QUEUE q
             USING (SELECT :docnumber AS docnumber FROM dual) src ON (q.docnumber = src.docnumber)
@@ -497,23 +481,25 @@ def update_document_processing_status(docnumber, new_abstract, o_detected, ocr, 
             """
             cursor.execute(merge_sql, {
                 'docnumber': docnumber, 'o_detected': o_detected, 'ocr': ocr, 'face': face,
-                'status': status, 'error': error, 'transcript': transcript, 'attempts' : attempts
+                'status': status, 'error': error, 'transcript': transcript, 'attempts': attempts
             })
-            
+
             conn.commit()
             logging.info(f"DB_UPDATE_SUCCESS: Successfully updated status for docnumber {docnumber}.")
-            
+
     except oracledb.Error as e:
         logging.error(f"DB_UPDATE_ERROR: Oracle error while updating docnumber {docnumber}: {e}", exc_info=True)
         try:
             conn.rollback()
             logging.info(f"DB_ROLLBACK: Transaction for docnumber {docnumber} was rolled back.")
         except oracledb.Error as rb_e:
-            logging.error(f"DB_ROLLBACK_ERROR: Failed to rollback transaction for docnumber {docnumber}: {rb_e}", exc_info=True)
-            
+            logging.error(f"DB_ROLLBACK_ERROR: Failed to rollback transaction for docnumber {docnumber}: {rb_e}",
+                          exc_info=True)
+
     finally:
         if conn:
             conn.close()
+
 
 def update_abstract_with_vips(doc_id, vip_names):
     """Appends VIP names to a document's abstract."""
@@ -525,7 +511,7 @@ def update_abstract_with_vips(doc_id, vip_names):
             result = cursor.fetchone()
             if result is None: return False, f"Document with ID {doc_id} not found."
             current_abstract = result[0] or ""
-            
+
             if "VIPs :" in current_abstract:
                 return True, "Abstract already contains VIPs section."
 
@@ -539,6 +525,7 @@ def update_abstract_with_vips(doc_id, vip_names):
         return False, f"Database error: {e}"
     finally:
         conn.close()
+
 
 def add_person_to_lkp(person_name):
     """Adds a new person to the LKP_PERSON lookup table."""
@@ -562,7 +549,8 @@ def add_person_to_lkp(person_name):
     finally:
         if conn:
             conn.close()
-    
+
+
 def fetch_lkp_persons(page=1, page_size=20, search=''):
     """Fetches a paginated list of people from the LKP_PERSON table."""
     conn = get_connection()
@@ -589,19 +577,21 @@ def fetch_lkp_persons(page=1, page_size=20, search=''):
         conn.close()
     return persons, total_rows
 
+
 def fetch_all_tags():
     """Fetches all unique keywords and person names to be used as tags."""
     conn = get_connection()
     if not conn: return []
-    
+
     tags = set()
     try:
         with conn.cursor() as cursor:
-            cursor.execute("SELECT KEYWORD_ID FROM KEYWORD k JOIN LKP_DOCUMENT_TAGS ldt ON ldt.TAG_ID = k.SYSTEM_ID")
+            cursor.execute(
+                "SELECT KEYWORD_ID FROM KEYWORD k JOIN LKP_DOCUMENT_TAGS ldt ON ldt.TAG_ID = k.SYSTEM_ID")
             for row in cursor:
                 if row[0]:
                     tags.add(row[0].strip())
-            
+
             cursor.execute("SELECT NAME_ENGLISH FROM LKP_PERSON")
             for row in cursor:
                 if row[0]:
@@ -610,8 +600,9 @@ def fetch_all_tags():
         print(f"❌ Oracle Database error in fetch_all_tags: {e}")
     finally:
         conn.close()
-    
+
     return sorted(list(tags))
+
 
 def fetch_tags_for_document(doc_id):
     """Fetches all keyword and person tags for a single document."""
@@ -652,8 +643,9 @@ def fetch_tags_for_document(doc_id):
     finally:
         if conn:
             conn.close()
-    
+
     return sorted(list(doc_tags))
+
 
 def clear_thumbnail_cache():
     """Deletes all files in the thumbnail cache directory."""
@@ -661,11 +653,13 @@ def clear_thumbnail_cache():
         shutil.rmtree(thumbnail_cache_dir)
     os.makedirs(thumbnail_cache_dir)
 
+
 def clear_video_cache():
     """Deletes all files in the video cache directory."""
     if os.path.exists(video_cache_dir):
         shutil.rmtree(video_cache_dir)
     os.makedirs(video_cache_dir)
+
 
 def insert_keywords_and_tags(docnumber, keywords):
     """
@@ -694,12 +688,14 @@ def insert_keywords_and_tags(docnumber, keywords):
                     continue
 
                 if len(english_keyword) > 30:
-                    logging.warning(f"Skipping keyword '{english_keyword_orig}' for docnumber {docnumber} because its length ({len(english_keyword_orig)}) exceeds the 30-character limit.")
+                    logging.warning(
+                        f"Skipping keyword '{english_keyword_orig}' for docnumber {docnumber} because its length ({len(english_keyword_orig)}) exceeds the 30-character limit.")
                     continue
 
                 keyword_system_id = None
 
-                cursor.execute("SELECT SYSTEM_ID FROM KEYWORD WHERE KEYWORD_ID = :keyword_id", keyword_id=english_keyword)
+                cursor.execute("SELECT SYSTEM_ID FROM KEYWORD WHERE KEYWORD_ID = :keyword_id",
+                               keyword_id=english_keyword)
                 result = cursor.fetchone()
 
                 if result:
@@ -708,30 +704,35 @@ def insert_keywords_and_tags(docnumber, keywords):
                     try:
                         cursor.execute("SELECT NVL(MAX(SYSTEM_ID), 0) + 1 FROM KEYWORD")
                         keyword_system_id = cursor.fetchone()[0]
-                        
+
                         cursor.execute("""
                             INSERT INTO KEYWORD (KEYWORD_ID, DESCRIPTION, SYSTEM_ID)
                             VALUES (:keyword_id, :description, :system_id)
-                        """, keyword_id=english_keyword, description=arabic_keyword, system_id=keyword_system_id)
+                        """, keyword_id=english_keyword, description=arabic_keyword,
+                                       system_id=keyword_system_id)
 
                     except oracledb.IntegrityError as ie:
                         error, = ie.args
                         if "ORA-00001" in error.message:
-                            logging.warning(f"Keyword '{english_keyword}' was inserted by another process. Fetching existing ID.")
-                            cursor.execute("SELECT SYSTEM_ID FROM KEYWORD WHERE KEYWORD_ID = :keyword_id", keyword_id=english_keyword)
+                            logging.warning(
+                                f"Keyword '{english_keyword}' was inserted by another process. Fetching existing ID.")
+                            cursor.execute("SELECT SYSTEM_ID FROM KEYWORD WHERE KEYWORD_ID = :keyword_id",
+                                           keyword_id=english_keyword)
                             result = cursor.fetchone()
                             if result:
                                 keyword_system_id = result[0]
                             else:
-                                logging.error(f"Failed to fetch SYSTEM_ID for '{english_keyword}' after integrity error.")
+                                logging.error(
+                                    f"Failed to fetch SYSTEM_ID for '{english_keyword}' after integrity error.")
                                 continue
                         else:
                             raise
 
                 if keyword_system_id:
-                    cursor.execute("SELECT COUNT(*) FROM LKP_DOCUMENT_TAGS WHERE DOCNUMBER = :docnumber AND TAG_ID = :tag_id",
-                                   docnumber=docnumber, tag_id=keyword_system_id)
-                    
+                    cursor.execute(
+                        "SELECT COUNT(*) FROM LKP_DOCUMENT_TAGS WHERE DOCNUMBER = :docnumber AND TAG_ID = :tag_id",
+                        docnumber=docnumber, tag_id=keyword_system_id)
+
                     if cursor.fetchone()[0] == 0:
                         cursor.execute("SELECT NVL(MAX(SYSTEM_ID), 0) + 1 FROM LKP_DOCUMENT_TAGS")
                         lkp_system_id = cursor.fetchone()[0]
@@ -739,23 +740,27 @@ def insert_keywords_and_tags(docnumber, keywords):
                             INSERT INTO LKP_DOCUMENT_TAGS (DOCNUMBER, TAG_ID, SYSTEM_ID, LAST_UPDATE, DISABLED)
                             VALUES (:docnumber, :tag_id, :system_id, SYSDATE, 0)
                         """, docnumber=docnumber, tag_id=keyword_system_id, system_id=lkp_system_id)
-                
+
                 processed_keywords.add(english_keyword)
 
             conn.commit()
             logging.info(f"DB_KEYWORD_SUCCESS: Successfully processed keywords for docnumber {docnumber}.")
 
     except oracledb.Error as e:
-        logging.error(f"DB_KEYWORD_ERROR: Oracle error while processing keywords for docnumber {docnumber}: {e}", exc_info=True)
+        logging.error(f"DB_KEYWORD_ERROR: Oracle error while processing keywords for docnumber {docnumber}: {e}",
+                      exc_info=True)
         try:
             conn.rollback()
             logging.info(f"DB_ROLLBACK: Transaction for docnumber {docnumber} keywords was rolled back.")
         except oracledb.Error as rb_e:
-            logging.error(f"DB_ROLLBACK_ERROR: Failed to rollback transaction for docnumber {docnumber} keywords: {rb_e}", exc_info=True)
+            logging.error(
+                f"DB_ROLLBACK_ERROR: Failed to rollback transaction for docnumber {docnumber} keywords: {rb_e}",
+                exc_info=True)
 
     finally:
         if conn:
             conn.close()
+
 
 def add_tag_to_document(doc_id, tag):
     """Adds a new tag to a document, handling existing keywords."""
@@ -773,10 +778,12 @@ def add_tag_to_document(doc_id, tag):
                 # Insert new keyword if it doesn't exist
                 cursor.execute("SELECT NVL(MAX(SYSTEM_ID), 0) + 1 FROM KEYWORD")
                 keyword_id = cursor.fetchone()[0]
-                cursor.execute("INSERT INTO KEYWORD (KEYWORD_ID, SYSTEM_ID) VALUES (:1, :2)", [tag.lower(), keyword_id])
+                cursor.execute("INSERT INTO KEYWORD (KEYWORD_ID, SYSTEM_ID) VALUES (:1, :2)",
+                               [tag.lower(), keyword_id])
 
             # Check if the document is already tagged with this keyword
-            cursor.execute("SELECT COUNT(*) FROM LKP_DOCUMENT_TAGS WHERE DOCNUMBER = :1 AND TAG_ID = :2", [doc_id, keyword_id])
+            cursor.execute("SELECT COUNT(*) FROM LKP_DOCUMENT_TAGS WHERE DOCNUMBER = :1 AND TAG_ID = :2",
+                           [doc_id, keyword_id])
             if cursor.fetchone()[0] > 0:
                 return True, "Tag already exists on this document."
 
@@ -795,6 +802,7 @@ def add_tag_to_document(doc_id, tag):
     finally:
         if conn:
             conn.close()
+
 
 def update_tag_for_document(doc_id, old_tag, new_tag):
     """Updates a tag for a document."""
@@ -819,7 +827,8 @@ def update_tag_for_document(doc_id, old_tag, new_tag):
                 # Insert new keyword
                 cursor.execute("SELECT NVL(MAX(SYSTEM_ID), 0) + 1 FROM KEYWORD")
                 new_keyword_id = cursor.fetchone()[0]
-                cursor.execute("INSERT INTO KEYWORD (KEYWORD_ID, SYSTEM_ID) VALUES (:1, :2)", [new_tag.lower(), new_keyword_id])
+                cursor.execute("INSERT INTO KEYWORD (KEYWORD_ID, SYSTEM_ID) VALUES (:1, :2)",
+                               [new_tag.lower(), new_keyword_id])
 
             # Update the link in LKP_DOCUMENT_TAGS
             cursor.execute("""
@@ -834,6 +843,7 @@ def update_tag_for_document(doc_id, old_tag, new_tag):
     finally:
         if conn:
             conn.close()
+
 
 def delete_tag_from_document(doc_id, tag):
     """Deletes a tag from a document."""
@@ -861,3 +871,420 @@ def delete_tag_from_document(doc_id, tag):
     finally:
         if conn:
             conn.close()
+
+# --- Archiving Database Functions ---
+
+def get_dashboard_counts():
+    conn = get_connection()
+    if not conn:
+        return {
+            "total_employees": 0,
+            "active_employees": 0,
+            "judicial_warrants": 0,
+            "expiring_soon": 0,
+        }
+
+    counts = {}
+    try:
+        with conn.cursor() as cursor:
+            # Total employees
+            cursor.execute("SELECT COUNT(*) FROM LKP_PTA_EMP_ARCH")
+            counts["total_employees"] = cursor.fetchone()[0]
+
+            # Active employees
+            cursor.execute("""
+                SELECT COUNT(*)
+                FROM LKP_PTA_EMP_ARCH arch
+                JOIN LKP_PTA_EMP_STATUS stat ON arch.STATUS_ID = stat.SYSTEM_ID
+                WHERE TRIM(stat.NAME_ENGLISH) = 'Active'
+            """)
+            counts["active_employees"] = cursor.fetchone()[0]
+
+            # Judicial Warrants
+            cursor.execute("""
+                SELECT COUNT(DISTINCT arch.SYSTEM_ID)
+                FROM LKP_PTA_EMP_ARCH arch
+                JOIN LKP_PTA_EMP_DOCS doc ON arch.SYSTEM_ID = doc.PTA_EMP_ARCH_ID
+                JOIN LKP_PTA_DOC_TYPES dt ON doc.DOC_TYPE_ID = dt.SYSTEM_ID
+                WHERE (TRIM(dt.NAME) LIKE '%Warrant Decisions%' OR TRIM(dt.NAME) LIKE '%القرارات الخاصة بالضبطية%') AND doc.DISABLED = '0'
+            """)
+            counts["judicial_warrants"] = cursor.fetchone()[0]
+
+            # Expiring Soon (in the next 30 days)
+            cursor.execute("""
+                SELECT COUNT(DISTINCT arch.SYSTEM_ID)
+                FROM LKP_PTA_EMP_ARCH arch
+                JOIN LKP_PTA_EMP_DOCS doc ON arch.SYSTEM_ID = doc.PTA_EMP_ARCH_ID
+                WHERE doc.EXPIRY BETWEEN SYSDATE AND SYSDATE + 30 AND doc.DISABLED = '0'
+            """)
+            counts["expiring_soon"] = cursor.fetchone()[0]
+    finally:
+        if conn:
+            conn.close()
+    return counts
+
+
+def fetch_archived_employees(page=1, page_size=20, search_term=None, status=None, filter_type=None):
+    conn = get_connection()
+    if not conn: return [], 0
+    offset = (page - 1) * page_size
+    employees, total_rows = [], 0
+    base_query = """
+        FROM LKP_PTA_EMP_ARCH arch
+        JOIN lkp_hr_employees hr ON arch.EMPLOYEE_ID = hr.SYSTEM_ID
+        LEFT JOIN LKP_PTA_EMP_STATUS stat ON arch.STATUS_ID = stat.SYSTEM_ID
+    """
+    where_clauses, params = [], {}
+    if search_term:
+        where_clauses.append(
+            "(UPPER(TRIM(hr.FULLNAME_EN)) LIKE :search OR UPPER(TRIM(hr.FULLNAME_AR)) LIKE :search OR TRIM(hr.EMPNO) LIKE :search)")
+        params['search'] = f"%{search_term.upper()}%"
+    if status:
+        where_clauses.append("TRIM(stat.NAME_ENGLISH) = :status")
+        params['status'] = status
+
+    if filter_type == 'judicial_warrant':
+        base_query += " JOIN LKP_PTA_EMP_DOCS doc ON arch.SYSTEM_ID = doc.PTA_EMP_ARCH_ID JOIN LKP_PTA_DOC_TYPES dt ON doc.DOC_TYPE_ID = dt.SYSTEM_ID"
+        where_clauses.append(
+            "(TRIM(dt.NAME) LIKE '%Warrant Decisions%' OR TRIM(dt.NAME) LIKE '%القرارات الخاصة بالضبطية%') AND doc.DISABLED = '0'")
+    elif filter_type == 'expiring_soon':
+        base_query += " JOIN LKP_PTA_EMP_DOCS doc ON arch.SYSTEM_ID = doc.PTA_EMP_ARCH_ID"
+        where_clauses.append("doc.EXPIRY BETWEEN SYSDATE AND SYSDATE + 30 AND doc.DISABLED = '0'")
+
+    final_where_clause = "WHERE " + " AND ".join(where_clauses) if where_clauses else ""
+    try:
+        with conn.cursor() as cursor:
+            count_query = f"SELECT COUNT(DISTINCT arch.SYSTEM_ID) {base_query} {final_where_clause}"
+            cursor.execute(count_query, params)
+            total_rows = cursor.fetchone()[0]
+
+            fetch_query = f"""
+                SELECT DISTINCT arch.SYSTEM_ID, TRIM(hr.FULLNAME_EN) as FULLNAME_EN, TRIM(hr.FULLNAME_AR) as FULLNAME_AR, TRIM(hr.EMPNO) as EMPNO, TRIM(hr.DEPARTEMENT) as DEPARTMENT, TRIM(hr.SECTION) as SECTION,
+                       TRIM(stat.NAME_ENGLISH) as STATUS_EN, TRIM(stat.NAME_ARABIC) as STATUS_AR
+                {base_query} {final_where_clause} ORDER BY arch.SYSTEM_ID DESC
+                OFFSET :offset ROWS FETCH NEXT :page_size ROWS ONLY
+            """
+            params.update({'offset': offset, 'page_size': page_size})
+            cursor.execute(fetch_query, params)
+
+            columns = [c[0].lower() for c in cursor.description]
+            employees = []
+            for row in cursor.fetchall():
+                emp = dict(zip(columns, row))
+
+                cursor.execute("""
+                    SELECT 1
+                    FROM LKP_PTA_EMP_DOCS doc
+                    JOIN LKP_PTA_DOC_TYPES dt ON doc.DOC_TYPE_ID = dt.SYSTEM_ID
+                    WHERE doc.PTA_EMP_ARCH_ID = :1 AND (TRIM(dt.NAME) LIKE '%Warrant Decisions%' OR TRIM(dt.NAME) LIKE '%القرارات الخاصة بالضبطية%') AND doc.DISABLED = '0'
+                    AND ROWNUM = 1
+                """, [emp['system_id']])
+                warrant_decision_doc = cursor.fetchone()
+                emp['warrant_status'] = 'توجد / Yes' if warrant_decision_doc else 'لا توجد / No'
+
+                cursor.execute("""
+                    SELECT doc.EXPIRY
+                    FROM LKP_PTA_EMP_DOCS doc
+                    JOIN LKP_PTA_DOC_TYPES dt ON doc.DOC_TYPE_ID = dt.SYSTEM_ID
+                    WHERE doc.PTA_EMP_ARCH_ID = :1 AND (TRIM(dt.NAME) LIKE '%Judicial Card%' OR TRIM(dt.NAME) LIKE '%بطاقة الضبطية%') AND doc.DISABLED = '0'
+                """, [emp['system_id']])
+                judicial_card = cursor.fetchone()
+
+                if judicial_card:
+                    emp['card_status'] = 'توجد / Yes'
+                    expiry_date = judicial_card[0]
+                    if expiry_date:
+                        emp['card_expiry'] = expiry_date.strftime('%Y-%m-%d')
+                        if expiry_date < datetime.now():
+                            emp['card_status_class'] = 'expired'
+                        elif expiry_date < datetime.now() + timedelta(days=30):
+                            emp['card_status_class'] = 'expiring-soon'
+                        else:
+                            emp['card_status_class'] = 'valid'
+                    else:
+                        emp['card_expiry'] = 'N/A'
+                        emp['card_status_class'] = 'valid'
+                else:
+                    emp['card_status'] = 'لا توجد / No'
+                    emp['card_expiry'] = 'N/A'
+                    emp['card_status_class'] = ''
+
+                employees.append(emp)
+    finally:
+        if conn: conn.close()
+    return employees, total_rows
+
+
+def fetch_hr_employees_paginated(search_term="", page=1, page_size=10):
+    conn = get_connection()
+    if not conn: return [], 0
+    offset = (page - 1) * page_size
+    employees, total_rows = [], 0
+    base_query = "FROM lkp_hr_employees hr WHERE hr.SYSTEM_ID NOT IN (SELECT EMPLOYEE_ID FROM LKP_PTA_EMP_ARCH WHERE EMPLOYEE_ID IS NOT NULL)"
+    params = {}
+    search_clause = ""
+    if search_term:
+        search_clause = " AND (UPPER(TRIM(hr.FULLNAME_EN)) LIKE :search OR UPPER(TRIM(hr.FULLNAME_AR)) LIKE :search OR TRIM(hr.EMPNO) LIKE :search)"
+        params['search'] = f"%{search_term.upper()}%"
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute(f"SELECT COUNT(hr.SYSTEM_ID) {base_query} {search_clause}", params)
+            total_rows = cursor.fetchone()[0]
+            query = f"SELECT SYSTEM_ID, TRIM(FULLNAME_EN) as FULLNAME_EN, TRIM(FULLNAME_AR) as FULLNAME_AR, TRIM(EMPNO) as EMPNO {base_query} {search_clause} ORDER BY hr.FULLNAME_EN OFFSET :offset ROWS FETCH NEXT :page_size ROWS ONLY"
+            params.update({'offset': offset, 'page_size': page_size})
+            cursor.execute(query, params)
+            employees = [dict(zip([c[0].lower() for c in cursor.description], row)) for row in cursor.fetchall()]
+    finally:
+        if conn: conn.close()
+    return employees, total_rows
+
+
+def fetch_hr_employee_details(employee_id):
+    conn = get_connection()
+    if not conn: return None
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                "SELECT SYSTEM_ID, TRIM(FULLNAME_EN) as FULLNAME_EN, TRIM(FULLNAME_AR) as FULLNAME_AR, TRIM(EMPNO) as EMPNO, TRIM(DEPARTEMENT) as DEPARTMENT, TRIM(SECTION) as SECTION, TRIM(EMAIL) as EMAIL, TRIM(MOBILE) as MOBILE, TRIM(SUPERVISORNAME) as SUPERVISORNAME, TRIM(NATIONALITY) as NATIONALITY, TRIM(JOB_NAME) as JOB_NAME FROM lkp_hr_employees WHERE SYSTEM_ID = :1",
+                [employee_id])
+            columns = [col[0].lower() for col in cursor.description]
+            row = cursor.fetchone()
+            return dict(zip(columns, row)) if row else None
+    finally:
+        if conn: conn.close()
+
+
+def fetch_statuses():
+    conn = get_connection()
+    if not conn: return {}
+    statuses = {}
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                "SELECT SYSTEM_ID, TRIM(NAME_ENGLISH) as NAME_ENGLISH, TRIM(NAME_ARABIC) as NAME_ARABIC FROM LKP_PTA_EMP_STATUS WHERE DISABLED='0'")
+            statuses['employee_status'] = [dict(zip([c[0].lower() for c in cursor.description], row)) for row in
+                                           cursor.fetchall()]
+    finally:
+        if conn: conn.close()
+    return statuses
+
+
+def fetch_document_types():
+    conn = get_connection()
+    if not conn: return {"all_types": [], "types_with_expiry": []}
+    doc_types = {"all_types": [], "types_with_expiry": []}
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                "SELECT SYSTEM_ID, TRIM(NAME) as NAME, HAS_EXPIRY FROM LKP_PTA_DOC_TYPES WHERE DISABLED = '0' ORDER BY SYSTEM_ID")
+            for row in cursor:
+                doc_type_obj = {'system_id': row[0], 'name': row[1]}
+                doc_types['all_types'].append(doc_type_obj)
+                if row[2] and str(row[2]).strip() == '1':
+                    doc_types['types_with_expiry'].append(doc_type_obj)
+    finally:
+        if conn: conn.close()
+    return doc_types
+
+
+def fetch_legislations():
+    conn = get_connection()
+    if not conn: return []
+    legislations = []
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                "SELECT SYSTEM_ID, TRIM(NAME) as NAME FROM LKP_PTA_LEGISL WHERE DISABLED = '0' ORDER BY NAME")
+            legislations = [dict(zip([c[0].lower() for c in cursor.description], row)) for row in
+                            cursor.fetchall()]
+    finally:
+        if conn: conn.close()
+    return legislations
+
+
+def fetch_single_archived_employee(archive_id):
+    conn = get_connection()
+    if not conn: return None
+    employee_details = {}
+    try:
+        with conn.cursor() as cursor:
+            query = "SELECT arch.SYSTEM_ID as ARCHIVE_ID, arch.EMPLOYEE_ID, arch.STATUS_ID, arch.HIRE_DATE, TRIM(hr.FULLNAME_EN) as FULLNAME_EN, TRIM(hr.FULLNAME_AR) as FULLNAME_AR, TRIM(hr.EMPNO) as EMPNO, TRIM(hr.DEPARTEMENT) as DEPARTMENT, TRIM(hr.SECTION) as SECTION, TRIM(hr.EMAIL) as EMAIL, TRIM(hr.MOBILE) as MOBILE, TRIM(hr.SUPERVISORNAME) as SUPERVISORNAME, TRIM(hr.NATIONALITY) as NATIONALITY, TRIM(hr.JOB_NAME) as JOB_NAME FROM LKP_PTA_EMP_ARCH arch JOIN lkp_hr_employees hr ON arch.EMPLOYEE_ID = hr.SYSTEM_ID WHERE arch.SYSTEM_ID = :1"
+            cursor.execute(query, [archive_id])
+            columns = [col[0].lower() for col in cursor.description]
+            row = cursor.fetchone()
+            if not row: return None
+            employee_details = dict(zip(columns, row))
+
+            doc_query = "SELECT d.SYSTEM_ID, d.DOCNUMBER, d.DOC_TYPE_ID, d.EXPIRY, d.LEGISLATION_ID, TRIM(dt.NAME) as DOC_NAME, TRIM(l.NAME) as LEGISLATION_NAME FROM LKP_PTA_EMP_DOCS d JOIN LKP_PTA_DOC_TYPES dt ON d.DOC_TYPE_ID = dt.SYSTEM_ID LEFT JOIN LKP_PTA_LEGISL l ON d.LEGISLATION_ID = l.SYSTEM_ID WHERE d.PTA_EMP_ARCH_ID = :1 AND d.DISABLED = '0'"
+
+            cursor.execute(doc_query, [archive_id])
+            doc_columns = [col[0].lower() for col in cursor.description]
+
+            documents = []
+            for doc_row in cursor.fetchall():
+                doc_dict = dict(zip(doc_columns, doc_row))
+                if doc_dict.get('expiry') and hasattr(doc_dict['expiry'], 'strftime'):
+                    doc_dict['expiry'] = doc_dict['expiry'].strftime('%Y-%m-%d')
+                documents.append(doc_dict)
+            employee_details['documents'] = documents
+    finally:
+        if conn: conn.close()
+    return employee_details
+
+
+def add_employee_archive_with_docs(dst, dms_user, employee_data, documents):
+    conn = get_connection()
+    if not conn: return False, "Database connection failed."
+    try:
+        conn.begin()
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT COUNT(*) FROM LKP_PTA_EMP_ARCH WHERE EMPLOYEE_ID = :1",
+                           [employee_data['employee_id']])
+            if cursor.fetchone()[0] > 0: return False, "This employee is already in the archive."
+
+            # Update lkp_hr_employees with any changes from the form
+            hr_update_query = """
+                UPDATE lkp_hr_employees
+                SET JOB_NAME = :jobTitle, NATIONALITY = :nationality, EMAIL = :email,
+                    MOBILE = :phone, SUPERVISORNAME = :manager,
+                    DEPARTEMENT = :department, SECTION = :section
+                WHERE SYSTEM_ID = :employee_id
+            """
+            cursor.execute(hr_update_query, {
+                'jobTitle': employee_data.get('jobTitle'),
+                'nationality': employee_data.get('nationality'),
+                'email': employee_data.get('email'),
+                'phone': employee_data.get('phone'),
+                'manager': employee_data.get('manager'),
+                'department': employee_data.get('department'),
+                'section': employee_data.get('section'),
+                'employee_id': employee_data['employee_id']
+            })
+
+            doc_types_to_add = [doc.get('doc_type_id') for doc in documents]
+            if len(doc_types_to_add) != len(set(doc_types_to_add)):
+                raise Exception("Cannot add the same document type twice.")
+
+            cursor.execute("SELECT NVL(MAX(SYSTEM_ID), 0) + 1 FROM LKP_PTA_EMP_ARCH")
+            new_archive_id = cursor.fetchone()[0]
+
+            archive_query = "INSERT INTO LKP_PTA_EMP_ARCH (SYSTEM_ID, EMPLOYEE_ID, STATUS_ID, HIRE_DATE, DISABLED, LAST_UPDATE) VALUES (:1, :2, :3, TO_DATE(:4, 'YYYY-MM-DD'), '0', SYSDATE)"
+            cursor.execute(archive_query, [new_archive_id, employee_data['employee_id'],
+                                            employee_data['status_id'],
+                                            employee_data.get('hireDate') if employee_data.get(
+                                                'hireDate') else None])
+
+            for doc in documents:
+                file_stream = doc['file'].stream
+                file_stream.seek(0)
+                
+                sanitized_doc_type = re.sub(r'[^a-zA-Z0-9]', '_', doc['doc_type_name'])
+                safe_docname = f"Archive_{employee_data['employeeNumber']}_{sanitized_doc_type}"
+
+                _, file_extension = os.path.splitext(doc['file'].filename)
+                app_id = get_app_id_from_extension(file_extension.lstrip('.').upper()) or 'UNKNOWN'
+
+                dms_metadata = {
+                    "docname": safe_docname,
+                    "abstract": f"{doc['doc_type_name']} for {employee_data['name_en']}",
+                    "filename": doc['file'].filename,
+                    "dms_user": dms_user,
+                    "app_id": app_id
+                }
+
+                docnumber = wsdl_client.upload_archive_document_to_dms(dst, file_stream, dms_metadata)
+                if not docnumber: raise Exception(f"Failed to upload {doc['doc_type_name']}")
+
+                cursor.execute("SELECT NVL(MAX(SYSTEM_ID), 0) + 1 FROM LKP_PTA_EMP_DOCS")
+                new_doc_table_id = cursor.fetchone()[0]
+                doc_query = "INSERT INTO LKP_PTA_EMP_DOCS (SYSTEM_ID, PTA_EMP_ARCH_ID, DOCNUMBER, DOC_TYPE_ID, EXPIRY, LEGISLATION_ID, DISABLED, LAST_UPDATE) VALUES (:1, :2, :3, :4, TO_DATE(:5, 'YYYY-MM-DD'), :6, '0', SYSDATE)"
+                cursor.execute(doc_query, [new_doc_table_id, new_archive_id, docnumber, doc.get('doc_type_id'),
+                                            doc.get('expiry') or None, doc.get('legislation_id') or None])
+
+        conn.commit()
+        return True, "Employee and documents archived successfully."
+    except Exception as e:
+        conn.rollback()
+        return False, f"Transaction failed: {e}"
+    finally:
+        if conn: conn.close()
+
+
+def update_archived_employee(dst, dms_user, archive_id, employee_data, new_documents, deleted_doc_ids):
+    conn = get_connection()
+    if not conn: return False, "Database connection failed."
+    try:
+        conn.begin()
+        with conn.cursor() as cursor:
+            # Update the archive status table
+            update_query = "UPDATE LKP_PTA_EMP_ARCH SET STATUS_ID = :status_id, HIRE_DATE = TO_DATE(:hireDate, 'YYYY-MM-DD'), LAST_UPDATE = SYSDATE WHERE SYSTEM_ID = :archive_id"
+            cursor.execute(update_query, {'status_id': employee_data['status_id'],
+                                           'hireDate': employee_data.get('hireDate') if employee_data.get(
+                                               'hireDate') else None, 'archive_id': archive_id})
+
+            # Update the main employee details table
+            hr_update_query = """
+                UPDATE lkp_hr_employees
+                SET JOB_NAME = :jobTitle, NATIONALITY = :nationality, EMAIL = :email,
+                    MOBILE = :phone, SUPERVISORNAME = :manager,
+                    DEPARTEMENT = :department, SECTION = :section
+                WHERE SYSTEM_ID = :employee_id
+            """
+            cursor.execute(hr_update_query, {
+                'jobTitle': employee_data.get('jobTitle'),
+                'nationality': employee_data.get('nationality'),
+                'email': employee_data.get('email'),
+                'phone': employee_data.get('phone'),
+                'manager': employee_data.get('manager'),
+                'department': employee_data.get('department'),
+                'section': employee_data.get('section'),
+                'employee_id': employee_data['employee_id']
+            })
+
+            if deleted_doc_ids:
+                cursor.executemany(
+                    "UPDATE LKP_PTA_EMP_DOCS SET DISABLED = '1', LAST_UPDATE = SYSDATE WHERE SYSTEM_ID = :1",
+                    [[doc_id] for doc_id in deleted_doc_ids])
+
+            cursor.execute("SELECT DOC_TYPE_ID FROM LKP_PTA_EMP_DOCS WHERE PTA_EMP_ARCH_ID = :1 AND DISABLED = '0'",
+                           [archive_id])
+            existing_doc_type_ids = {row[0] for row in cursor.fetchall()}
+
+            for doc in new_documents:
+                if int(doc['doc_type_id']) in existing_doc_type_ids:
+                    raise Exception(f"Document type '{doc['doc_type_name']}' already exists for this employee.")
+
+                file_stream = doc['file'].stream
+                file_stream.seek(0)
+                
+                sanitized_doc_type = re.sub(r'[^a-zA-Z0-9]', '_', doc['doc_type_name'])
+                safe_docname = f"Archive_{employee_data['employeeNumber']}_{sanitized_doc_type}"
+
+                _, file_extension = os.path.splitext(doc['file'].filename)
+                app_id = get_app_id_from_extension(file_extension.lstrip('.').upper()) or 'UNKNOWN'
+
+                dms_metadata = {"docname": safe_docname,
+                                "abstract": f"Updated document for {employee_data['name_en']}",
+                                "filename": doc['file'].filename, 
+                                "dms_user": dms_user,
+                                "app_id": app_id
+                                }
+
+                docnumber = wsdl_client.upload_archive_document_to_dms(dst, file_stream, dms_metadata)
+                if not docnumber: raise Exception(f"Failed to upload new document {doc['doc_type_name']}")
+
+                cursor.execute("SELECT NVL(MAX(SYSTEM_ID), 0) + 1 FROM LKP_PTA_EMP_DOCS")
+                new_doc_table_id = cursor.fetchone()[0]
+
+                doc_query = "INSERT INTO LKP_PTA_EMP_DOCS (SYSTEM_ID, PTA_EMP_ARCH_ID, DOCNUMBER, DOC_TYPE_ID, EXPIRY, LEGISLATION_ID, DISABLED, LAST_UPDATE) VALUES (:1, :2, :3, :4, TO_DATE(:5, 'YYYY-MM-DD'), :6, '0', SYSDATE)"
+                cursor.execute(doc_query,
+                               [new_doc_table_id, archive_id, docnumber, doc.get('doc_type_id'),
+                                doc.get('expiry') or None, doc.get('legislation_id') or None])
+
+        conn.commit()
+        return True, "Employee archive updated successfully."
+    except Exception as e:
+        conn.rollback()
+        return False, f"Update transaction failed: {e}"
+    finally:
+        if conn: conn.close()
