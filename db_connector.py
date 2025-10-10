@@ -524,7 +524,8 @@ def update_abstract_with_vips(doc_id, vip_names):
     except oracledb.Error as e:
         return False, f"Database error: {e}"
     finally:
-        conn.close()
+        if conn:
+            conn.close()
 
 
 def add_person_to_lkp(person_name):
@@ -599,7 +600,8 @@ def fetch_all_tags():
     except oracledb.Error as e:
         print(f"❌ Oracle Database error in fetch_all_tags: {e}")
     finally:
-        conn.close()
+        if conn:
+            conn.close()
 
     return sorted(list(tags))
 
@@ -1115,17 +1117,36 @@ def fetch_single_archived_employee(archive_id):
             if not row: return None
             employee_details = dict(zip(columns, row))
 
-            doc_query = "SELECT d.SYSTEM_ID, d.DOCNUMBER, d.DOC_TYPE_ID, d.EXPIRY, d.LEGISLATION_ID, TRIM(dt.NAME) as DOC_NAME, TRIM(l.NAME) as LEGISLATION_NAME FROM LKP_PTA_EMP_DOCS d JOIN LKP_PTA_DOC_TYPES dt ON d.DOC_TYPE_ID = dt.SYSTEM_ID LEFT JOIN LKP_PTA_LEGISL l ON d.LEGISLATION_ID = l.SYSTEM_ID WHERE d.PTA_EMP_ARCH_ID = :1 AND d.DISABLED = '0'"
-
+            doc_query = """
+                SELECT d.SYSTEM_ID, d.DOCNUMBER, d.DOC_TYPE_ID, d.EXPIRY, TRIM(dt.NAME) as DOC_NAME
+                FROM LKP_PTA_EMP_DOCS d
+                JOIN LKP_PTA_DOC_TYPES dt ON d.DOC_TYPE_ID = dt.SYSTEM_ID
+                WHERE d.PTA_EMP_ARCH_ID = :1 AND d.DISABLED = '0'
+            """
             cursor.execute(doc_query, [archive_id])
             doc_columns = [col[0].lower() for col in cursor.description]
-
             documents = []
+            
             for doc_row in cursor.fetchall():
                 doc_dict = dict(zip(doc_columns, doc_row))
                 if doc_dict.get('expiry') and hasattr(doc_dict['expiry'], 'strftime'):
                     doc_dict['expiry'] = doc_dict['expiry'].strftime('%Y-%m-%d')
+                
+                doc_dict['legislation_ids'] = []
+                doc_dict['legislation_names'] = []
+                leg_query = """
+                    SELECT dl.LEGISLATION_ID, TRIM(l.NAME)
+                    FROM LKP_PTA_DOC_LEGISL dl
+                    JOIN LKP_PTA_LEGISL l ON dl.LEGISLATION_ID = l.SYSTEM_ID
+                    WHERE dl.DOC_ID = :1
+                """
+                cursor.execute(leg_query, [doc_dict['system_id']])
+                for leg_row in cursor.fetchall():
+                    doc_dict['legislation_ids'].append(leg_row[0])
+                    doc_dict['legislation_names'].append(leg_row[1])
+                
                 documents.append(doc_dict)
+            
             employee_details['documents'] = documents
     finally:
         if conn: conn.close()
@@ -1197,9 +1218,19 @@ def add_employee_archive_with_docs(dst, dms_user, employee_data, documents):
 
                 cursor.execute("SELECT NVL(MAX(SYSTEM_ID), 0) + 1 FROM LKP_PTA_EMP_DOCS")
                 new_doc_table_id = cursor.fetchone()[0]
-                doc_query = "INSERT INTO LKP_PTA_EMP_DOCS (SYSTEM_ID, PTA_EMP_ARCH_ID, DOCNUMBER, DOC_TYPE_ID, EXPIRY, LEGISLATION_ID, DISABLED, LAST_UPDATE) VALUES (:1, :2, :3, :4, TO_DATE(:5, 'YYYY-MM-DD'), :6, '0', SYSDATE)"
+                doc_query = "INSERT INTO LKP_PTA_EMP_DOCS (SYSTEM_ID, PTA_EMP_ARCH_ID, DOCNUMBER, DOC_TYPE_ID, EXPIRY, DISABLED, LAST_UPDATE) VALUES (:1, :2, :3, :4, TO_DATE(:5, 'YYYY-MM-DD'), '0', SYSDATE)"
                 cursor.execute(doc_query, [new_doc_table_id, new_archive_id, docnumber, doc.get('doc_type_id'),
-                                            doc.get('expiry') or None, doc.get('legislation_id') or None])
+                                            doc.get('expiry') or None])
+                
+                # Handle multiple legislations
+                legislation_ids = doc.get('legislation_ids')
+                if legislation_ids and isinstance(legislation_ids, list):
+                    for leg_id in legislation_ids:
+                        if leg_id: # Ensure not empty
+                            cursor.execute("SELECT NVL(MAX(SYSTEM_ID), 0) + 1 FROM LKP_PTA_DOC_LEGISL")
+                            new_leg_link_id = cursor.fetchone()[0]
+                            leg_query = "INSERT INTO LKP_PTA_DOC_LEGISL (SYSTEM_ID, DOC_ID, LEGISLATION_ID) VALUES (:1, :2, :3)"
+                            cursor.execute(leg_query, [new_leg_link_id, new_doc_table_id, leg_id])
 
         conn.commit()
         return True, "Employee and documents archived successfully."
@@ -1210,7 +1241,7 @@ def add_employee_archive_with_docs(dst, dms_user, employee_data, documents):
         if conn: conn.close()
 
 
-def update_archived_employee(dst, dms_user, archive_id, employee_data, new_documents, deleted_doc_ids):
+def update_archived_employee(dst, dms_user, archive_id, employee_data, new_documents, deleted_doc_ids, updated_documents):
     conn = get_connection()
     if not conn: return False, "Database connection failed."
     try:
@@ -1242,9 +1273,31 @@ def update_archived_employee(dst, dms_user, archive_id, employee_data, new_docum
             })
 
             if deleted_doc_ids:
+                # First delete from the junction table to maintain referential integrity
+                for doc_id in deleted_doc_ids:
+                    cursor.execute("DELETE FROM LKP_PTA_DOC_LEGISL WHERE DOC_ID = :1", [doc_id])
+                
+                # Then mark the document as disabled
                 cursor.executemany(
                     "UPDATE LKP_PTA_EMP_DOCS SET DISABLED = '1', LAST_UPDATE = SYSDATE WHERE SYSTEM_ID = :1",
                     [[doc_id] for doc_id in deleted_doc_ids])
+
+            # Handle updated documents' legislations
+            if updated_documents:
+                for doc in updated_documents:
+                    doc_id = doc.get('system_id')
+                    legislation_ids = doc.get('legislation_ids', [])
+
+                    # Clear existing legislations for this document
+                    cursor.execute("DELETE FROM LKP_PTA_DOC_LEGISL WHERE DOC_ID = :1", [doc_id])
+
+                    # Add the new set of legislations
+                    for leg_id in legislation_ids:
+                        if leg_id:
+                            cursor.execute("SELECT NVL(MAX(SYSTEM_ID), 0) + 1 FROM LKP_PTA_DOC_LEGISL")
+                            new_leg_link_id = cursor.fetchone()[0]
+                            leg_query = "INSERT INTO LKP_PTA_DOC_LEGISL (SYSTEM_ID, DOC_ID, LEGISLATION_ID) VALUES (:1, :2, :3)"
+                            cursor.execute(leg_query, [new_leg_link_id, doc_id, leg_id])
 
             cursor.execute("SELECT DOC_TYPE_ID FROM LKP_PTA_EMP_DOCS WHERE PTA_EMP_ARCH_ID = :1 AND DISABLED = '0'",
                            [archive_id])
@@ -1276,10 +1329,21 @@ def update_archived_employee(dst, dms_user, archive_id, employee_data, new_docum
                 cursor.execute("SELECT NVL(MAX(SYSTEM_ID), 0) + 1 FROM LKP_PTA_EMP_DOCS")
                 new_doc_table_id = cursor.fetchone()[0]
 
-                doc_query = "INSERT INTO LKP_PTA_EMP_DOCS (SYSTEM_ID, PTA_EMP_ARCH_ID, DOCNUMBER, DOC_TYPE_ID, EXPIRY, LEGISLATION_ID, DISABLED, LAST_UPDATE) VALUES (:1, :2, :3, :4, TO_DATE(:5, 'YYYY-MM-DD'), :6, '0', SYSDATE)"
+                doc_query = "INSERT INTO LKP_PTA_EMP_DOCS (SYSTEM_ID, PTA_EMP_ARCH_ID, DOCNUMBER, DOC_TYPE_ID, EXPIRY, DISABLED, LAST_UPDATE) VALUES (:1, :2, :3, :4, TO_DATE(:5, 'YYYY-MM-DD'), '0', SYSDATE)"
                 cursor.execute(doc_query,
                                [new_doc_table_id, archive_id, docnumber, doc.get('doc_type_id'),
-                                doc.get('expiry') or None, doc.get('legislation_id') or None])
+                                doc.get('expiry') or None])
+                
+                # Handle multiple legislations
+                legislation_ids = doc.get('legislation_ids')
+                if legislation_ids and isinstance(legislation_ids, list):
+                    for leg_id in legislation_ids:
+                        if leg_id: # Ensure not empty
+                            cursor.execute("SELECT NVL(MAX(SYSTEM_ID), 0) + 1 FROM LKP_PTA_DOC_LEGISL")
+                            new_leg_link_id = cursor.fetchone()[0]
+                            leg_query = "INSERT INTO LKP_PTA_DOC_LEGISL (SYSTEM_ID, DOC_ID, LEGISLATION_ID) VALUES (:1, :2, :3)"
+                            cursor.execute(leg_query, [new_leg_link_id, new_doc_table_id, leg_id])
+
 
         conn.commit()
         return True, "Employee archive updated successfully."
@@ -1288,3 +1352,4 @@ def update_archived_employee(dst, dms_user, archive_id, employee_data, new_docum
         return False, f"Update transaction failed: {e}"
     finally:
         if conn: conn.close()
+

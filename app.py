@@ -712,13 +712,14 @@ def add_employee_archive():
         documents = []
         i = 0
         while f'new_documents[{i}][file]' in request.files:
-            documents.append({
+            doc_data = {
                 "file": request.files[f'new_documents[{i}][file]'],
                 "doc_type_id": request.form.get(f'new_documents[{i}][doc_type_id]'),
                 "doc_type_name": request.form.get(f'new_documents[{i}][doc_type_name]'),
                 "expiry": request.form.get(f'new_documents[{i}][expiry]'),
-                "legislation_id": request.form.get(f'new_documents[{i}][legislation_id]')
-            })
+                "legislation_ids": request.form.getlist(f'new_documents[{i}][legislation_ids][]')
+            }
+            documents.append(doc_data)
             i += 1
 
         success, message = db_connector.add_employee_archive_with_docs(session['dst'], dms_user, employee_data,
@@ -746,18 +747,23 @@ def update_employee_archive(archive_id):
     new_documents = []
     i = 0
     while f'new_documents[{i}][file]' in request.files:
-        new_documents.append({
+        doc_data = {
             "file": request.files[f'new_documents[{i}][file]'],
             "doc_type_id": request.form.get(f'new_documents[{i}][doc_type_id]'),
             "doc_type_name": request.form.get(f'new_documents[{i}][doc_type_name]'),
             "expiry": request.form.get(f'new_documents[{i}][expiry]'),
-            "legislation_id": request.form.get(f'new_documents[{i}][legislation_id]')
-        })
+            "legislation_ids": request.form.getlist(f'new_documents[{i}][legislation_ids][]')
+        }
+        new_documents.append(doc_data)
         i += 1
 
     deleted_doc_ids = json.loads(request.form.get('deleted_documents', '[]'))
-    success, message = db_connector.update_archived_employee(session['dst'], dms_user, archive_id, employee_data,
-                                                               new_documents, deleted_doc_ids)
+    updated_documents = json.loads(request.form.get('updated_documents', '[]'))
+
+    success, message = db_connector.update_archived_employee(
+        session['dst'], dms_user, archive_id, employee_data,
+        new_documents, deleted_doc_ids, updated_documents
+    )
 
     return (jsonify({"message": message}), 200) if success else (jsonify({"error": message}), 500)
 
