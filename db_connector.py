@@ -217,6 +217,38 @@ def get_connection():
         print(f"DB connection error: {error.message}")
         return None
 
+def get_user_security_level(username):
+    """Fetches the user's security level name from the database using their user ID from the PEOPLE table."""
+    conn = get_connection()
+    if not conn:
+        return "Viewer"  # Default to Viewer if DB connection fails
+    
+    security_level = "Viewer"  # Default value
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT SYSTEM_ID FROM PEOPLE WHERE UPPER(USER_ID) = UPPER(:username)", username=username)
+            user_result = cursor.fetchone()
+            
+            if user_result:
+                user_id = user_result[0]
+                
+                # Now, get the security level using the user_id
+                query = """
+                    SELECT sl.NAME
+                    FROM LKP_PTA_USR_SECUR us
+                    JOIN LKP_PTA_SECURITY sl ON us.SECURITY_LEVEL_ID = sl.SYSTEM_ID
+                    WHERE us.USER_ID = :user_id
+                """
+                cursor.execute(query, user_id=user_id)
+                level_result = cursor.fetchone()
+                if level_result:
+                    security_level = level_result[0]
+    except oracledb.Error as e:
+        print(f"❌ Oracle Database error in get_user_security_level: {e}")
+    finally:
+        if conn:
+            conn.close()
+    return security_level
 
 def get_app_id_from_extension(extension):
     """
@@ -1352,4 +1384,3 @@ def update_archived_employee(dst, dms_user, archive_id, employee_data, new_docum
         return False, f"Update transaction failed: {e}"
     finally:
         if conn: conn.close()
-

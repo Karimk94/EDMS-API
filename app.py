@@ -1,4 +1,4 @@
-from flask import Flask, jsonify, request, Response, send_from_directory, stream_with_context, send_file, session
+from flask import Flask, jsonify, request, Response, send_from_directory, stream_with_context, send_file, session, abort
 from flask_cors import CORS
 import db_connector
 import api_client
@@ -12,15 +12,23 @@ import json
 import re
 from threading import Thread
 import mimetypes
+from functools import wraps
 
 # --- Logging Setup ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 app = Flask(__name__)
-# Added a default secret key for session management, move to .env in production
-app.secret_key = os.getenv('FLASK_SECRET_KEY', 'a-secure-default-secret-key-for-development')
-# Enabled supports_credentials for CORS to handle session cookies
+app.secret_key = os.getenv('FLASK_SECRET_KEY')
 CORS(app, supports_credentials=True, resources={r"/api/*": {"origins": "*"}})
+
+# --- Security Decorator ---
+def editor_required(f):
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if 'user' not in session or session['user'].get('security_level') != 'Editor':
+            abort(403)
+        return f(*args, **kwargs)
+    return decorated_function
 
 
 # --- Authentication Routes (from Archiving Backend) ---
@@ -37,10 +45,12 @@ def login():
     dst = wsdl_client.dms_user_login(username, password)
 
     if dst:
-        # If DMS login is successful, create a session for the user
-        session['user'] = {'username': username}
+        # If DMS login is successful, get security level from our new table
+        security_level = db_connector.get_user_security_level(username)
+        
+        session['user'] = {'username': username, 'security_level': security_level}
         session['dst'] = dst  # Store the DMS token in the session
-        return jsonify({"message": "Login successful", "user": {"username": username}}), 200
+        return jsonify({"message": "Login successful", "user": session['user']}), 200
     else:
         return jsonify({"error": "Invalid DMS credentials"}), 401
 
@@ -701,6 +711,7 @@ def get_employees():
 
 
 @app.route('/api/employees', methods=['POST'])
+@editor_required
 def add_employee_archive():
     if 'user' not in session or 'dst' not in session:
         return jsonify({"error": "Unauthorized"}), 401
@@ -738,6 +749,7 @@ def get_employee_details(archive_id):
 
 
 @app.route('/api/employees/<int:archive_id>', methods=['PUT'])
+@editor_required
 def update_employee_archive(archive_id):
     if 'user' not in session or 'dst' not in session: return jsonify({"error": "Unauthorized"}), 401
 
