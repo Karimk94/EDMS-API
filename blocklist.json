@@ -1,16 +1,41 @@
 {
+  "characters": [
+    "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m",
+    "n", "o", "p", "q", "r", "s", "t", "u", "v", "w", "x", "y", "z",
+    "0", "1", "2", "3", "4", "5", "6", "7", "8", "9",
+    "!", "@", "#", "$", "%", "^", "&", "*", "(", ")", "-", "_", "+", "=",
+    "{", "}", "[", "]", "|", "\\", ":", ";", "\"", "'", "<", ">", ",", ".",
+    "?", "/", "`", "~",
+    "ا", "ب", "ت", "ث", "ج", "ح", "خ", "د", "ذ", "ر", "ز", "س", "ش", "ص",
+    "ض", "ط", "ظ", "ع", "غ", "ف", "ق", "ك", "ل", "م", "ن", "ه", "و", "ي"
+  ],
   "meaningless_english": [
-    "a", "an", "the", "and", "is", "in", "it", "of", "for", "on", "with", "at",
-    "by", "to", "up", "as", "be", "do", "if", "so", "am", "are", "was", "were",
-    "has", "had", "not", "but", "or", "so", "me", "my", "he", "she", "we", "they"
+    "a", "an", "the", "and", "is", "in", "it", "of", "for", "on", "with",
+    "at", "by", "to", "up", "as", "be", "do", "if", "so", "am", "are", "was",
+    "were", "has", "had", "not", "but", "or", "me", "my", "he", "she", "we",
+    "they", "about", "above", "after", "again", "against", "all", "any",
+    "because", "been", "before", "being", "below", "between", "both",
+    "can", "could", "did", "does", "doing", "down", "during", "each",
+    "few", "from", "further", "have", "having", "here", "how", "into",
+    "just", "more", "most", "no", "nor", "now", "off", "once", "only",
+    "other", "our", "out", "over", "same", "should", "some", "such",
+    "than", "that", "then", "there", "these", "this", "those", "through",
+    "too", "under", "until", "very", "what", "when", "where", "which",
+    "while", "who", "whom", "why", "will", "would", "you", "your"
   ],
   "profanity_english": [
-    "shit", "fuck", "bitch", "cunt", "asshole", "damn", "hell", "piss", "dick",
-    "pussy", "gay","sex"
+    "shit", "fuck", "bitch", "cunt", "asshole", "damn", "hell", "piss",
+    "dick", "pussy", "gay", "sex"
   ],
   "meaningless_arabic": [
-    "ال", "و", "في", "من", "الى", "على", "يا", "هو", "هي", "هم", "هن", "نحن",
-    "أنا", "أنت", "هذا", "هذه"
+    "ال", "و", "في", "من", "الى", "على", "يا", "هو", "هي", "هم", "هن",
+    "نحن", "أنا", "أنت", "هذا", "هذه", "إلى", "أن", "أو", "أي", "بك",
+    "بل", "بما", "به", "بها", "بين", "ثم", "جميع", "جدا", "جعل", "حتى",
+    "حول", "حيث", "خلال", "دون", "ذلك", "الذي", "الذين", "التي", "عن",
+    "عند", "عندما", "كل", "كان", "كانت", "كانوا", "كما", "كذلك", "كيف",
+    "لأن", "لك", "لكن", "لكم", "لم", "لن", "له", "لها", "لهم", "لو", "ما",
+    "ماذا", "متى", "مع", "معظم", "منذ", "هؤلاء", "هنا", "هناك", "واحد",
+    "واحدة", "ولكن", "يجب", "يكون", "يمكن", "يوم"
   ],
   "profanity_arabic": [
     "كلب", "حقير", "حيوان", "خرا", "تبا", "عاهرة"

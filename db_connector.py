@@ -9,10 +9,10 @@ import io
 import shutil
 import logging
 from moviepy import VideoFileClip
-import fitz
+import fitz 
 from datetime import datetime, timedelta
 import wsdl_client
-
+import json
 
 load_dotenv()
 
@@ -24,6 +24,19 @@ if not os.path.exists(thumbnail_cache_dir):
 video_cache_dir = os.path.join(os.path.dirname(__file__), 'video_cache')
 if not os.path.exists(video_cache_dir):
     os.makedirs(video_cache_dir)
+
+# --- Blocklist Loading ---
+BLOCKLIST = {}
+try:
+    blocklist_path = os.path.join(os.path.dirname(__file__), 'blocklist.json')
+    with open(blocklist_path, 'r', encoding='utf-8') as f:
+        loaded_blocklist = json.load(f)
+        # Combine all meaningless words into a single set for efficient lookup
+        meaningless_words = set(loaded_blocklist.get('meaningless_english', []))
+        meaningless_words.update(loaded_blocklist.get('meaningless_arabic', []))
+        BLOCKLIST['meaningless'] = meaningless_words
+except (FileNotFoundError, json.JSONDecodeError) as e:
+    logging.warning(f"Could not load or parse blocklist.json: {e}")
 
 
 # --- DMS Communication ---
@@ -716,6 +729,15 @@ def insert_keywords_and_tags(docnumber, keywords):
                 if not english_keyword_orig or not arabic_keyword:
                     continue
 
+                # --- Keyword Validation ---
+                if len(english_keyword_orig.strip()) < 2:
+                    logging.warning(f"Skipping short keyword '{english_keyword_orig}' for docnumber {docnumber}.")
+                    continue
+
+                if ' ' not in english_keyword_orig and english_keyword_orig.lower() in BLOCKLIST.get('meaningless', set()):
+                    logging.warning(f"Skipping meaningless keyword '{english_keyword_orig}' for docnumber {docnumber}.")
+                    continue
+
                 english_keyword = english_keyword_orig.lower()
 
                 if english_keyword in processed_keywords:
@@ -797,7 +819,15 @@ def insert_keywords_and_tags(docnumber, keywords):
 
 
 def add_tag_to_document(doc_id, tag):
-    """Adds a new tag to a document, handling existing keywords."""
+    """Adds a new tag to a document, handling existing keywords and validating the tag."""
+    # --- Tag Validation ---
+    if not tag or len(tag.strip()) < 2:
+        return False, "Tag cannot be empty or less than 2 characters."
+
+    # If the tag is a single word, check if it's in the blocklist
+    if ' ' not in tag and tag.lower() in BLOCKLIST.get('meaningless', set()):
+        return False, f"Tag '{tag}' is a meaningless word and cannot be added."
+
     conn = get_connection()
     if not conn:
         return False, "Could not connect to the database."
@@ -840,6 +870,13 @@ def add_tag_to_document(doc_id, tag):
 
 def update_tag_for_document(doc_id, old_tag, new_tag):
     """Updates a tag for a document."""
+    # --- Tag Validation ---
+    if not new_tag or len(new_tag.strip()) < 2:
+        return False, "New tag cannot be empty or less than 2 characters."
+
+    if ' ' not in new_tag and new_tag.lower() in BLOCKLIST.get('meaningless', set()):
+        return False, f"Tag '{new_tag}' is a meaningless word and cannot be added."
+
     conn = get_connection()
     if not conn:
         return False, "Could not connect to the database."
@@ -880,27 +917,70 @@ def update_tag_for_document(doc_id, old_tag, new_tag):
 
 
 def delete_tag_from_document(doc_id, tag):
-    """Deletes a tag from a document."""
+    """Deletes a tag from a document. The tag can be a keyword or a person's name."""
     conn = get_connection()
     if not conn:
         return False, "Could not connect to the database."
+
     try:
         with conn.cursor() as cursor:
-            # Find the keyword ID
+            # First, assume the tag is a keyword and try to delete it.
             cursor.execute("SELECT SYSTEM_ID FROM KEYWORD WHERE KEYWORD_ID = :1", [tag.lower()])
-            result = cursor.fetchone()
-            if not result:
-                return False, "Tag not found."
-            keyword_id = result[0]
+            keyword_result = cursor.fetchone()
 
-            # Delete the link from LKP_DOCUMENT_TAGS
-            cursor.execute("""
-                DELETE FROM LKP_DOCUMENT_TAGS
-                WHERE DOCNUMBER = :doc_id AND TAG_ID = :tag_id
-            """, doc_id=doc_id, tag_id=keyword_id)
+            if keyword_result:
+                keyword_id = keyword_result[0]
+                # Delete the link from LKP_DOCUMENT_TAGS
+                cursor.execute("""
+                    DELETE FROM LKP_DOCUMENT_TAGS
+                    WHERE DOCNUMBER = :doc_id AND TAG_ID = :tag_id
+                """, doc_id=doc_id, tag_id=keyword_id)
+                
+                # Check if any rows were deleted
+                if cursor.rowcount > 0:
+                    conn.commit()
+                    return True, "Tag deleted successfully."
+
+            # If the tag was not found as a keyword or no rows were deleted, check if it's a person.
+            cursor.execute("SELECT NAME_ENGLISH FROM LKP_PERSON WHERE UPPER(NAME_ENGLISH) = :1", [tag.upper()])
+            person_result = cursor.fetchone()
+
+            if person_result:
+                # It's a person, so we need to modify the abstract.
+                cursor.execute("SELECT ABSTRACT FROM PROFILE WHERE DOCNUMBER = :1", [doc_id])
+                abstract_result = cursor.fetchone()
+                if not abstract_result or not abstract_result[0]:
+                    return False, "Document abstract not found or is empty."
+
+                current_abstract = abstract_result[0]
+                # Find the VIPs section
+                vips_match = re.search(r'VIPs:\s*(.*)', current_abstract, re.IGNORECASE)
+                if vips_match:
+                    vips_str = vips_match.group(1)
+                    vips_list = [name.strip() for name in vips_str.split(',')]
+                    
+                    # Remove the person from the list (case-insensitive)
+                    original_len = len(vips_list)
+                    vips_list = [name for name in vips_list if name.lower() != tag.lower()]
+
+                    if len(vips_list) < original_len:
+                        # Reconstruct the abstract
+                        if vips_list:
+                            new_vips_str = "VIPs: " + ", ".join(vips_list)
+                            new_abstract = current_abstract.replace(vips_match.group(0), new_vips_str)
+                        else:
+                            # If no VIPs are left, remove the entire VIPs line
+                            new_abstract = current_abstract.replace(vips_match.group(0), '').strip()
+
+                        cursor.execute("UPDATE PROFILE SET ABSTRACT = :1 WHERE DOCNUMBER = :2", [new_abstract, doc_id])
+                        conn.commit()
+                        return True, "Person tag removed from abstract successfully."
+
             conn.commit()
-            return True, "Tag deleted successfully."
+            return False, f"Tag '{tag}' not found for this document."
+
     except oracledb.Error as e:
+        conn.rollback()
         return False, f"Database error: {e}"
     finally:
         if conn:
