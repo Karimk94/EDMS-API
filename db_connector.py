@@ -234,9 +234,9 @@ def get_user_security_level(username):
     """Fetches the user's security level name from the database using their user ID from the PEOPLE table."""
     conn = get_connection()
     if not conn:
-        return "Viewer"  # Default to Viewer if DB connection fails
+        return None  # Return None if DB connection fails
     
-    security_level = "Viewer"  # Default value
+    security_level = None  # Default value is now None
     try:
         with conn.cursor() as cursor:
             cursor.execute("SELECT SYSTEM_ID FROM PEOPLE WHERE UPPER(USER_ID) = UPPER(:username)", username=username)
@@ -256,6 +256,7 @@ def get_user_security_level(username):
                 level_result = cursor.fetchone()
                 if level_result:
                     security_level = level_result[0]
+                # If level_result is None, security_level remains None and will be returned
     except oracledb.Error as e:
         print(f"❌ Oracle Database error in get_user_security_level: {e}")
     finally:

@@ -48,12 +48,14 @@ def login():
         # If DMS login is successful, get security level from our new table
         security_level = db_connector.get_user_security_level(username)
         
+        if security_level is None:
+            return jsonify({"error": "User not authorized"}), 401
+
         session['user'] = {'username': username, 'security_level': security_level}
         session['dst'] = dst  # Store the DMS token in the session
         return jsonify({"message": "Login successful", "user": session['user']}), 200
     else:
         return jsonify({"error": "Invalid DMS credentials"}), 401
-
 
 @app.route('/api/auth/logout', methods=['POST'])
 def logout():
