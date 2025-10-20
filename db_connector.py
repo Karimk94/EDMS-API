@@ -385,7 +385,7 @@ def fetch_documents_from_oracle(page=1, page_size=10, search_term=None, date_fro
         search_conditions = []
         for i, word in enumerate(words):
             key = f"search_word_{i}"
-            search_conditions.append(f"UPPER(p.ABSTRACT) LIKE :{key}")
+            search_conditions.append(f"(UPPER(p.ABSTRACT) LIKE :{key} OR UPPER(p.DOCNAME) LIKE :{key})")
             params[key] = f"%{word}%"
         where_clauses.append(" AND ".join(search_conditions))
 
@@ -621,7 +621,8 @@ def fetch_lkp_persons(page=1, page_size=20, search=''):
     except oracledb.Error as e:
         print(f"❌ Oracle Database error in fetch_lkp_persons: {e}")
     finally:
-        conn.close()
+        if conn:
+            conn.close()
     return persons, total_rows
 
 
