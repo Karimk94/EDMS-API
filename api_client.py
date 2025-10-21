@@ -44,7 +44,7 @@ def get_ocr_text_from_pdf(pdf_data, filename):
 def recognize_faces(image_data, filename):
     """Processes a single, full image file for face recognition using a stream."""
     api_url = os.getenv("FACE_API_URL")
-    stream_api_url = f"{api_url.rstrip('/')}/analyze_image_stream"
+    stream_api_url = f"{api_url.rstrip('/')}/api/analyze_image_stream"
 
     headers = {'Content-Type': 'application/octet-stream', 'X-Filename': filename}
     response = requests.post(stream_api_url, data=data_chunk_generator(image_data), headers=headers, timeout=500)
