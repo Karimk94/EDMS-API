@@ -752,7 +752,7 @@ def insert_keywords_and_tags(docnumber, keywords):
 
                 keyword_system_id = None
 
-                cursor.execute("SELECT SYSTEM_ID FROM KEYWORD WHERE KEYWORD_ID = :keyword_id",
+                cursor.execute("SELECT SYSTEM_ID FROM KEYWORD WHERE UPPER(KEYWORD_ID) = UPPER(:keyword_id)",
                                keyword_id=english_keyword)
                 result = cursor.fetchone()
 
@@ -774,7 +774,7 @@ def insert_keywords_and_tags(docnumber, keywords):
                         if "ORA-00001" in error.message:
                             logging.warning(
                                 f"Keyword '{english_keyword}' was inserted by another process. Fetching existing ID.")
-                            cursor.execute("SELECT SYSTEM_ID FROM KEYWORD WHERE KEYWORD_ID = :keyword_id",
+                            cursor.execute("SELECT SYSTEM_ID FROM KEYWORD WHERE UPPER(KEYWORD_ID) = UPPER(:keyword_id)",
                                            keyword_id=english_keyword)
                             result = cursor.fetchone()
                             if result:

@@ -54,7 +54,7 @@ def recognize_faces(image_data, filename):
 def recognize_faces_from_list(base64_faces_list):
     """Processes a list of pre-cropped, base64-encoded faces from a video."""
     base_api_url = os.getenv("FACE_API_URL")
-    endpoint = f"{base_api_url.rstrip('/')}/recognize_faces"
+    endpoint = f"{base_api_url.rstrip('/')}/api/recognize_faces"
     
     payload = {'faces': base64_faces_list}
     response = requests.post(endpoint, json=payload, timeout=500)
