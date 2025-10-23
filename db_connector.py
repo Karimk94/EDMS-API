@@ -9,10 +9,11 @@ import io
 import shutil
 import logging
 from moviepy import VideoFileClip
-import fitz 
+import fitz
 from datetime import datetime, timedelta
 import wsdl_client
 import json
+import math
 
 load_dotenv()
 
@@ -37,6 +38,41 @@ try:
         BLOCKLIST['meaningless'] = meaningless_words
 except (FileNotFoundError, json.JSONDecodeError) as e:
     logging.warning(f"Could not load or parse blocklist.json: {e}")
+
+
+def get_exif_date(image_stream):
+    """Extracts the 'Date Taken' from image EXIF data."""
+    try:
+        # Reset stream position just in case
+        image_stream.seek(0)
+        with Image.open(image_stream) as img:
+            # exif = img.getexif() # Use the recommended method
+            # exif_ifd = exif.get_ifd(ExifTags.IFD.Exif)
+            # Use the numeric tag directly if getexif() returns the raw dictionary
+            raw_exif = img._getexif()
+            if raw_exif and 36867 in raw_exif: # 36867 is the tag for DateTimeOriginal
+                date_str = raw_exif[36867]
+                # Ensure the date string is not empty or just spaces
+                if date_str and date_str.strip():
+                     # Attempt to parse known formats
+                    for fmt in ('%Y:%m:%d %H:%M:%S', '%Y-%m-%d %H:%M:%S'):
+                        try:
+                            return datetime.strptime(date_str, fmt)
+                        except ValueError:
+                            continue
+                    logging.warning(f"Could not parse EXIF date string '{date_str}' with known formats.")
+                else:
+                    logging.info("EXIF date tag found but empty.")
+
+    except AttributeError:
+         # Handle cases where _getexif might not be available or returns None
+         logging.warning("Could not retrieve EXIF data using _getexif.")
+    except Exception as e:
+        logging.warning(f"Could not extract or parse EXIF date: {e}")
+    finally:
+        # It's good practice to seek back to the beginning if the stream might be reused
+        image_stream.seek(0)
+    return None
 
 
 # --- DMS Communication ---
@@ -177,7 +213,7 @@ def stream_and_cache_generator(obj_client, stream_id, content_id, final_cache_pa
 
         # Once fully downloaded, move the temp file to its final location
         os.rename(temp_cache_path, final_cache_path)
-        logging.info(f"Successfully cached file to {final_cache_path}")
+        # logging.info(f"Successfully cached file to {final_cache_path}")
     except Exception as e:
         logging.error(f"Error during streaming/caching: {e}")
     finally:
@@ -200,21 +236,28 @@ def create_thumbnail(doc_number, media_type, file_ext, media_bytes):
         if media_type == 'video':
             temp_video_path = os.path.join(thumbnail_cache_dir, f"{doc_number}{file_ext}")
             with open(temp_video_path, 'wb') as f: f.write(media_bytes)
+            # Use moviepy.editor
             with VideoFileClip(temp_video_path) as clip: clip.save_frame(cached_path, t=1)
             os.remove(temp_video_path)
         elif media_type == 'pdf':
+            # Use fitz (PyMuPDF)
             with fitz.open(stream=media_bytes, filetype="pdf") as doc:
                 page = doc.load_page(0)  # Load the first page
                 pix = page.get_pixmap()
+                # Create PIL image from pixmap samples
                 with Image.frombytes("RGB", [pix.width, pix.height], pix.samples) as img:
                     img.save(cached_path, "JPEG", quality=95)
-        else:
+        else: # Assumed image
+            # Use Pillow
             with Image.open(io.BytesIO(media_bytes)) as img:
                 img.thumbnail((300, 300))
+                # Ensure image is RGB before saving as JPEG
                 img.convert("RGB").save(cached_path, "JPEG", quality=95)
-        return f"cache/{thumbnail_filename}"
+        return f"cache/{thumbnail_filename}" # Return relative path for URL
     except Exception as e:
         print(f"Could not create thumbnail for {doc_number}: {e}")
+        # Consider logging the error more formally
+        # logging.error(f"Thumbnail creation failed for {doc_number}", exc_info=True)
         return None
 
 
@@ -224,10 +267,17 @@ def get_connection():
     """Establishes a connection to the Oracle database."""
     try:
         dsn = f"{os.getenv('DB_HOST')}:{os.getenv('DB_PORT')}/{os.getenv('DB_SERVICE_NAME')}"
-        return oracledb.connect(user=os.getenv('DB_USERNAME'), password=os.getenv('DB_PASSWORD'), dsn=dsn)
+        # Ensure credentials are being fetched correctly
+        user = os.getenv('DB_USERNAME')
+        password = os.getenv('DB_PASSWORD')
+        if not all([user, password, dsn]):
+            logging.error("Database connection details missing in environment variables.")
+            return None
+        return oracledb.connect(user=user, password=password, dsn=dsn)
     except oracledb.Error as ex:
         error, = ex.args
-        print(f"DB connection error: {error.message}")
+        # Log the detailed error
+        logging.error(f"DB connection error: {error.message} (Code: {error.code}, Context: {error.context})")
         return None
 
 def get_user_security_level(username):
@@ -235,16 +285,17 @@ def get_user_security_level(username):
     conn = get_connection()
     if not conn:
         return None  # Return None if DB connection fails
-    
+
     security_level = None  # Default value is now None
     try:
         with conn.cursor() as cursor:
+            # Use upper for case-insensitive comparison
             cursor.execute("SELECT SYSTEM_ID FROM PEOPLE WHERE UPPER(USER_ID) = UPPER(:username)", username=username)
             user_result = cursor.fetchone()
-            
+
             if user_result:
                 user_id = user_result[0]
-                
+
                 # Now, get the security level using the user_id
                 query = """
                     SELECT sl.NAME
@@ -256,9 +307,13 @@ def get_user_security_level(username):
                 level_result = cursor.fetchone()
                 if level_result:
                     security_level = level_result[0]
-                # If level_result is None, security_level remains None and will be returned
+                else:
+                    logging.warning(f"No security level found for user_id {user_id} (DMS user: {username})")
+            else:
+                 logging.warning(f"No PEOPLE record found for DMS user: {username}")
+                 # If level_result is None, security_level remains None and will be returned
     except oracledb.Error as e:
-        print(f"❌ Oracle Database error in get_user_security_level: {e}")
+        logging.error(f"Oracle Database error in get_user_security_level for {username}: {e}", exc_info=True)
     finally:
         if conn:
             conn.close()
@@ -267,28 +322,30 @@ def get_user_security_level(username):
 def get_app_id_from_extension(extension):
     """
     Looks up the APPLICATION (APP_ID) from the APPS table based on the file extension.
+    Converts extension to uppercase for comparison.
     """
     conn = get_connection()
     if not conn:
         return None
 
     app_id = None
+    upper_extension = extension.upper() if extension else ''
     try:
         with conn.cursor() as cursor:
-            # First, check the DEFAULT_EXTENSION column
-            cursor.execute("SELECT APPLICATION FROM APPS WHERE DEFAULT_EXTENSION = :ext", ext=extension)
+            # First, check the DEFAULT_EXTENSION column (case-insensitive)
+            cursor.execute("SELECT APPLICATION FROM APPS WHERE UPPER(DEFAULT_EXTENSION) = :ext", ext=upper_extension)
             result = cursor.fetchone()
             if result:
                 app_id = result[0]
             else:
-                # If not found, check the FILE_TYPES column
-                cursor.execute("SELECT APPLICATION FROM APPS WHERE FILE_TYPES LIKE :ext_like",
-                               ext_like=f"%{extension}%")
+                # If not found, check the FILE_TYPES column (case-insensitive, using LIKE)
+                cursor.execute("SELECT APPLICATION FROM APPS WHERE UPPER(FILE_TYPES) LIKE :ext_like",
+                               ext_like=f"%{upper_extension}%")
                 result = cursor.fetchone()
                 if result:
                     app_id = result[0]
     except oracledb.Error as e:
-        print(f"❌ Oracle Database error in get_app_id_from_extension: {e}")
+        logging.error(f"Oracle Database error in get_app_id_from_extension for '{extension}': {e}", exc_info=True)
     finally:
         if conn:
             conn.close()
@@ -302,12 +359,17 @@ def get_specific_documents_for_processing(docnumbers):
 
     conn = get_connection()
     if not conn:
-        return []
+         logging.error("Failed to get DB connection in get_specific_documents_for_processing.")
+         return []
+
 
     try:
         with conn.cursor() as cursor:
+            # Ensure docnumbers are integers for binding
+            int_docnumbers = [int(d) for d in docnumbers]
+
             # Create placeholders for the IN clause
-            placeholders = ','.join([':' + str(i + 1) for i in range(len(docnumbers))])
+            placeholders = ','.join([f':{i + 1}' for i in range(len(int_docnumbers))])
 
             sql = f"""
             SELECT p.docnumber, p.abstract,
@@ -319,9 +381,12 @@ def get_specific_documents_for_processing(docnumbers):
             LEFT JOIN TAGGING_QUEUE q ON p.docnumber = q.docnumber
             WHERE p.docnumber IN ({placeholders})
             """
-            cursor.execute(sql, docnumbers)
+            cursor.execute(sql, int_docnumbers)
             columns = [col[0].lower() for col in cursor.description]
             return [dict(zip(columns, row)) for row in cursor.fetchall()]
+    except (oracledb.Error, ValueError) as e: # Catch potential int conversion error
+        logging.error(f"Error in get_specific_documents_for_processing: {e}", exc_info=True)
+        return []
     finally:
         if conn:
             conn.close()
@@ -337,141 +402,225 @@ def check_processing_status(docnumbers):
 
     conn = get_connection()
     if not conn:
+        logging.error("Failed to get DB connection in check_processing_status.")
         return docnumbers  # Assume still processing if DB is down
 
     try:
+         # Ensure docnumbers are integers
+        int_docnumbers = [int(d) for d in docnumbers]
         with conn.cursor() as cursor:
-            placeholders = ','.join([':' + str(i + 1) for i in range(len(docnumbers))])
+            # Using bind variables is generally safer and more performant
+            bind_names = [f':doc_{i}' for i in range(len(int_docnumbers))]
+            bind_vars = {f'doc_{i}': val for i, val in enumerate(int_docnumbers)}
 
+            # Construct the SQL using bind names
+            # Using SYS.ODCINUMBERLIST is fine for moderate numbers, but can be slow for very large lists
             sql = f"""
-            SELECT COLUMN_VALUE FROM TABLE(SYS.ODCINUMBERLIST({placeholders})) input_docs
+            SELECT COLUMN_VALUE
+            FROM TABLE(SYS.ODCINUMBERLIST({','.join(bind_names)})) input_docs
             WHERE input_docs.COLUMN_VALUE NOT IN (
-                SELECT docnumber FROM TAGGING_QUEUE WHERE docnumber IN ({placeholders}) AND STATUS = 3
+                SELECT docnumber FROM TAGGING_QUEUE WHERE docnumber IN ({','.join(bind_names)}) AND STATUS = 3
             )
             """
 
-            cursor.execute(sql, docnumbers + docnumbers)
+            # Execute with the dictionary of bind variables twice
+            cursor.execute(sql, {**bind_vars, **{f'q_{k}': v for k, v in bind_vars.items()}}) # Need unique names for second IN
             still_processing = [row[0] for row in cursor.fetchall()]
             return still_processing
-    except oracledb.Error as e:
-        print(f"❌ Oracle Database error in check_processing_status: {e}")
-        return docnumbers
+    except (oracledb.Error, ValueError) as e:
+        logging.error(f"Error in check_processing_status: {e}", exc_info=True)
+        return docnumbers # Return original list on error
     finally:
         if conn:
             conn.close()
 
 
 def fetch_documents_from_oracle(page=1, page_size=10, search_term=None, date_from=None, date_to=None,
-                                persons=None, person_condition='any', tags=None):
+                                persons=None, person_condition='any', tags=None, years=None): # Changed year to years
     """Fetches a paginated list of documents from Oracle, handling filtering and thumbnail logic."""
     conn = get_connection()
-    if not conn: return [], 0
+    if not conn:
+        logging.error("Failed to get DB connection in fetch_documents_from_oracle.")
+        return [], 0
 
     dst = dms_system_login()
     if not dst:
-        print("Could not log into DMS. Aborting document fetch.")
+        logging.error("Could not log into DMS. Aborting document fetch.")
         return [], 0
 
     offset = (page - 1) * page_size
     documents = []
     total_rows = 0
 
-    base_where = "WHERE p.docnumber >= 19662092 AND p.FORM = 2740 "
+    base_where = "WHERE p.docnumber >= 19662092 AND p.FORM = 2740 " # Base filters
     params = {}
     where_clauses = []
 
+    # --- Search Term ---
     if search_term:
-        words = re.findall(r'\w+', search_term.upper())
-        search_conditions = []
-        for i, word in enumerate(words):
-            key = f"search_word_{i}"
-            search_conditions.append(f"(UPPER(p.ABSTRACT) LIKE :{key} OR UPPER(p.DOCNAME) LIKE :{key})")
-            params[key] = f"%{word}%"
-        where_clauses.append(" AND ".join(search_conditions))
+        # Split search term into words, handle potential operators later if needed
+        words = re.findall(r'\b\w+\b', search_term.upper()) # Find word boundaries
+        if words:
+            search_conditions = []
+            for i, word in enumerate(words):
+                # Avoid overly broad searches for very short words if desired
+                # if len(word) < 3: continue
+                key = f"search_word_{i}"
+                # Search in ABSTRACT and DOCNAME
+                search_conditions.append(f"(UPPER(p.ABSTRACT) LIKE :{key} OR UPPER(p.DOCNAME) LIKE :{key})")
+                params[key] = f"%{word}%"
+            if search_conditions:
+                 # Default to AND for multiple search words
+                where_clauses.append("(" + " AND ".join(search_conditions) + ")")
 
+
+    # --- Persons Filter ---
     if persons:
+        # Expecting comma-separated string
         person_list = [p.strip().upper() for p in persons.split(',') if p.strip()]
         if person_list:
             op = " OR " if person_condition == 'any' else " AND "
             person_conditions = []
             for i, person in enumerate(person_list):
                 key = f'person_{i}'
+                # Searching within ABSTRACT for person names
                 person_conditions.append(f"UPPER(p.ABSTRACT) LIKE :{key}")
-                params[key] = f"%{person}%"
-            where_clauses.append(f"({op.join(person_conditions)})")
+                params[key] = f"%{person}%" # Wildcard search
+            if person_conditions:
+                where_clauses.append(f"({op.join(person_conditions)})")
 
+    # --- Date Filtering uses RTADOCDATE ---
+    # Validate date formats if necessary before adding to query
     if date_from:
-        where_clauses.append("p.CREATION_DATE >= TO_DATE(:date_from, 'YYYY-MM-DD HH24:MI:SS')")
+        # Assuming date_from is 'YYYY-MM-DD HH24:MI:SS' string from frontend
+        where_clauses.append("p.RTADOCDATE >= TO_DATE(:date_from, 'YYYY-MM-DD HH24:MI:SS')")
         params['date_from'] = date_from
     if date_to:
-        where_clauses.append("p.CREATION_DATE <= TO_DATE(:date_to, 'YYYY-MM-DD HH24:MI:SS')")
+        # Assuming date_to is 'YYYY-MM-DD HH24:MI:SS' string from frontend
+        where_clauses.append("p.RTADOCDATE <= TO_DATE(:date_to, 'YYYY-MM-DD HH24:MI:SS')")
         params['date_to'] = date_to
 
+    # --- Year Filtering uses RTADOCDATE ---
+    if years:
+         # Expecting comma-separated string of years
+        try:
+            year_list = [int(y.strip()) for y in years.split(',') if y.strip().isdigit()]
+            if year_list:
+                # Create placeholders like :year_0, :year_1, ...
+                year_placeholders = ','.join([f':year_{i}' for i in range(len(year_list))])
+                where_clauses.append(f"EXTRACT(YEAR FROM p.RTADOCDATE) IN ({year_placeholders})")
+                # Add each year to the params dictionary
+                for i, year_val in enumerate(year_list):
+                    params[f'year_{i}'] = year_val
+        except ValueError:
+            logging.warning(f"Invalid year format received: {years}. Skipping year filter.")
+
+
+    # --- Tags Filter ---
     if tags:
+        # Expecting comma-separated string
         tag_list = [t.strip().upper() for t in tags.split(',') if t.strip()]
         if tag_list:
             tag_conditions = []
             for i, tag in enumerate(tag_list):
                 key = f'tag_{i}'
+                # Check existence in keyword link table
                 keyword_subquery = f"""
                 EXISTS (
                     SELECT 1 FROM LKP_DOCUMENT_TAGS ldt
                     JOIN KEYWORD k ON ldt.TAG_ID = k.SYSTEM_ID
-                    WHERE ldt.DOCNUMBER = p.DOCNUMBER AND UPPER(k.KEYWORD_ID) = :{key}
+                    WHERE ldt.DOCNUMBER = p.DOCNUMBER AND UPPER(k.KEYWORD_ID) = :{key} AND ldt.DISABLED = 0
                 )
                 """
-                person_subquery = f"UPPER(p.ABSTRACT) LIKE '%' || :{key} || '%'"
+                # Also check if the tag appears as a potential person name in the abstract
+                person_subquery = f"UPPER(p.ABSTRACT) LIKE '%' || :{key} || '%'" # Simple LIKE check
 
+                # Combine checks with OR: doc must match either keyword OR person name in abstract
                 tag_conditions.append(f"({keyword_subquery} OR {person_subquery})")
-                params[key] = tag
+                params[key] = tag # Bind the tag value
 
-            where_clauses.append(" AND ".join(tag_conditions))
+            # All selected tags must match (AND condition between different tags)
+            where_clauses.append("(" + " AND ".join(tag_conditions) + ")")
 
+    # --- Combine WHERE clauses ---
     final_where_clause = base_where + ("AND " + " AND ".join(where_clauses) if where_clauses else "")
 
     try:
         with conn.cursor() as cursor:
+            # --- Count Query ---
             count_query = f"SELECT COUNT(p.DOCNUMBER) FROM PROFILE p {final_where_clause}"
+            logging.debug(f"Executing Count Query: {count_query}")
+            logging.debug(f"Count Params: {params}")
             cursor.execute(count_query, params)
-            total_rows = cursor.fetchone()[0]
+            count_result = cursor.fetchone()
+            total_rows = count_result[0] if count_result else 0
+            # logging.info(f"Total rows found: {total_rows}")
 
-            fetch_query = f"SELECT p.DOCNUMBER, p.ABSTRACT, p.AUTHOR, p.CREATION_DATE, p.DOCNAME FROM PROFILE p {final_where_clause}"
-            params['offset'] = offset
-            params['page_size'] = page_size
+            # --- Fetch Query ---
+            # Select RTADOCDATE and alias it for clarity, handle potential NULLs
+            fetch_query = f"""
+                SELECT p.DOCNUMBER, p.ABSTRACT, p.AUTHOR, p.RTADOCDATE as DOC_DATE, p.DOCNAME
+                FROM PROFILE p {final_where_clause}
+                ORDER BY p.DOCNUMBER DESC
+                OFFSET :offset ROWS FETCH NEXT :page_size ROWS ONLY
+            """
+            # Add pagination params AFTER filter params
+            fetch_params = params.copy()
+            fetch_params['offset'] = offset
+            fetch_params['page_size'] = page_size
 
-            cursor.execute(
-                fetch_query + " ORDER BY p.DOCNUMBER DESC OFFSET :offset ROWS FETCH NEXT :page_size ROWS ONLY",
-                params)
+            logging.debug(f"Executing Fetch Query: {fetch_query}")
+            logging.debug(f"Fetch Params: {fetch_params}")
+            cursor.execute(fetch_query, fetch_params)
 
+            # Process results
             for row in cursor:
-                doc_id, abstract, author, creation_date, docname = row
+                doc_id, abstract, author, doc_date, docname = row
                 thumbnail_path = None
 
+                # Fetch media info (could potentially be optimized if DMS calls are slow)
                 original_filename, media_type, file_ext = get_media_info_from_dms(dst, doc_id)
 
+                # --- Thumbnail Logic ---
                 cached_thumbnail_file = f"{doc_id}.jpg"
                 cached_path = os.path.join(thumbnail_cache_dir, cached_thumbnail_file)
 
                 if os.path.exists(cached_path):
                     thumbnail_path = f"cache/{cached_thumbnail_file}"
                 else:
+                    # Only fetch full content if thumbnail not cached
                     media_bytes = get_media_content_from_dms(dst, doc_id)
                     if media_bytes:
                         thumbnail_path = create_thumbnail(doc_id, media_type, file_ext, media_bytes)
+                    else:
+                        logging.warning(f"Failed to get media content for doc {doc_id} to create thumbnail.")
+
 
                 documents.append({
                     "doc_id": doc_id,
                     "title": abstract or "No Title",
                     "docname": docname or "",
                     "author": author or "N/A",
-                    "date": creation_date.strftime('%Y-%m-%d') if creation_date else "N/A",
-                    "thumbnail_url": thumbnail_path or "",
-                    "media_type": media_type
+                    # Format date, handle None
+                    "date": doc_date.strftime('%Y-%m-%d') if doc_date else "N/A",
+                    "thumbnail_url": thumbnail_path or "", # Use empty string if no thumbnail
+                    "media_type": media_type or "image" # Default to image if type unknown
                 })
+    except oracledb.Error as e:
+         # Log detailed Oracle error
+         logging.error(f"Oracle Error in fetch_documents_from_oracle: {e}", exc_info=True)
+         error_obj, = e.args
+         logging.error(f"Error Code: {error_obj.code}, Message: {error_obj.message}, Context: {error_obj.context}")
+         return [], 0 # Return empty results on error
+    except Exception as e:
+         # Catch other potential errors
+         logging.error(f"Unexpected error in fetch_documents_from_oracle: {e}", exc_info=True)
+         return [], 0
     finally:
-        conn.close()
+        if conn:
+            conn.close()
+            logging.debug("Database connection closed.")
     return documents, total_rows
-
 
 def get_documents_to_process():
     """Gets a batch of documents that need AI processing."""
@@ -499,7 +648,6 @@ def get_documents_to_process():
         finally:
             conn.close()
     return []
-
 
 def update_document_processing_status(docnumber, new_abstract, o_detected, ocr, face, status, error, transcript,
                                       attempts):
@@ -531,7 +679,7 @@ def update_document_processing_status(docnumber, new_abstract, o_detected, ocr, 
             })
 
             conn.commit()
-            logging.info(f"DB_UPDATE_SUCCESS: Successfully updated status for docnumber {docnumber}.")
+            # logging.info(f"DB_UPDATE_SUCCESS: Successfully updated status for docnumber {docnumber}.")
 
     except oracledb.Error as e:
         logging.error(f"DB_UPDATE_ERROR: Oracle error while updating docnumber {docnumber}: {e}", exc_info=True)
@@ -545,7 +693,6 @@ def update_document_processing_status(docnumber, new_abstract, o_detected, ocr, 
     finally:
         if conn:
             conn.close()
-
 
 def update_abstract_with_vips(doc_id, vip_names):
     """Appends VIP names to a document's abstract."""
@@ -573,7 +720,6 @@ def update_abstract_with_vips(doc_id, vip_names):
         if conn:
             conn.close()
 
-
 def add_person_to_lkp(person_name):
     """Adds a new person to the LKP_PERSON lookup table."""
     conn = get_connection()
@@ -596,7 +742,6 @@ def add_person_to_lkp(person_name):
     finally:
         if conn:
             conn.close()
-
 
 def fetch_lkp_persons(page=1, page_size=20, search=''):
     """Fetches a paginated list of people from the LKP_PERSON table."""
@@ -625,7 +770,6 @@ def fetch_lkp_persons(page=1, page_size=20, search=''):
             conn.close()
     return persons, total_rows
 
-
 def fetch_all_tags():
     """Fetches all unique keywords and person names to be used as tags."""
     conn = get_connection()
@@ -651,7 +795,6 @@ def fetch_all_tags():
             conn.close()
 
     return sorted(list(tags))
-
 
 def fetch_tags_for_document(doc_id):
     """Fetches all keyword and person tags for a single document."""
@@ -695,20 +838,17 @@ def fetch_tags_for_document(doc_id):
 
     return sorted(list(doc_tags))
 
-
 def clear_thumbnail_cache():
     """Deletes all files in the thumbnail cache directory."""
     if os.path.exists(thumbnail_cache_dir):
         shutil.rmtree(thumbnail_cache_dir)
     os.makedirs(thumbnail_cache_dir)
 
-
 def clear_video_cache():
     """Deletes all files in the video cache directory."""
     if os.path.exists(video_cache_dir):
         shutil.rmtree(video_cache_dir)
     os.makedirs(video_cache_dir)
-
 
 def insert_keywords_and_tags(docnumber, keywords):
     """
@@ -774,7 +914,7 @@ def insert_keywords_and_tags(docnumber, keywords):
                         if "ORA-00001" in error.message:
                             logging.warning(
                                 f"Keyword '{english_keyword}' was inserted by another process. Fetching existing ID.")
-                            cursor.execute("SELECT SYSTEM_ID FROM KEYWORD WHERE UPPER(KEYWORD_ID) = UPPER(:keyword_id)",
+                            cursor.execute("SELECT SYSTEM_ID FROM KEYWORD WHERE KEYWORD_ID = :keyword_id",
                                            keyword_id=english_keyword)
                             result = cursor.fetchone()
                             if result:
@@ -802,7 +942,7 @@ def insert_keywords_and_tags(docnumber, keywords):
                 processed_keywords.add(english_keyword)
 
             conn.commit()
-            logging.info(f"DB_KEYWORD_SUCCESS: Successfully processed keywords for docnumber {docnumber}.")
+            # logging.info(f"DB_KEYWORD_SUCCESS: Successfully processed keywords for docnumber {docnumber}.")
 
     except oracledb.Error as e:
         logging.error(f"DB_KEYWORD_ERROR: Oracle error while processing keywords for docnumber {docnumber}: {e}",
@@ -818,7 +958,6 @@ def insert_keywords_and_tags(docnumber, keywords):
     finally:
         if conn:
             conn.close()
-
 
 def add_tag_to_document(doc_id, tag):
     """Adds a new tag to a document, handling existing keywords and validating the tag."""
@@ -869,7 +1008,6 @@ def add_tag_to_document(doc_id, tag):
         if conn:
             conn.close()
 
-
 def update_tag_for_document(doc_id, old_tag, new_tag):
     """Updates a tag for a document."""
     # --- Tag Validation ---
@@ -916,7 +1054,6 @@ def update_tag_for_document(doc_id, old_tag, new_tag):
     finally:
         if conn:
             conn.close()
-
 
 def delete_tag_from_document(doc_id, tag):
     """Deletes a tag from a document. The tag can be a keyword or a person's name."""
@@ -1039,7 +1176,6 @@ def get_dashboard_counts():
             conn.close()
     return counts
 
-
 def fetch_archived_employees(page=1, page_size=20, search_term=None, status=None, filter_type=None):
     conn = get_connection()
     if not conn: return [], 0
@@ -1130,7 +1266,6 @@ def fetch_archived_employees(page=1, page_size=20, search_term=None, status=None
         if conn: conn.close()
     return employees, total_rows
 
-
 def fetch_hr_employees_paginated(search_term="", page=1, page_size=10):
     conn = get_connection()
     if not conn: return [], 0
@@ -1154,7 +1289,6 @@ def fetch_hr_employees_paginated(search_term="", page=1, page_size=10):
         if conn: conn.close()
     return employees, total_rows
 
-
 def fetch_hr_employee_details(employee_id):
     conn = get_connection()
     if not conn: return None
@@ -1169,7 +1303,6 @@ def fetch_hr_employee_details(employee_id):
     finally:
         if conn: conn.close()
 
-
 def fetch_statuses():
     conn = get_connection()
     if not conn: return {}
@@ -1183,7 +1316,6 @@ def fetch_statuses():
     finally:
         if conn: conn.close()
     return statuses
-
 
 def fetch_document_types():
     conn = get_connection()
@@ -1202,7 +1334,6 @@ def fetch_document_types():
         if conn: conn.close()
     return doc_types
 
-
 def fetch_legislations():
     conn = get_connection()
     if not conn: return []
@@ -1216,7 +1347,6 @@ def fetch_legislations():
     finally:
         if conn: conn.close()
     return legislations
-
 
 def fetch_single_archived_employee(archive_id):
     conn = get_connection()
@@ -1265,7 +1395,6 @@ def fetch_single_archived_employee(archive_id):
     finally:
         if conn: conn.close()
     return employee_details
-
 
 def add_employee_archive_with_docs(dst, dms_user, employee_data, documents):
     conn = get_connection()
@@ -1353,7 +1482,6 @@ def add_employee_archive_with_docs(dst, dms_user, employee_data, documents):
         return False, f"Transaction failed: {e}"
     finally:
         if conn: conn.close()
-
 
 def update_archived_employee(dst, dms_user, archive_id, employee_data, new_documents, deleted_doc_ids, updated_documents):
     conn = get_connection()

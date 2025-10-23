@@ -57,15 +57,15 @@ def upload_document_to_dms(dst, file_stream, metadata):
 
         string_type = svc_client.get_type('{http://www.w3.org/2001/XMLSchema}string')
         int_type = svc_client.get_type('{http://www.w3.org/2001/XMLSchema}int')
-
+        
         logging.info("Step 2: CreateObject - Creating document profile.")
         string_array_type = svc_client.get_type(
             '{http://schemas.microsoft.com/2003/10/Serialization/Arrays}ArrayOfstring')
 
-        property_names = string_array_type([
+        property_names_list = [
             '%TARGET_LIBRARY', '%RECENTLY_USED_LOCATION', 'DOCNAME', 'TYPE_ID', 'AUTHOR_ID',
             'ABSTRACT', 'APP_ID', 'TYPIST_ID', 'SECURITY'
-        ])
+        ]
 
         property_values_list = [
             xsd.AnyObject(string_type, 'RTA_MAIN'),
@@ -78,6 +78,15 @@ def upload_document_to_dms(dst, file_stream, metadata):
             xsd.AnyObject(string_type, DMS_USER),
             xsd.AnyObject(string_type, '1')
         ]
+        
+        doc_date = metadata.get('doc_date')
+        if doc_date:
+            logging.info(f"doc_date is : {doc_date}")
+            property_names_list.append('RTADOCDATE')
+            property_values_list.append(xsd.AnyObject(string_type, doc_date.strftime('%m/%d/%y')))
+
+        property_names = string_array_type(property_names_list)
+
 
         create_object_call = {
             'call': {
