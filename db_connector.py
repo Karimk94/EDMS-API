@@ -435,13 +435,12 @@ def check_processing_status(docnumbers):
             conn.close()
 
 
-def fetch_documents_from_oracle(page=1, page_size=10, search_term=None, date_from=None, date_to=None,
-                                persons=None, person_condition='any', tags=None, years=None): # Changed year to years
-    """Fetches a paginated list of documents from Oracle, handling filtering and thumbnail logic."""
+def fetch_documents_from_oracle(page=1, page_size=20, search_term=None, date_from=None, date_to=None,
+                                persons=None, person_condition='any', tags=None, years=None, sort=None,
+                                memory_month=None, memory_day=None): # Added memory params
+    """Fetches a paginated list of documents from Oracle, handling filtering, memories, and thumbnail logic."""
     conn = get_connection()
-    if not conn:
-        logging.error("Failed to get DB connection in fetch_documents_from_oracle.")
-        return [], 0
+    if not conn: return [], 0
 
     dst = dms_system_login()
     if not dst:
@@ -452,174 +451,198 @@ def fetch_documents_from_oracle(page=1, page_size=10, search_term=None, date_fro
     documents = []
     total_rows = 0
 
-    base_where = "WHERE p.docnumber >= 19662092 AND p.FORM = 2740 " # Base filters
+    base_where = "WHERE p.docnumber >= 19662092 AND p.FORM = 2740 "
     params = {}
     where_clauses = []
 
-    # --- Search Term ---
-    if search_term:
-        # Split search term into words, handle potential operators later if needed
-        words = re.findall(r'\b\w+\b', search_term.upper()) # Find word boundaries
-        if words:
-            search_conditions = []
-            for i, word in enumerate(words):
-                # Avoid overly broad searches for very short words if desired
-                # if len(word) < 3: continue
-                key = f"search_word_{i}"
-                # Search in ABSTRACT and DOCNAME
-                search_conditions.append(f"(UPPER(p.ABSTRACT) LIKE :{key} OR UPPER(p.DOCNAME) LIKE :{key})")
-                params[key] = f"%{word}%"
-            if search_conditions:
-                 # Default to AND for multiple search words
-                where_clauses.append("(" + " AND ".join(search_conditions) + ")")
+    if memory_month is not None:
+        try:
+            month_int = int(memory_month)
+            day_int = int(memory_day) if memory_day is not None else None
+            current_year = datetime.now().year
 
+            if not 1 <= month_int <= 12: raise ValueError("Invalid month")
+            if day_int is not None and not 1 <= day_int <= 31: raise ValueError("Invalid day")
 
-    # --- Persons Filter ---
-    if persons:
-        # Expecting comma-separated string
-        person_list = [p.strip().upper() for p in persons.split(',') if p.strip()]
-        if person_list:
-            op = " OR " if person_condition == 'any' else " AND "
-            person_conditions = []
-            for i, person in enumerate(person_list):
-                key = f'person_{i}'
-                # Searching within ABSTRACT for person names
-                person_conditions.append(f"UPPER(p.ABSTRACT) LIKE :{key}")
-                params[key] = f"%{person}%" # Wildcard search
-            if person_conditions:
+            where_clauses.append("p.RTADOCDATE IS NOT NULL")
+            where_clauses.append("EXTRACT(MONTH FROM p.RTADOCDATE) = :memory_month")
+            params['memory_month'] = month_int
+            if day_int is not None:
+                where_clauses.append("EXTRACT(DAY FROM p.RTADOCDATE) = :memory_day")
+                params['memory_day'] = day_int
+            where_clauses.append("EXTRACT(YEAR FROM p.RTADOCDATE) < :current_year")
+            params['current_year'] = current_year
+            # Optionally add image filter here too if memories should only be images
+            where_clauses.append("""
+                (LOWER(p.DOCNAME) LIKE '%.jpg' OR LOWER(p.DOCNAME) LIKE '%.jpeg' OR LOWER(p.DOCNAME) LIKE '%.png' OR
+                 LOWER(p.DOCNAME) LIKE '%.gif' OR LOWER(p.DOCNAME) LIKE '%.bmp')
+            """)
+
+        except (ValueError, TypeError) as e:
+            logging.error(f"Invalid memory date parameters provided: {e}")
+            memory_month = None 
+
+    if memory_month is None: # Apply standard filters only if not fetching memories
+        if search_term:
+            words = [word for word in re.findall(r'\b\w+\b', search_term.upper()) if word]
+            if words:
+                search_conditions = []
+                for i, word in enumerate(words):
+                    key = f"search_word_{i}"
+                    search_conditions.append(f"(UPPER(p.ABSTRACT) LIKE :{key} OR UPPER(p.DOCNAME) LIKE :{key})")
+                    params[key] = f"%{word}%"
+                where_clauses.append(" AND ".join(search_conditions))
+
+        if persons:
+            person_list = [p.strip().upper() for p in persons.split(',') if p.strip()]
+            if person_list:
+                op = " OR " if person_condition == 'any' else " AND "
+                person_conditions = []
+                for i, person in enumerate(person_list):
+                    key = f'person_{i}'
+                    person_conditions.append(f"UPPER(p.ABSTRACT) LIKE :{key}")
+                    params[key] = f"%{person}%"
                 where_clauses.append(f"({op.join(person_conditions)})")
 
-    # --- Date Filtering uses RTADOCDATE ---
-    # Validate date formats if necessary before adding to query
-    if date_from:
-        # Assuming date_from is 'YYYY-MM-DD HH24:MI:SS' string from frontend
-        where_clauses.append("p.RTADOCDATE >= TO_DATE(:date_from, 'YYYY-MM-DD HH24:MI:SS')")
-        params['date_from'] = date_from
-    if date_to:
-        # Assuming date_to is 'YYYY-MM-DD HH24:MI:SS' string from frontend
-        where_clauses.append("p.RTADOCDATE <= TO_DATE(:date_to, 'YYYY-MM-DD HH24:MI:SS')")
-        params['date_to'] = date_to
+        if date_from:
+            try:
+                 datetime.strptime(date_from, '%Y-%m-%d %H:%M:%S')
+                 where_clauses.append("p.RTADOCDATE >= TO_DATE(:date_from, 'YYYY-MM-DD HH24:MI:SS')")
+                 params['date_from'] = date_from
+            except ValueError:
+                logging.warning(f"Invalid date_from format received: {date_from}")
+        if date_to:
+            try:
+                 datetime.strptime(date_to, '%Y-%m-%d %H:%M:%S')
+                 where_clauses.append("p.RTADOCDATE <= TO_DATE(:date_to, 'YYYY-MM-DD HH24:MI:SS')")
+                 params['date_to'] = date_to
+            except ValueError:
+                 logging.warning(f"Invalid date_to format received: {date_to}")
 
-    # --- Year Filtering uses RTADOCDATE ---
-    if years:
-         # Expecting comma-separated string of years
-        try:
-            year_list = [int(y.strip()) for y in years.split(',') if y.strip().isdigit()]
-            if year_list:
-                # Create placeholders like :year_0, :year_1, ...
-                year_placeholders = ','.join([f':year_{i}' for i in range(len(year_list))])
-                where_clauses.append(f"EXTRACT(YEAR FROM p.RTADOCDATE) IN ({year_placeholders})")
-                # Add each year to the params dictionary
-                for i, year_val in enumerate(year_list):
-                    params[f'year_{i}'] = year_val
-        except ValueError:
-            logging.warning(f"Invalid year format received: {years}. Skipping year filter.")
+        if years:
+            year_list_str = years.split(',')
+            year_list_int = []
+            valid_years = True
+            for y_str in year_list_str:
+                try:
+                    year_int = int(y_str.strip())
+                    if 1900 < year_int < 2100: year_list_int.append(year_int)
+                    else: valid_years = False; break
+                except ValueError: valid_years = False; break
+            if valid_years and year_list_int:
+                 year_placeholders = ', '.join([f":year_{i}" for i in range(len(year_list_int))])
+                 where_clauses.append(f"EXTRACT(YEAR FROM p.RTADOCDATE) IN ({year_placeholders})")
+                 for i, year in enumerate(year_list_int): params[f'year_{i}'] = year
+            elif not valid_years: logging.warning(f"Invalid year format received: {years}")
 
 
-    # --- Tags Filter ---
-    if tags:
-        # Expecting comma-separated string
-        tag_list = [t.strip().upper() for t in tags.split(',') if t.strip()]
-        if tag_list:
-            tag_conditions = []
-            for i, tag in enumerate(tag_list):
-                key = f'tag_{i}'
-                # Check existence in keyword link table
-                keyword_subquery = f"""
-                EXISTS (
-                    SELECT 1 FROM LKP_DOCUMENT_TAGS ldt
-                    JOIN KEYWORD k ON ldt.TAG_ID = k.SYSTEM_ID
-                    WHERE ldt.DOCNUMBER = p.DOCNUMBER AND UPPER(k.KEYWORD_ID) = :{key} AND ldt.DISABLED = 0
-                )
-                """
-                # Also check if the tag appears as a potential person name in the abstract
-                person_subquery = f"UPPER(p.ABSTRACT) LIKE '%' || :{key} || '%'" # Simple LIKE check
-
-                # Combine checks with OR: doc must match either keyword OR person name in abstract
-                tag_conditions.append(f"({keyword_subquery} OR {person_subquery})")
-                params[key] = tag # Bind the tag value
-
-            # All selected tags must match (AND condition between different tags)
-            where_clauses.append("(" + " AND ".join(tag_conditions) + ")")
+        if tags:
+            tag_list = [t.strip().upper() for t in tags.split(',') if t.strip()]
+            if tag_list:
+                tag_conditions = []
+                for i, tag in enumerate(tag_list):
+                    key = f'tag_{i}'
+                    keyword_subquery = f"""
+                    EXISTS (
+                        SELECT 1 FROM LKP_DOCUMENT_TAGS ldt
+                        JOIN KEYWORD k ON ldt.TAG_ID = k.SYSTEM_ID
+                        WHERE ldt.DOCNUMBER = p.DOCNUMBER AND UPPER(k.KEYWORD_ID) = :{key} AND ldt.DISABLED = '0' AND k.DISABLED = '0'
+                    )
+                    """
+                    person_subquery = f"UPPER(p.ABSTRACT) LIKE '%' || :{key} || '%'"
+                    tag_conditions.append(f"({keyword_subquery} OR {person_subquery})")
+                    params[key] = tag
+                where_clauses.append(" AND ".join(tag_conditions))
 
     # --- Combine WHERE clauses ---
     final_where_clause = base_where + ("AND " + " AND ".join(where_clauses) if where_clauses else "")
 
+    # --- Sorting Logic ---
+    order_by_clause = "ORDER BY p.DOCNUMBER DESC" # Default
+    if memory_month is not None:
+        # Default sort for memories view (uses RTADOCDATE)
+        order_by_clause = "ORDER BY p.RTADOCDATE DESC, p.DOCNUMBER DESC"
+        if sort == 'rtadocdate_asc': # Allow explicit sort for memories too
+            order_by_clause = "ORDER BY p.RTADOCDATE ASC, p.DOCNUMBER ASC"
+    else:
+        if sort == 'date_desc':
+            order_by_clause = "ORDER BY p.RTADOCDATE DESC, p.DOCNUMBER DESC"
+        elif sort == 'date_asc':
+            order_by_clause = "ORDER BY p.RTADOCDATE ASC, p.DOCNUMBER ASC"
+        # Add other standard sort options if needed
+
+
     try:
         with conn.cursor() as cursor:
-            # --- Count Query ---
+            # Count total matching rows
             count_query = f"SELECT COUNT(p.DOCNUMBER) FROM PROFILE p {final_where_clause}"
-            logging.debug(f"Executing Count Query: {count_query}")
+            logging.debug(f"Count Query: {count_query}")
             logging.debug(f"Count Params: {params}")
             cursor.execute(count_query, params)
-            count_result = cursor.fetchone()
-            total_rows = count_result[0] if count_result else 0
-            # logging.info(f"Total rows found: {total_rows}")
+            total_rows = cursor.fetchone()[0]
 
-            # --- Fetch Query ---
-            # Select RTADOCDATE and alias it for clarity, handle potential NULLs
+            # Fetch paginated data - select RTADOCDATE if fetching memories
+            date_column = "p.RTADOCDATE" if memory_month is not None else "p.RTADOCDATE"
             fetch_query = f"""
-                SELECT p.DOCNUMBER, p.ABSTRACT, p.AUTHOR, p.RTADOCDATE as DOC_DATE, p.DOCNAME
-                FROM PROFILE p {final_where_clause}
-                ORDER BY p.DOCNUMBER DESC
-                OFFSET :offset ROWS FETCH NEXT :page_size ROWS ONLY
+            SELECT p.DOCNUMBER, p.ABSTRACT, p.AUTHOR, {date_column} as DOC_DATE, p.DOCNAME
+            FROM PROFILE p
+            {final_where_clause}
+            {order_by_clause}
+            OFFSET :offset ROWS FETCH NEXT :page_size ROWS ONLY
             """
-            # Add pagination params AFTER filter params
-            fetch_params = params.copy()
-            fetch_params['offset'] = offset
-            fetch_params['page_size'] = page_size
+            params_paginated = params.copy()
+            params_paginated['offset'] = offset
+            params_paginated['page_size'] = page_size
 
-            logging.debug(f"Executing Fetch Query: {fetch_query}")
-            logging.debug(f"Fetch Params: {fetch_params}")
-            cursor.execute(fetch_query, fetch_params)
+            logging.debug(f"Fetch Query: {fetch_query}")
+            logging.debug(f"Fetch Params: {params_paginated}")
+            cursor.execute(fetch_query, params_paginated)
 
-            # Process results
-            for row in cursor:
+            rows = cursor.fetchall()
+            logging.info(f"Fetched {len(rows)} rows for page {page}.")
+
+            for row in rows:
                 doc_id, abstract, author, doc_date, docname = row
                 thumbnail_path = None
+                media_type = 'image' # Default
+                file_ext = '.jpg'   # Default
 
-                # Fetch media info (could potentially be optimized if DMS calls are slow)
-                original_filename, media_type, file_ext = get_media_info_from_dms(dst, doc_id)
+                try:
+                    original_filename, media_type, file_ext = get_media_info_from_dms(dst, doc_id)
+                    cached_thumbnail_file = f"{doc_id}.jpg"
+                    cached_path = os.path.join(thumbnail_cache_dir, cached_thumbnail_file)
 
-                # --- Thumbnail Logic ---
-                cached_thumbnail_file = f"{doc_id}.jpg"
-                cached_path = os.path.join(thumbnail_cache_dir, cached_thumbnail_file)
-
-                if os.path.exists(cached_path):
-                    thumbnail_path = f"cache/{cached_thumbnail_file}"
-                else:
-                    # Only fetch full content if thumbnail not cached
-                    media_bytes = get_media_content_from_dms(dst, doc_id)
-                    if media_bytes:
-                        thumbnail_path = create_thumbnail(doc_id, media_type, file_ext, media_bytes)
+                    if os.path.exists(cached_path):
+                        thumbnail_path = f"cache/{cached_thumbnail_file}"
                     else:
-                        logging.warning(f"Failed to get media content for doc {doc_id} to create thumbnail.")
+                        media_bytes = get_media_content_from_dms(dst, doc_id)
+                        if media_bytes:
+                            # Pass correct media type to thumbnail creator
+                            thumbnail_path = create_thumbnail(doc_id, media_type, file_ext, media_bytes)
+                        else:
+                             logging.warning(f"Could not retrieve media content for doc {doc_id} to create thumbnail.")
+
+                except Exception as media_info_e:
+                     logging.error(f"Error processing media info/thumbnail for doc {doc_id}: {media_info_e}", exc_info=True)
 
 
                 documents.append({
                     "doc_id": doc_id,
-                    "title": abstract or "No Title",
+                    "title": abstract or "",
                     "docname": docname or "",
                     "author": author or "N/A",
-                    # Format date, handle None
-                    "date": doc_date.strftime('%Y-%m-%d') if doc_date else "N/A",
-                    "thumbnail_url": thumbnail_path or "", # Use empty string if no thumbnail
-                    "media_type": media_type or "image" # Default to image if type unknown
+                    # Format the correct date based on which one was selected
+                    "date": doc_date.strftime('%Y-%m-%d %H:%M:%S') if doc_date else "N/A",
+                    "thumbnail_url": thumbnail_path or "",
+                    "media_type": media_type
                 })
     except oracledb.Error as e:
-         # Log detailed Oracle error
-         logging.error(f"Oracle Error in fetch_documents_from_oracle: {e}", exc_info=True)
-         error_obj, = e.args
-         logging.error(f"Error Code: {error_obj.code}, Message: {error_obj.message}, Context: {error_obj.context}")
-         return [], 0 # Return empty results on error
-    except Exception as e:
-         # Catch other potential errors
-         logging.error(f"Unexpected error in fetch_documents_from_oracle: {e}", exc_info=True)
+         logging.error(f"Oracle error fetching documents: {e}", exc_info=True)
          return [], 0
     finally:
         if conn:
-            conn.close()
-            logging.debug("Database connection closed.")
+            try: conn.close()
+            except oracledb.Error: logging.error("Error closing DB connection.")
     return documents, total_rows
 
 def get_documents_to_process():
@@ -1594,3 +1617,144 @@ def update_archived_employee(dst, dms_user, archive_id, employee_data, new_docum
         return False, f"Update transaction failed: {e}"
     finally:
         if conn: conn.close()
+
+def fetch_memories_from_oracle(month, day=None, limit=5):
+    """Fetches one representative image document per past year for a given month (and optionally day)."""
+    conn = get_connection()
+    if not conn: return []
+
+    dst = dms_system_login()
+    if not dst:
+        logging.error("Could not log into DMS. Aborting memories fetch.")
+        return []
+
+    memories = []
+    current_year = datetime.now().year
+    # Ensure month and day are integers if provided
+    try:
+        month_int = int(month)
+        day_int = int(day) if day is not None else None
+        limit_int = int(limit)
+    except (ValueError, TypeError):
+        logging.error(f"Invalid month/day/limit provided for memories: month={month}, day={day}, limit={limit}")
+        return []
+
+    if not 1 <= month_int <= 12:
+         logging.error(f"Invalid month provided for memories: {month_int}")
+         return []
+    if day_int is not None and not 1 <= day_int <= 31:
+         logging.error(f"Invalid day provided for memories: {day_int}")
+         return []
+    limit_int = max(1, min(limit_int, 10)) # Clamp limit between 1 and 10
+
+
+    params = {'month': month_int, 'current_year': current_year, 'limit': limit_int}
+    day_filter_sql = ""
+    if day_int is not None:
+        params['day'] = day_int
+        day_filter_sql = "AND EXTRACT(DAY FROM p.RTADOCDATE) = :day"
+
+    # Use RTADOCDATE for filtering memories
+    # Rank documents within each past year for the given month/day and pick the latest one (rn=1)
+    # Filter for common image types in DOCNAME (case-insensitive)
+    sql = f"""
+    WITH RankedMemories AS (
+        SELECT
+            p.DOCNUMBER,
+            p.ABSTRACT,
+            p.AUTHOR,
+            p.RTADOCDATE, -- Using RTADOCDATE
+            p.DOCNAME,
+            EXTRACT(YEAR FROM p.RTADOCDATE) as memory_year,
+            ROW_NUMBER() OVER(PARTITION BY EXTRACT(YEAR FROM p.RTADOCDATE) ORDER BY p.RTADOCDATE DESC, p.DOCNUMBER DESC) as rn
+        FROM
+            PROFILE p
+        WHERE
+            p.FORM = 2740
+            AND p.RTADOCDATE IS NOT NULL
+            AND EXTRACT(MONTH FROM p.RTADOCDATE) = :month
+            {day_filter_sql}
+            AND EXTRACT(YEAR FROM p.RTADOCDATE) < :current_year
+            AND p.DOCNUMBER >= 19662092 -- Apply base docnumber filter if necessary
+            AND (
+                 LOWER(p.DOCNAME) LIKE '%.jpg' OR
+                 LOWER(p.DOCNAME) LIKE '%.jpeg' OR
+                 LOWER(p.DOCNAME) LIKE '%.png' OR
+                 LOWER(p.DOCNAME) LIKE '%.gif' OR
+                 LOWER(p.DOCNAME) LIKE '%.bmp'
+                 )
+    )
+    SELECT
+        rm.DOCNUMBER,
+        rm.ABSTRACT,
+        rm.AUTHOR,
+        rm.RTADOCDATE,
+        rm.DOCNAME
+    FROM
+        RankedMemories rm
+    WHERE
+        rm.rn = 1
+    ORDER BY
+        rm.memory_year DESC
+    FETCH FIRST :limit ROWS ONLY
+    """
+
+    try:
+        with conn.cursor() as cursor:
+            logging.debug(f"Memories Query: {sql}")
+            logging.debug(f"Memories Params: {params}")
+            cursor.execute(sql, params)
+            rows = cursor.fetchall()
+
+            for row in rows:
+                doc_id, abstract, author, rtadocdate, docname = row
+                thumbnail_path = None
+                media_type = 'image' # Assume image based on query filter
+                file_ext = '.jpg'   # Default extension for thumbnail
+
+                try:
+                    # Check cache first
+                    cached_thumbnail_file = f"{doc_id}.jpg"
+                    cached_path = os.path.join(thumbnail_cache_dir, cached_thumbnail_file)
+
+                    if os.path.exists(cached_path):
+                        thumbnail_path = f"cache/{cached_thumbnail_file}"
+                    else:
+                        # Get actual media info only if not cached, to verify type and create thumb
+                        _, actual_media_type, actual_file_ext = get_media_info_from_dms(dst, doc_id)
+                        if actual_media_type == 'image':
+                            media_bytes = get_media_content_from_dms(dst, doc_id)
+                            if media_bytes:
+                                # Ensure create_thumbnail exists and handles images
+                                thumbnail_path = create_thumbnail(doc_id, actual_media_type, actual_file_ext, media_bytes)
+                            else:
+                                logging.warning(f"Could not get content for memory doc {doc_id} to create thumbnail.")
+                        else:
+                             # This case should be less likely due to the SQL filter, but good to keep
+                             logging.warning(f"Memory query returned non-image doc {doc_id} (Type: {actual_media_type}). Skipping.")
+                             continue # Skip non-image results
+
+                except Exception as thumb_e:
+                     logging.error(f"Error processing thumbnail for memory doc {doc_id}: {thumb_e}", exc_info=True)
+
+
+                memories.append({
+                    "doc_id": doc_id,
+                    "title": abstract or "",
+                    "docname": docname or "",
+                    "author": author or "N/A",
+                    "date": rtadocdate.strftime('%d-%m-%Y') if rtadocdate else "N/A",
+                    "thumbnail_url": thumbnail_path or "", # Use empty string if no thumbnail
+                    "media_type": 'image' # Hardcode as image for memories component
+                })
+
+    except oracledb.Error as e:
+        logging.error(f"Oracle error fetching memories: {e}", exc_info=True)
+    finally:
+        if conn:
+            try:
+                conn.close()
+            except oracledb.Error:
+                logging.error("Error closing database connection in fetch_memories_from_oracle.")
+
+    return memories

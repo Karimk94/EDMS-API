@@ -14,6 +14,7 @@ from threading import Thread
 import mimetypes
 from functools import wraps
 import io
+from datetime import datetime 
 
 # --- Logging Setup ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -533,18 +534,29 @@ def clean_repeated_words(text):
 # --- Viewer API Routes (Original Middleware) ---
 @app.route('/api/documents')
 def api_get_documents():
-    """Handles fetching documents for the frontend viewer."""
-    page = request.args.get('page', 1, type=int)
-    search_term = request.args.get('search', None, type=str)
-    date_from = request.args.get('date_from', None, type=str)
-    date_to = request.args.get('date_to', None, type=str)
-    persons = request.args.get('persons', None, type=str)
-    person_condition = request.args.get('person_condition', 'any', type=str)
-    tags = request.args.get('tags', None, type=str)
-    years = request.args.get('years', None, type=str) # Get years as string
-
-    page_size = 20
+    """Handles fetching documents for the frontend viewer, including full memory view."""
     try:
+        page = request.args.get('page', 1, type=int)
+        page_size = request.args.get('pageSize', 20, type=int)
+        search_term = request.args.get('search', None, type=str)
+        date_from = request.args.get('date_from', None, type=str)
+        date_to = request.args.get('date_to', None, type=str)
+        persons = request.args.get('persons', None, type=str)
+        person_condition = request.args.get('person_condition', 'any', type=str)
+        tags = request.args.get('tags', None, type=str)
+        years = request.args.get('years', None, type=str)
+        sort = request.args.get('sort', None, type=str)
+
+        # Check for memory-specific parameters
+        memory_month = request.args.get('memoryMonth', None, type=str)
+        memory_day = request.args.get('memoryDay', None, type=str) # Optional day
+
+        # Basic validation
+        if page < 1: page = 1
+        if page_size < 1: page_size = 20
+        if page_size > 100: page_size = 100
+
+        # Pass memory params to the DB function if present
         documents, total_rows = db_connector.fetch_documents_from_oracle(
             page=page,
             page_size=page_size,
@@ -554,20 +566,23 @@ def api_get_documents():
             persons=persons,
             person_condition=person_condition,
             tags=tags,
-            years=years # Pass years string
+            years=years,
+            sort=sort,
+            memory_month=memory_month, # Pass through
+            memory_day=memory_day      # Pass through
         )
 
         total_pages = math.ceil(total_rows / page_size) if total_rows > 0 else 1
 
         return jsonify({
-            "documents": documents, "page": page,
-            "total_pages": total_pages, "total_documents": total_rows
+            "documents": documents,
+            "page": page,
+            "total_pages": total_pages,
+            "total_documents": total_rows
         })
     except Exception as e:
-        logging.error(f"Error fetching documents: {e}", exc_info=True)
-        return jsonify({"error": "Failed to fetch documents due to an internal error."}), 500
-
-
+         logging.error(f"Error in /api/documents endpoint: {e}", exc_info=True)
+         return jsonify({"error": "Failed to fetch documents due to server error."}), 500
 
 @app.route('/api/image/<doc_id>')
 def api_get_image(doc_id):
@@ -942,6 +957,39 @@ def get_document_file(docnumber):
     else:
         logging.warning(f"Document not found or retrieval failed for docnumber: {docnumber}")
         return jsonify({"error": "Document not found or could not be retrieved from DMS."}), 404
+
+@app.route('/api/memories', methods=['GET'])
+def api_get_memories():
+    """Fetches representative memory documents (images) from past years for the current month."""
+    try:
+        current_dt = datetime.now()
+        # Get month from query param, default to current month
+        month_str = request.args.get('month')
+        month = 1 # int(month_str) if month_str and month_str.isdigit() else current_dt.month
+        print(f"month is: {month}")
+
+        # Get day from query param, optional
+        day_str = request.args.get('day')
+        day = int(day_str) if day_str and day_str.isdigit() else None
+
+        limit_str = request.args.get('limit', '5') # Default limit for stack view
+        limit = int(limit_str) if limit_str.isdigit() else 5
+        limit = max(1, min(limit, 10)) # Ensure limit is reasonable (1-10)
+
+
+        if not 1 <= month <= 12:
+            return jsonify({"error": "Invalid month provided."}), 400
+        if day is not None and not 1 <= day <= 31:
+             return jsonify({"error": "Invalid day provided."}), 400
+
+        logging.info(f"Fetching memories for Month: {month}, Day: {day}, Limit: {limit}")
+        memories = db_connector.fetch_memories_from_oracle(month=month, day=day, limit=limit)
+
+        return jsonify({"memories": memories})
+
+    except Exception as e:
+        logging.error(f"Error fetching memories via API: {e}", exc_info=True)
+        return jsonify({"error": "Failed to fetch memories due to server error."}), 500
 
 
 if __name__ == '__main__':
