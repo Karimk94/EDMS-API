@@ -12,7 +12,6 @@ WSDL_URL = os.getenv("WSDL_URL")
 DMS_USER = os.getenv("DMS_USER")
 DMS_PASSWORD = os.getenv("DMS_PASSWORD")
 
-
 def dms_system_login():
     """Logs into the DMS SOAP service using system credentials from .env and returns a session token (DST)."""
     try:
@@ -41,7 +40,6 @@ def dms_system_login():
     except Exception as e:
         logging.error(f"An unexpected error occurred during DMS login: {e}", exc_info=True)
         return None
-
 
 def upload_document_to_dms(dst, file_stream, metadata):
     """
@@ -250,7 +248,6 @@ def upload_document_to_dms(dst, file_stream, metadata):
                 except Exception as e:
                     logging.warning(f"Failed to release streamID object {stream_id}: {e}")
 
-
 def get_image_by_docnumber(dst, doc_number):
     """Retrieves a single document's image bytes from the DMS using the multi-step process."""
     svc_client, obj_client, content_id, stream_id = None, None, None, None
@@ -324,7 +321,6 @@ def get_image_by_docnumber(dst, doc_number):
                 except Exception:
                     pass
 
-
 def get_dms_stream_details(dst, doc_number):
     """Opens a stream to a DMS document and returns the client and stream ID for reading."""
     try:
@@ -356,7 +352,6 @@ def get_dms_stream_details(dst, doc_number):
         print(f"Error opening DMS stream for {doc_number}: {e}")
         return None
 
-
 # --- Archiving/User Functions (Merged) ---
 
 def dms_user_login(username, password):
@@ -384,7 +379,6 @@ def dms_user_login(username, password):
     except Exception as e:
         logging.error(f"An unexpected error occurred during DMS login: {e}", exc_info=True)
         return None
-
 
 def upload_archive_document_to_dms(dst, file_stream, metadata):
     """
@@ -494,7 +488,6 @@ def upload_archive_document_to_dms(dst, file_stream, metadata):
                     obj_client.service.ReleaseObject(call={'objectID': stream_id})
                 except Exception:
                     pass
-
 
 def get_document_from_dms(dst, doc_number):
     """

@@ -74,13 +74,11 @@ def get_exif_date(image_stream):
         image_stream.seek(0)
     return None
 
-
 # --- DMS Communication ---
 
 def dms_system_login():
     """Logs into the DMS SOAP service using system credentials from .env and returns a session token (DST)."""
     return wsdl_client.dms_system_login()
-
 
 def get_media_info_from_dms(dst, doc_number):
     """
@@ -131,7 +129,6 @@ def get_media_info_from_dms(dst, doc_number):
     except Fault as e:
         print(f"DMS metadata fault for doc {doc_number}: {e}")
         return None, 'image', ''
-
 
 def get_media_content_from_dms(dst, doc_number):
     """
@@ -184,7 +181,6 @@ def get_media_content_from_dms(dst, doc_number):
                 except Exception:
                     pass
 
-
 def get_dms_stream_details(dst, doc_number):
     """
     Opens a stream to a DMS document and returns the client and stream ID for reading.
@@ -227,7 +223,6 @@ def stream_and_cache_generator(obj_client, stream_id, content_id, final_cache_pa
         if os.path.exists(temp_cache_path):
             os.remove(temp_cache_path)
 
-
 def create_thumbnail(doc_number, media_type, file_ext, media_bytes):
     """Creates a thumbnail from media bytes and saves it to the cache."""
     thumbnail_filename = f"{doc_number}.jpg"
@@ -260,9 +255,7 @@ def create_thumbnail(doc_number, media_type, file_ext, media_bytes):
         # logging.error(f"Thumbnail creation failed for {doc_number}", exc_info=True)
         return None
 
-
 # --- Oracle Database Interaction ---
-
 def get_connection():
     """Establishes a connection to the Oracle database."""
     try:
@@ -351,7 +344,6 @@ def get_app_id_from_extension(extension):
             conn.close()
     return app_id
 
-
 def get_specific_documents_for_processing(docnumbers):
     """Gets details for a specific list of docnumbers that need AI processing."""
     if not docnumbers:
@@ -391,7 +383,6 @@ def get_specific_documents_for_processing(docnumbers):
         if conn:
             conn.close()
 
-
 def check_processing_status(docnumbers):
     """
     Checks the TAGGING_QUEUE for a list of docnumbers and returns those
@@ -414,7 +405,9 @@ def check_processing_status(docnumbers):
             bind_vars = {f'doc_{i}': val for i, val in enumerate(int_docnumbers)}
 
             # Construct the SQL using bind names
-            # Using SYS.ODCINUMBERLIST is fine for moderate numbers, but can be slow for very large lists
+            # Using SYS.ODCINUMBERLIST or similar collection type for IN clause binding
+            # NOTE: For very large lists, consider alternative approaches like temporary tables
+            # if performance becomes an issue. SYS.ODCINUMBERLIST is generally fine for moderate lists.
             sql = f"""
             SELECT COLUMN_VALUE
             FROM TABLE(SYS.ODCINUMBERLIST({','.join(bind_names)})) input_docs
@@ -423,17 +416,23 @@ def check_processing_status(docnumbers):
             )
             """
 
-            # Execute with the dictionary of bind variables twice
-            cursor.execute(sql, {**bind_vars, **{f'q_{k}': v for k, v in bind_vars.items()}}) # Need unique names for second IN
+            # Execute with the original bind_vars dictionary.
+            # The driver handles using the same bind names multiple times.
+            cursor.execute(sql, bind_vars)
+
             still_processing = [row[0] for row in cursor.fetchall()]
             return still_processing
     except (oracledb.Error, ValueError) as e:
-        logging.error(f"Error in check_processing_status: {e}", exc_info=True)
-        return docnumbers # Return original list on error
+        # Log the specific Oracle error or ValueError (from int conversion)
+        error_message = f"Error in check_processing_status: {e}"
+        if isinstance(e, oracledb.Error):
+             error_obj, = e.args
+             error_message = f"Oracle Error in check_processing_status: {error_obj.message} (Code: {error_obj.code})"
+        logging.error(error_message, exc_info=True)
+        return docnumbers # Return original list on error to be safe
     finally:
         if conn:
             conn.close()
-
 
 def fetch_documents_from_oracle(page=1, page_size=20, search_term=None, date_from=None, date_to=None,
                                 persons=None, person_condition='any', tags=None, years=None, sort=None,
@@ -451,7 +450,7 @@ def fetch_documents_from_oracle(page=1, page_size=20, search_term=None, date_fro
     documents = []
     total_rows = 0
 
-    base_where = "WHERE p.docnumber >= 19662092 AND p.FORM = 2740 "
+    base_where = "WHERE p.docnumber >= 19677386 AND p.FORM = 2740 " #19662092
     params = {}
     where_clauses = []
 
@@ -660,7 +659,7 @@ def get_documents_to_process():
             FROM PROFILE p
             LEFT JOIN TAGGING_QUEUE q ON p.docnumber = q.docnumber
             WHERE p.form = :form_id
-              AND p.docnumber >= 19662092
+              AND p.docnumber >= 19677386 --19662092
               AND (q.STATUS <> 3 OR q.STATUS IS NULL)
               AND (q.ATTEMPTS <= 3 OR q.ATTEMPTS IS NULL)
             FETCH FIRST 10 ROWS ONLY
@@ -1149,7 +1148,6 @@ def delete_tag_from_document(doc_id, tag):
             conn.close()
 
 # --- Archiving Database Functions ---
-
 def get_dashboard_counts():
     conn = get_connection()
     if not conn:
@@ -1663,7 +1661,7 @@ def fetch_memories_from_oracle(month, day=None, limit=5):
             p.DOCNUMBER,
             p.ABSTRACT,
             p.AUTHOR,
-            p.RTADOCDATE, -- Using RTADOCDATE
+            p.RTADOCDATE,
             p.DOCNAME,
             EXTRACT(YEAR FROM p.RTADOCDATE) as memory_year,
             ROW_NUMBER() OVER(PARTITION BY EXTRACT(YEAR FROM p.RTADOCDATE) ORDER BY p.RTADOCDATE DESC, p.DOCNUMBER DESC) as rn
@@ -1675,7 +1673,7 @@ def fetch_memories_from_oracle(month, day=None, limit=5):
             AND EXTRACT(MONTH FROM p.RTADOCDATE) = :month
             {day_filter_sql}
             AND EXTRACT(YEAR FROM p.RTADOCDATE) < :current_year
-            AND p.DOCNUMBER >= 19662092 -- Apply base docnumber filter if necessary
+            AND p.DOCNUMBER >= 19677386 --19662092
             AND (
                  LOWER(p.DOCNAME) LIKE '%.jpg' OR
                  LOWER(p.DOCNAME) LIKE '%.jpeg' OR
@@ -1758,3 +1756,90 @@ def fetch_memories_from_oracle(month, day=None, limit=5):
                 logging.error("Error closing database connection in fetch_memories_from_oracle.")
 
     return memories
+
+def update_document_metadata(doc_id, new_abstract=None, new_date_taken=Ellipsis):
+    """
+    Updates metadata (abstract and/or RTADOCDATE) for a specific document number in the PROFILE table.
+    - If new_abstract is provided, updates the ABSTRACT column.
+    - If new_date_taken is provided (not Ellipsis), updates the RTADOCDATE column.
+      - If new_date_taken is None, sets RTADOCDATE to NULL.
+      - If new_date_taken is a datetime object, sets RTADOCDATE accordingly.
+    - Ellipsis for new_date_taken means "do not change the date".
+    """
+    conn = get_connection()
+    if not conn:
+        return False, "Database connection failed."
+
+    update_parts = []
+    params = {}
+
+    # Build the SET part of the UPDATE statement dynamically
+    if new_abstract is not None:
+        update_parts.append("ABSTRACT = :abstract")
+        params['abstract'] = new_abstract
+
+    if new_date_taken is not Ellipsis: # Check against Ellipsis to see if date update is requested
+        if new_date_taken is None:
+             update_parts.append("RTADOCDATE = NULL")
+             # No parameter needed for NULL
+        elif isinstance(new_date_taken, datetime):
+             # Oracle TO_DATE expects a string in the specified format
+             update_parts.append("RTADOCDATE = TO_DATE(:date_taken, 'YYYY-MM-DD HH24:MI:SS')")
+             params['date_taken'] = new_date_taken.strftime('%Y-%m-%d %H:%M:%S')
+        else:
+             # This case should ideally be caught by the API layer parsing
+             logging.error(f"Invalid type for new_date_taken for doc_id {doc_id}: {type(new_date_taken)}")
+             return False, "Invalid date format received by database function."
+
+    # Check if there's anything to update
+    if not update_parts:
+        return False, "No valid fields provided for update."
+
+    # Finalize SQL statement
+    sql = f"UPDATE PROFILE SET {', '.join(update_parts)} WHERE DOCNUMBER = :doc_id"
+    params['doc_id'] = doc_id
+
+    logging.debug(f"Executing metadata update SQL: {sql}")
+    logging.debug(f"With params: {params}")
+
+    try:
+        with conn.cursor() as cursor:
+            # Check if document exists first
+            cursor.execute("SELECT 1 FROM PROFILE WHERE DOCNUMBER = :1", [doc_id])
+            if cursor.fetchone() is None:
+                return False, f"Document with ID {doc_id} not found."
+
+            # Perform the update
+            cursor.execute(sql, params)
+
+            # Check if any row was updated
+            if cursor.rowcount == 0:
+                conn.rollback() # Rollback if no rows affected
+                # This could happen if the doc_id exists but the update didn't change anything (e.g., same abstract/date)
+                # Or potentially a race condition. Treat as failure for clarity.
+                return False, f"Update affected 0 rows for Document ID {doc_id}. Check if data actually changed."
+
+            conn.commit()
+            return True, "Metadata updated successfully."
+
+    except oracledb.Error as e:
+        error_obj, = e.args
+        logging.error(f"Oracle error updating metadata for doc_id {doc_id}: {error_obj.message}", exc_info=True)
+        try:
+            conn.rollback()
+        except oracledb.Error:
+             logging.error(f"Failed to rollback metadata update transaction for doc_id {doc_id}.")
+        return False, f"Database error occurred: {error_obj.message}"
+    except Exception as e:
+         logging.error(f"Unexpected error updating metadata for doc_id {doc_id}: {e}", exc_info=True)
+         try:
+            conn.rollback()
+         except Exception:
+             pass # Ignore rollback error if main operation failed unexpectedly
+         return False, "An unexpected server error occurred."
+    finally:
+        if conn:
+            try:
+                conn.close()
+            except oracledb.Error:
+                logging.error(f"Error closing DB connection after metadata update for doc_id {doc_id}.")

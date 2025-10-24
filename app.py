@@ -32,7 +32,6 @@ def editor_required(f):
         return f(*args, **kwargs)
     return decorated_function
 
-
 # --- Authentication Routes (from Archiving Backend) ---
 @app.route('/api/auth/login', methods=['POST'])
 def login():
@@ -72,7 +71,6 @@ def logout():
     logging.info(f"User '{username}' logged out.")
     return jsonify({"message": "Logout successful"}), 200
 
-
 @app.route('/api/auth/user', methods=['GET'])
 def get_user():
     user = session.get('user')
@@ -81,7 +79,6 @@ def get_user():
     else:
         # Return an error if no user is in the session
         return jsonify({'error': 'Not authenticated'}), 401
-
 
 # --- AI Processing Routes (Original Middleware) ---
 def process_document(doc, dms_session_token):
@@ -347,9 +344,7 @@ def process_document(doc, dms_session_token):
             # Otherwise, keep it as In Progress (status 1)
             results['status'] = 1
 
-
     return results
-
 
 @app.route('/process-batch', methods=['POST'])
 def process_batch():
@@ -400,7 +395,6 @@ def process_batch():
     return jsonify(
         {"status": "success", "message": f"Processed {processed_count} documents.", "processed_count": processed_count}), 200
 
-
 @app.route('/api/upload_document', methods=['POST'])
 def api_upload_document():
     if 'file' not in request.files:
@@ -411,52 +405,79 @@ def api_upload_document():
         return jsonify({"success": False, "error": "No selected file"}), 400
 
     file_stream = file.stream
-    # Read the file content into memory to allow multiple reads (for EXIF and upload)
     file_bytes = file_stream.read()
-    file_stream.seek(0) # Reset stream pointer after reading
+    file_stream.seek(0) # Reset stream pointer
 
-    # Pass the in-memory bytes to the EXIF function
-    doc_date = db_connector.get_exif_date(io.BytesIO(file_bytes))
-    logging.info(f"Extracted EXIF date: {doc_date}")
+    # --- Date Taken Logic ---
+    # Priority: 1. Form data, 2. EXIF data, 3. None
+    doc_date_taken = None
+    date_taken_str = request.form.get('date_taken') # Expected format: YYYY-MM-DD HH:MM:SS
 
-    filename = secure_filename(file.filename)
-    file_extension = os.path.splitext(filename)[1].lstrip('.').upper()
+    if date_taken_str:
+        try:
+            # Attempt to parse the date string from the form
+            doc_date_taken = datetime.strptime(date_taken_str, '%Y-%m-%d %H:%M:%S')
+            logging.info(f"Using date_taken from form data: {doc_date_taken}")
+        except ValueError:
+            logging.warning(f"Could not parse date_taken '{date_taken_str}' from form. Proceeding without it.")
+            # Optionally fall back to EXIF or None, depending on requirements.
+            # For now, we prioritize user input, so if parsing fails, we might prefer None.
+            # If EXIF should be fallback even if user input fails parsing:
+            # doc_date_taken = db_connector.get_exif_date(io.BytesIO(file_bytes))
+            # logging.info(f"Falling back to extracted EXIF date: {doc_date_taken}")
+    else:
+        # If no date_taken in form, try extracting from EXIF
+        doc_date_taken = db_connector.get_exif_date(io.BytesIO(file_bytes))
+        logging.info(f"Using extracted EXIF date: {doc_date_taken}")
+    # --- End Date Taken Logic ---
+
+    # Secure original filename, get extension
+    original_filename = secure_filename(file.filename)
+    file_extension = os.path.splitext(original_filename)[1].lstrip('.').upper()
 
     app_id = db_connector.get_app_id_from_extension(file_extension)
     if not app_id:
         logging.warning(f"Could not find APP_ID for extension: {file_extension}. Defaulting to 'UNKNOWN'.")
         app_id = 'UNKNOWN'
 
-    logging.info(f"Upload request received for file: {filename}. Mapped to APP_ID: {app_id}")
+    # --- Docname Logic ---
+    # Priority: 1. Form data (if not empty), 2. Original filename (without ext)
+    docname = request.form.get('docname')
+    if not docname or not docname.strip():
+        docname = os.path.splitext(original_filename)[0] # Fallback to original filename base
+    else:
+        docname = docname.strip() # Use stripped name from form
+    logging.info(f"Using docname: {docname}")
+    # --- End Docname Logic ---
 
-    docname = request.form.get('docname', os.path.splitext(filename)[0])
-    abstract = request.form.get('abstract', 'Uploaded via EDMS Viewer')
+    abstract = request.form.get('abstract', 'Uploaded via EDMS Viewer') # Keep default if needed
+
+    logging.info(f"Upload request received for file: {original_filename}. Mapped to APP_ID: {app_id}")
 
     dst = wsdl_client.dms_system_login()
     if not dst:
         return jsonify({"success": False, "error": "Failed to authenticate with DMS."}), 500
 
     metadata = {
-        "docname": docname,
+        "docname": docname, # Use potentially edited docname
         "abstract": abstract,
         "app_id": app_id,
-        "filename": filename,
-        "doc_date": doc_date # Pass the extracted date to the upload function
+        "filename": original_filename, # Keep original filename for reference/DMS internal? Check DMS needs
+        "doc_date": doc_date_taken # Pass the determined date (could be None)
     }
 
     # Pass the original file stream (reset pointer) for the actual upload
     new_doc_number = wsdl_client.upload_document_to_dms(dst, file_stream, metadata)
 
     if new_doc_number:
-        logging.info(f"Successfully uploaded {filename} as docnumber {new_doc_number}.")
+        logging.info(f"Successfully uploaded {original_filename} as docnumber {new_doc_number}.")
         # Optionally trigger immediate processing for the uploaded doc
         # process_single_doc_async(new_doc_number) # Needs implementation
-        return jsonify({"success": True, "docnumber": new_doc_number, "filename": filename})
+        return jsonify({"success": True, "docnumber": new_doc_number, "filename": original_filename})
     else:
-        logging.error(f"Failed to upload {filename} to DMS.")
+        logging.error(f"Failed to upload {original_filename} to DMS.")
         return jsonify({"success": False, "error": "Failed to upload file to DMS."}), 500
-
-
+    
 @app.route('/api/process_uploaded_documents', methods=['POST'])
 def api_process_uploaded_documents():
     data = request.get_json()
@@ -504,7 +525,6 @@ def api_process_uploaded_documents():
 
     return jsonify(results), 200
 
-
 def clean_repeated_words(text):
     """Removes consecutive repeated words from a string, keeping the last one's punctuation."""
     if not text:
@@ -529,7 +549,6 @@ def clean_repeated_words(text):
             result_words.append(words[i])
 
     return " ".join(result_words)
-
 
 # --- Viewer API Routes (Original Middleware) ---
 @app.route('/api/documents')
@@ -596,7 +615,6 @@ def api_get_image(doc_id):
     logging.warning(f"Image not found in DMS for doc_id: {doc_id}")
     return jsonify({'error': 'Image not found in EDMS.'}), 404
 
-
 @app.route('/api/pdf/<doc_id>')
 def api_get_pdf(doc_id):
     """Serves the full PDF content for a given document ID."""
@@ -608,7 +626,6 @@ def api_get_pdf(doc_id):
         return Response(bytes(pdf_data), mimetype='application/pdf')
     logging.warning(f"PDF not found in DMS for doc_id: {doc_id}")
     return jsonify({'error': 'PDF not found in EDMS.'}), 404
-
 
 @app.route('/api/video/<doc_id>')
 def api_get_video(doc_id):
@@ -657,15 +674,13 @@ def api_get_video(doc_id):
     mimetype, _ = mimetypes.guess_type(cached_video_path)
     return Response(stream_with_context(stream_generator), mimetype=mimetype or "video/mp4")
 
-
 @app.route('/cache/<path:filename>')
 def serve_cached_thumbnail(filename):
     """Serves cached thumbnail images."""
     return send_from_directory(db_connector.thumbnail_cache_dir, filename)
 
-
 @app.route('/api/clear_cache', methods=['POST'])
-@editor_required # Assuming only editors should clear cache
+@editor_required
 def api_clear_cache():
     """Clears the thumbnail and video cache."""
     try:
@@ -679,9 +694,8 @@ def api_clear_cache():
         logging.error(f"Failed to clear cache: {e}", exc_info=True)
         return jsonify({"error": f"Failed to clear cache: {e}"}), 500
 
-
 @app.route('/api/update_abstract', methods=['POST'])
-@editor_required # Protect this endpoint
+@editor_required
 def api_update_abstract():
     """Updates a document's abstract with VIP names."""
     data = request.get_json()
@@ -699,9 +713,8 @@ def api_update_abstract():
     else:
         return jsonify({'error': message}), 500
 
-
 @app.route('/api/add_person', methods=['POST'])
-@editor_required # Protect this endpoint
+@editor_required
 def api_add_person():
     """Adds a person to the lookup table."""
     data = request.get_json()
@@ -718,7 +731,6 @@ def api_add_person():
     else:
         return jsonify({'error': message}), 500
 
-
 @app.route('/api/persons')
 def api_get_persons():
     """Fetches people from the lookup table for autocomplete."""
@@ -730,20 +742,17 @@ def api_get_persons():
         'hasMore': (page * 20) < total_rows # Assuming page size is 20
     })
 
-
 @app.route('/api/tags')
 def api_get_tags():
     """Fetches all unique tags (keywords and persons) for the filter dropdown."""
     tags = db_connector.fetch_all_tags()
     return jsonify(tags)
 
-
 @app.route('/api/tags/<int:doc_id>')
 def api_get_tags_for_document(doc_id):
     """Fetches all tags for a specific document ID."""
     tags = db_connector.fetch_tags_for_document(doc_id)
     return jsonify({"tags": tags})
-
 
 @app.route('/api/processing_status', methods=['POST'])
 def api_processing_status():
@@ -759,9 +768,8 @@ def api_processing_status():
 
     return jsonify({"processing": still_processing})
 
-
 @app.route('/api/tags/<int:doc_id>', methods=['POST'])
-@editor_required # Protect this endpoint
+@editor_required
 def api_add_tag(doc_id):
     """Adds a new tag to a document."""
     data = request.get_json()
@@ -778,17 +786,14 @@ def api_add_tag(doc_id):
     else:
         return jsonify({'error': message}), 500
 
-
 @app.route('/api/tags/<int:doc_id>/<tag>', methods=['PUT'])
-@editor_required # Protect this endpoint
+@editor_required
 def api_update_tag(doc_id, tag):
     """Updates a tag for a document (not typically needed, usually add/delete)."""
-    # This endpoint might be less useful than add/delete, keeping it simple
     return jsonify({'error': 'Tag update not implemented. Use delete and add instead.'}), 501
 
-
 @app.route('/api/tags/<int:doc_id>/<tag>', methods=['DELETE'])
-@editor_required # Protect this endpoint
+@editor_required
 def api_delete_tag(doc_id, tag):
     """Deletes a tag from a document."""
     username = session.get('user', {}).get('username', 'Unknown user')
@@ -801,17 +806,13 @@ def api_delete_tag(doc_id, tag):
         status_code = 404 if "not found" in message.lower() else 500
         return jsonify({'error': message}), status_code
 
-
 # --- Archiving API Routes (from Archiving Backend) ---
-# Assuming these exist and have appropriate @editor_required decorators if needed
-
 @app.route('/api/dashboard_counts', methods=['GET'])
 def get_dashboard_counts():
     if 'user' not in session:
         return jsonify({"error": "Unauthorized"}), 401
     counts = db_connector.get_dashboard_counts()
     return jsonify(counts)
-
 
 @app.route('/api/employees', methods=['GET'])
 def get_employees():
@@ -825,7 +826,6 @@ def get_employees():
     )
     total_pages = math.ceil(total_rows / request.args.get('page_size', 20, type=int))
     return jsonify({"employees": employees, "total_employees": total_rows, "total_pages": total_pages})
-
 
 @app.route('/api/employees', methods=['POST'])
 @editor_required
@@ -858,13 +858,11 @@ def add_employee_archive():
          logging.error(f"Error adding employee archive: {e}", exc_info=True)
          return jsonify({"error": str(e)}), 500
 
-
 @app.route('/api/employees/<int:archive_id>', methods=['GET'])
 def get_employee_details(archive_id):
     if 'user' not in session: return jsonify({"error": "Unauthorized"}), 401
     details = db_connector.fetch_single_archived_employee(archive_id)
     return jsonify(details) if details else (jsonify({"error": "Not found"}), 404)
-
 
 @app.route('/api/employees/<int:archive_id>', methods=['PUT'])
 @editor_required
@@ -901,7 +899,6 @@ def update_employee_archive(archive_id):
         logging.error(f"Error updating employee archive {archive_id}: {e}", exc_info=True)
         return jsonify({"error": str(e)}), 500
 
-
 @app.route('/api/hr_employees', methods=['GET'])
 def get_hr_employees():
     if 'user' not in session: return jsonify({"error": "Unauthorized"}), 401
@@ -911,13 +908,11 @@ def get_hr_employees():
     has_more = (page * 10) < total_rows
     return jsonify({"employees": employees, "hasMore": has_more})
 
-
 @app.route('/api/hr_employees/<int:employee_id>', methods=['GET'])
 def get_hr_employee_details(employee_id):
     if 'user' not in session: return jsonify({"error": "Unauthorized"}), 401
     details = db_connector.fetch_hr_employee_details(employee_id)
     return jsonify(details) if details else (jsonify({"error": "Not found"}), 404)
-
 
 @app.route('/api/statuses', methods=['GET'])
 def get_statuses():
@@ -925,20 +920,17 @@ def get_statuses():
     statuses = db_connector.fetch_statuses()
     return jsonify(statuses)
 
-
 @app.route('/api/document_types', methods=['GET'])
 def get_document_types():
     if 'user' not in session: return jsonify({"error": "Unauthorized"}), 401
     doc_types = db_connector.fetch_document_types()
     return jsonify(doc_types)
 
-
 @app.route('/api/legislations', methods=['GET'])
 def get_legislations():
     if 'user' not in session: return jsonify({"error": "Unauthorized"}), 401
     legislations = db_connector.fetch_legislations()
     return jsonify(legislations)
-
 
 @app.route('/api/document/<int:docnumber>', methods=['GET'])
 def get_document_file(docnumber):
@@ -991,6 +983,61 @@ def api_get_memories():
         logging.error(f"Error fetching memories via API: {e}", exc_info=True)
         return jsonify({"error": "Failed to fetch memories due to server error."}), 500
 
+@app.route('/api/update_metadata', methods=['PUT'])
+def api_update_metadata():
+    """Updates specific metadata fields for a document (abstract and/or date_taken)."""
+    data = request.get_json()
+    doc_id = data.get('doc_id')
+
+    if not doc_id:
+        return jsonify({'error': 'Document ID (doc_id) is required.'}), 400
+
+    # Extract potential fields to update
+    new_abstract = data.get('abstract') # Can be None if only date is updated
+    date_taken_str = data.get('date_taken') # Expected format: YYYY-MM-DD HH:MM:SS or null
+
+    # --- Validation ---
+    # Check if at least one field is provided for update
+    if new_abstract is None and date_taken_str is None:
+        return jsonify({'error': 'At least one field (abstract or date_taken) must be provided for update.'}), 400
+
+    # --- Parse Date Taken String ---
+    new_date_taken = None
+    update_date = False # Flag to indicate if date needs updating
+    if date_taken_str is not None: # Check if the key exists (even if value is null)
+        update_date = True # Intent to update the date is present
+        if date_taken_str: # If the string is not empty or null
+             try:
+                 # Attempt to parse the date string from the form
+                 new_date_taken = datetime.strptime(date_taken_str, '%Y-%m-%d %H:%M:%S')
+                 logging.info(f"Parsed date_taken from request: {new_date_taken}")
+             except (ValueError, TypeError):
+                 logging.warning(f"Could not parse date_taken '{date_taken_str}' from request. Date will not be updated.")
+                 # Return an error if parsing fails for a non-null string
+                 return jsonify({'error': f"Invalid date_taken format provided: '{date_taken_str}'. Expected YYYY-MM-DD HH:MM:SS."}), 400
+        # If date_taken_str is explicitly null or empty string, new_date_taken remains None, indicating clear/set to null
+        else:
+             logging.info(f"Received request to set date_taken to NULL for doc_id {doc_id}.")
+
+
+    username = session.get('user', {}).get('username', 'Unknown user')
+    logging.info(f"User '{username}' updating metadata for doc_id {doc_id}. Abstract provided: {new_abstract is not None}, Date provided: {date_taken_str is not None}")
+
+    # Call the updated database function, passing the parsed date or None
+    success, message = db_connector.update_document_metadata(
+        doc_id,
+        new_abstract=new_abstract,
+        new_date_taken=new_date_taken if update_date else Ellipsis # Use Ellipsis to signal "don't update date"
+    )
+
+    if success:
+        logging.info(f"Successfully updated metadata for doc_id {doc_id}.")
+        return jsonify({'message': message}), 200
+    else:
+        logging.error(f"Failed to update metadata for doc_id {doc_id}: {message}")
+        # Determine appropriate status code based on error
+        status_code = 404 if "not found" in message.lower() else 500
+        return jsonify({'error': message}), status_code
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
