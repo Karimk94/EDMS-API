@@ -695,7 +695,6 @@ def api_clear_cache():
         return jsonify({"error": f"Failed to clear cache: {e}"}), 500
 
 @app.route('/api/update_abstract', methods=['POST'])
-@editor_required
 def api_update_abstract():
     """Updates a document's abstract with VIP names."""
     data = request.get_json()
@@ -714,7 +713,6 @@ def api_update_abstract():
         return jsonify({'error': message}), 500
 
 @app.route('/api/add_person', methods=['POST'])
-@editor_required
 def api_add_person():
     """Adds a person to the lookup table."""
     data = request.get_json()
@@ -769,7 +767,6 @@ def api_processing_status():
     return jsonify({"processing": still_processing})
 
 @app.route('/api/tags/<int:doc_id>', methods=['POST'])
-@editor_required
 def api_add_tag(doc_id):
     """Adds a new tag to a document."""
     data = request.get_json()
@@ -787,13 +784,11 @@ def api_add_tag(doc_id):
         return jsonify({'error': message}), 500
 
 @app.route('/api/tags/<int:doc_id>/<tag>', methods=['PUT'])
-@editor_required
 def api_update_tag(doc_id, tag):
     """Updates a tag for a document (not typically needed, usually add/delete)."""
     return jsonify({'error': 'Tag update not implemented. Use delete and add instead.'}), 501
 
 @app.route('/api/tags/<int:doc_id>/<tag>', methods=['DELETE'])
-@editor_required
 def api_delete_tag(doc_id, tag):
     """Deletes a tag from a document."""
     username = session.get('user', {}).get('username', 'Unknown user')
