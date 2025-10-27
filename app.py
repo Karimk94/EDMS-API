@@ -952,7 +952,7 @@ def api_get_memories():
         current_dt = datetime.now()
         # Get month from query param, default to current month
         month_str = request.args.get('month')
-        month = 1 # int(month_str) if month_str and month_str.isdigit() else current_dt.month
+        month = int(month_str) if month_str and month_str.isdigit() else current_dt.month
         print(f"month is: {month}")
 
         # Get day from query param, optional
