@@ -33,7 +33,7 @@ def editor_required(f):
     return decorated_function
 
 # --- Authentication Routes (from Archiving Backend) ---
-@app.route('/api/auth/login', methods=['POST'])
+@app.route('/api/auth/pta-login', methods=['POST'])
 def login():
     data = request.get_json()
     username = data.get('username')
@@ -1034,6 +1034,82 @@ def api_update_metadata():
         status_code = 404 if "not found" in message.lower() else 500
         return jsonify({'error': message}), status_code
 
+# --- Favorites API Routes ---
+@app.route('/api/favorites/<int:doc_id>', methods=['POST'])
+def add_favorite_route(doc_id):
+    if 'user' not in session:
+        return jsonify({"error": "Unauthorized"}), 401
+    user_id = session['user'].get('username') # Assuming username is the user ID from PEOPLE table
+    success, message = db_connector.add_favorite(user_id, doc_id)
+    if success:
+        return jsonify({"message": message}), 201
+    else:
+        return jsonify({"error": message}), 500
+
+@app.route('/api/favorites/<int:doc_id>', methods=['DELETE'])
+def remove_favorite_route(doc_id):
+    if 'user' not in session:
+        return jsonify({"error": "Unauthorized"}), 401
+    user_id = session['user'].get('username')
+    success, message = db_connector.remove_favorite(user_id, doc_id)
+    if success:
+        return jsonify({"message": message}), 200
+    else:
+        return jsonify({"error": message}), 500
+
+@app.route('/api/favorites', methods=['GET'])
+def get_favorites_route():
+    if 'user' not in session:
+        return jsonify({"error": "Unauthorized"}), 401
+    user_id = session['user'].get('username')
+    page = request.args.get('page', 1, type=int)
+    page_size = request.args.get('pageSize', 20, type=int)
+
+    documents, total_rows = db_connector.get_favorites(user_id, page, page_size)
+    total_pages = math.ceil(total_rows / page_size) if total_rows > 0 else 1
+
+    return jsonify({
+        "documents": documents,
+        "page": page,
+        "total_pages": total_pages,
+        "total_documents": total_rows
+    })
+
+# --- Events API Routes ---
+@app.route('/api/events', methods=['GET'])
+def get_events_route():
+    # Get pagination and search parameters from query string
+    page = request.args.get('page', 1, type=int)
+    search = request.args.get('search', None, type=str)
+    page_size = 10
+
+    if page < 1:
+        page = 1
+
+    logging.debug(f"Fetching events - Page: {page}, Search: '{search}'")
+
+    # Call the updated database function
+    events_list, has_more = db_connector.get_events(page=page, page_size=page_size, search=search)
+
+    # Return the structure expected by react-select-async-paginate
+    return jsonify({
+        "events": events_list,
+        "hasMore": has_more
+    })
+
+@app.route('/api/events', methods=['POST'])
+def create_event_route():
+    data = request.get_json()
+    event_name = data.get('name')
+    if not event_name:
+        return jsonify({"error": "Event name is required."}), 400
+    event_id, message = db_connector.create_event(event_name)
+    if event_id:
+        return jsonify({"id": event_id, "message": message}), 201
+    else:
+        return jsonify({"error": message}), 400
+
+# ... (rest of the file)
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     logging.info(f"Starting server on host 0.0.0.0 port {port}")

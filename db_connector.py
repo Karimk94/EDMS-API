@@ -1843,3 +1843,223 @@ def update_document_metadata(doc_id, new_abstract=None, new_date_taken=Ellipsis)
                 conn.close()
             except oracledb.Error:
                 logging.error(f"Error closing DB connection after metadata update for doc_id {doc_id}.")
+
+def add_favorite(user_id, doc_id):
+    """Adds a document to a user's favorites."""
+    conn = get_connection()
+    if not conn:
+        return False, "Could not connect to the database."
+    try:
+        with conn.cursor() as cursor:
+            # Check if it's already a favorite
+            cursor.execute("SELECT COUNT(*) FROM LKP_FAVORITES_DOC WHERE USER_ID = :user_id AND DOCNUMBER = :doc_id",
+                           [user_id, doc_id])
+            if cursor.fetchone()[0] > 0:
+                return True, "Document is already a favorite."
+
+            # Get the next SYSTEM_ID
+            cursor.execute("SELECT NVL(MAX(SYSTEM_ID), 0) + 1 FROM LKP_FAVORITES_DOC")
+            system_id = cursor.fetchone()[0]
+
+            # Insert the new favorite record
+            cursor.execute("INSERT INTO LKP_FAVORITES_DOC (SYSTEM_ID, USER_ID, DOCNUMBER) VALUES (:1, :2, :3)",
+                           [system_id, user_id, doc_id])
+            conn.commit()
+            return True, "Favorite added."
+    except oracledb.Error as e:
+        conn.rollback()
+        return False, f"Database error: {e}"
+    finally:
+        if conn:
+            conn.close()
+
+def remove_favorite(user_id, doc_id):
+    """Removes a document from a user's favorites."""
+    conn = get_connection()
+    if not conn:
+        return False, "Could not connect to the database."
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute("DELETE FROM LKP_FAVORITES_DOC WHERE USER_ID = :user_id AND DOCNUMBER = :doc_id",
+                           [user_id, doc_id])
+            conn.commit()
+            if cursor.rowcount > 0:
+                return True, "Favorite removed."
+            else:
+                return False, "Favorite not found."
+    except oracledb.Error as e:
+        conn.rollback()
+        return False, f"Database error: {e}"
+    finally:
+        if conn:
+            conn.close()
+
+def get_favorites(user_id, page=1, page_size=20):
+    """Fetches a paginated list of a user's favorited documents."""
+    conn = get_connection()
+    if not conn:
+        return [], 0
+
+    offset = (page - 1) * page_size
+    documents = []
+    total_rows = 0
+
+    try:
+        with conn.cursor() as cursor:
+            # Count total favorites
+            cursor.execute("SELECT COUNT(*) FROM LKP_FAVORITES_DOC WHERE USER_ID = :user_id", [user_id])
+            total_rows = cursor.fetchone()[0]
+
+            # Fetch paginated favorites
+            query = """
+                SELECT p.DOCNUMBER, p.ABSTRACT, p.AUTHOR, p.RTADOCDATE as DOC_DATE, p.DOCNAME
+                FROM PROFILE p
+                JOIN LKP_FAVORITES_DOC f ON p.DOCNUMBER = f.DOCNUMBER
+                WHERE f.USER_ID = :user_id
+                ORDER BY p.DOCNUMBER DESC
+                OFFSET :offset ROWS FETCH NEXT :page_size ROWS ONLY
+            """
+            cursor.execute(query, user_id=user_id, offset=offset, page_size=page_size)
+
+            rows = cursor.fetchall()
+            dst = dms_system_login() # Login to DMS to get thumbnails
+
+            for row in rows:
+                doc_id, abstract, author, doc_date, docname = row
+                thumbnail_path = None
+                media_type = 'image'
+
+                if dst:
+                    try:
+                        _, media_type, file_ext = get_media_info_from_dms(dst, doc_id)
+                        cached_thumbnail_file = f"{doc_id}.jpg"
+                        cached_path = os.path.join(thumbnail_cache_dir, cached_thumbnail_file)
+
+                        if os.path.exists(cached_path):
+                            thumbnail_path = f"cache/{cached_thumbnail_file}"
+                        else:
+                            media_bytes = get_media_content_from_dms(dst, doc_id)
+                            if media_bytes:
+                                thumbnail_path = create_thumbnail(doc_id, media_type, file_ext, media_bytes)
+                    except Exception as e:
+                        logging.error(f"Error getting media info for favorite {doc_id}: {e}")
+
+
+                documents.append({
+                    "doc_id": doc_id,
+                    "title": abstract or "",
+                    "docname": docname or "",
+                    "author": author or "N/A",
+                    "date": doc_date.strftime('%Y-%m-%d %H:%M:%S') if doc_date else "N/A",
+                    "thumbnail_url": thumbnail_path or "",
+                    "media_type": media_type,
+                    "is_favorite": True # Mark as favorite
+                })
+        return documents, total_rows
+    except oracledb.Error as e:
+        logging.error(f"Oracle error fetching favorites: {e}", exc_info=True)
+        return [], 0
+    finally:
+        if conn:
+            conn.close()
+
+def get_events(page=1, page_size=10, search=None):
+    """Fetches a paginated list of existing events, optionally filtered by search term."""
+    conn = get_connection()
+    if not conn:
+        logging.error("Failed to get DB connection in get_events.")
+        return [], False # Return empty list and hasMore=False on connection error
+
+    events = []
+    total_rows = 0
+    offset = (page - 1) * page_size
+    # Base parameters used in both queries if search exists
+    base_params = {}
+    where_clause = ""
+
+    if search:
+        # Use a clear placeholder name
+        where_clause = "WHERE UPPER(EVENT_NAME) LIKE :search_term"
+        search_like = f"%{search.upper()}%"
+        base_params['search_term'] = search_like
+        logging.debug(f"Search term applied: {search_like}")
+
+
+    try:
+        with conn.cursor() as cursor:
+            # Count total matching rows first
+            count_query = f"SELECT COUNT(*) FROM LKP_PHOTO_EVENT {where_clause}"
+            logging.debug(f"Executing count query: {count_query} with params: {base_params}")
+            cursor.execute(count_query, base_params) # Use base_params (only includes search if present)
+            count_result = cursor.fetchone()
+            total_rows = count_result[0] if count_result else 0
+            logging.debug(f"Total rows found: {total_rows}")
+
+            # Fetch paginated data only if there are rows to fetch
+            if total_rows > 0 and offset < total_rows: # Check offset too
+                fetch_query = f"""
+                    SELECT SYSTEM_ID, EVENT_NAME
+                    FROM LKP_PHOTO_EVENT
+                    {where_clause}
+                    ORDER BY EVENT_NAME
+                    OFFSET :offset ROWS FETCH NEXT :page_size ROWS ONLY
+                """
+                # Create specific parameters for the fetch query
+                fetch_params = base_params.copy() # Start with search term if it exists
+                fetch_params['offset'] = offset
+                fetch_params['page_size'] = page_size
+
+                logging.debug(f"Executing fetch query: {fetch_query} with params: {fetch_params}")
+                cursor.execute(fetch_query, fetch_params) # Use fetch_params
+
+                events = [{"id": row[0], "name": row[1]} for row in cursor.fetchall()]
+                logging.debug(f"Fetched {len(events)} events for page {page}.")
+            else:
+                events = [] # Ensure events is an empty list if no rows or offset is too high
+                logging.debug("Skipping fetch query as total_rows is 0 or offset is beyond total rows.")
+
+
+            has_more = (page * page_size) < total_rows
+            return events, has_more
+
+    except oracledb.Error as e:
+        error_obj, = e.args
+        logging.error(f"Oracle Error fetching events: {error_obj.message} (Code: {error_obj.code})", exc_info=True)
+        return [], False # Return empty list and hasMore=False on error
+    except Exception as e:
+         logging.error(f"Unexpected error fetching events: {e}", exc_info=True)
+         return [], False
+    finally:
+        if conn:
+            try:
+                conn.close()
+            except oracledb.Error as close_e:
+                 logging.error(f"Error closing DB connection in get_events: {close_e}")
+
+def create_event(event_name):
+    """Creates a new event."""
+    conn = get_connection()
+    if not conn:
+        return None, "Database connection failed."
+    try:
+        with conn.cursor() as cursor:
+            # Check if event already exists
+            cursor.execute("SELECT SYSTEM_ID FROM LKP_PHOTO_EVENT WHERE EVENT_NAME = :event_name", [event_name])
+            if cursor.fetchone():
+                return None, "Event with this name already exists."
+
+            # Get next SYSTEM_ID
+            cursor.execute("SELECT NVL(MAX(SYSTEM_ID), 0) + 1 FROM LKP_PHOTO_EVENT")
+            system_id = cursor.fetchone()[0]
+
+            # Insert new event
+            cursor.execute("INSERT INTO LKP_PHOTO_EVENT (SYSTEM_ID, EVENT_NAME, LAST_UPDATE) VALUES (:1, :2, SYSDATE)",
+                           [system_id, event_name])
+            conn.commit()
+            return system_id, "Event created successfully."
+    except oracledb.Error as e:
+        conn.rollback()
+        return None, f"Database error: {e}"
+    finally:
+        if conn:
+            conn.close()
