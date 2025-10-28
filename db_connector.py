@@ -436,7 +436,7 @@ def check_processing_status(docnumbers):
 
 def fetch_documents_from_oracle(page=1, page_size=20, search_term=None, date_from=None, date_to=None,
                                 persons=None, person_condition='any', tags=None, years=None, sort=None,
-                                memory_month=None, memory_day=None): # Added memory params
+                                memory_month=None, memory_day=None, user_id=None): # Added user_id parameter
     """Fetches a paginated list of documents from Oracle, handling filtering, memories, and thumbnail logic."""
     conn = get_connection()
     if not conn: return [], 0
@@ -445,6 +445,18 @@ def fetch_documents_from_oracle(page=1, page_size=20, search_term=None, date_fro
     if not dst:
         logging.error("Could not log into DMS. Aborting document fetch.")
         return [], 0
+    
+    db_user_id = None
+    if user_id:
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute("SELECT SYSTEM_ID FROM PEOPLE WHERE UPPER(USER_ID) = UPPER(:username)", username=user_id)
+                user_result = cursor.fetchone()
+                if user_result:
+                    db_user_id = user_result[0]
+        except oracledb.Error as e:
+            logging.error(f"Could not fetch user system ID for {user_id}: {e}")
+            # Continue without favorite info if this fails
 
     offset = (page - 1) * page_size
     documents = []
@@ -583,13 +595,16 @@ def fetch_documents_from_oracle(page=1, page_size=20, search_term=None, date_fro
             # Fetch paginated data - select RTADOCDATE if fetching memories
             date_column = "p.RTADOCDATE" if memory_month is not None else "p.RTADOCDATE"
             fetch_query = f"""
-            SELECT p.DOCNUMBER, p.ABSTRACT, p.AUTHOR, {date_column} as DOC_DATE, p.DOCNAME
+            SELECT p.DOCNUMBER, p.ABSTRACT, p.AUTHOR, {date_column} as DOC_DATE, p.DOCNAME,
+                   CASE WHEN f.DOCNUMBER IS NOT NULL THEN 1 ELSE 0 END as IS_FAVORITE
             FROM PROFILE p
+            LEFT JOIN LKP_FAVORITES_DOC f ON p.DOCNUMBER = f.DOCNUMBER AND f.USER_ID = :db_user_id
             {final_where_clause}
             {order_by_clause}
             OFFSET :offset ROWS FETCH NEXT :page_size ROWS ONLY
             """
             params_paginated = params.copy()
+            params_paginated['db_user_id'] = db_user_id
             params_paginated['offset'] = offset
             params_paginated['page_size'] = page_size
 
@@ -601,7 +616,7 @@ def fetch_documents_from_oracle(page=1, page_size=20, search_term=None, date_fro
             logging.info(f"Fetched {len(rows)} rows for page {page}.")
 
             for row in rows:
-                doc_id, abstract, author, doc_date, docname = row
+                doc_id, abstract, author, doc_date, docname, is_favorite = row
                 thumbnail_path = None
                 media_type = 'image' # Default
                 file_ext = '.jpg'   # Default
@@ -633,7 +648,8 @@ def fetch_documents_from_oracle(page=1, page_size=20, search_term=None, date_fro
                     # Format the correct date based on which one was selected
                     "date": doc_date.strftime('%Y-%m-%d %H:%M:%S') if doc_date else "N/A",
                     "thumbnail_url": thumbnail_path or "",
-                    "media_type": media_type
+                    "media_type": media_type,
+                    "is_favorite": bool(is_favorite)
                 })
     except oracledb.Error as e:
          logging.error(f"Oracle error fetching documents: {e}", exc_info=True)
@@ -1851,19 +1867,28 @@ def add_favorite(user_id, doc_id):
         return False, "Could not connect to the database."
     try:
         with conn.cursor() as cursor:
+            # Get the numeric SYSTEM_ID from the PEOPLE table using the username
+            cursor.execute("SELECT SYSTEM_ID FROM PEOPLE WHERE UPPER(USER_ID) = UPPER(:username)", username=user_id)
+            user_result = cursor.fetchone()
+
+            if not user_result:
+                return False, "User not found in PEOPLE table."
+            
+            db_user_id = user_result[0]
+
             # Check if it's already a favorite
             cursor.execute("SELECT COUNT(*) FROM LKP_FAVORITES_DOC WHERE USER_ID = :user_id AND DOCNUMBER = :doc_id",
-                           [user_id, doc_id])
+                           [db_user_id, doc_id])
             if cursor.fetchone()[0] > 0:
                 return True, "Document is already a favorite."
 
-            # Get the next SYSTEM_ID
+            # Get the next SYSTEM_ID for the favorites table
             cursor.execute("SELECT NVL(MAX(SYSTEM_ID), 0) + 1 FROM LKP_FAVORITES_DOC")
             system_id = cursor.fetchone()[0]
 
             # Insert the new favorite record
             cursor.execute("INSERT INTO LKP_FAVORITES_DOC (SYSTEM_ID, USER_ID, DOCNUMBER) VALUES (:1, :2, :3)",
-                           [system_id, user_id, doc_id])
+                           [system_id, db_user_id, doc_id])
             conn.commit()
             return True, "Favorite added."
     except oracledb.Error as e:
@@ -1880,8 +1905,17 @@ def remove_favorite(user_id, doc_id):
         return False, "Could not connect to the database."
     try:
         with conn.cursor() as cursor:
+            # Get the numeric SYSTEM_ID from the PEOPLE table
+            cursor.execute("SELECT SYSTEM_ID FROM PEOPLE WHERE UPPER(USER_ID) = UPPER(:username)", username=user_id)
+            user_result = cursor.fetchone()
+
+            if not user_result:
+                return False, "User not found in PEOPLE table."
+
+            db_user_id = user_result[0]
+
             cursor.execute("DELETE FROM LKP_FAVORITES_DOC WHERE USER_ID = :user_id AND DOCNUMBER = :doc_id",
-                           [user_id, doc_id])
+                           [db_user_id, doc_id])
             conn.commit()
             if cursor.rowcount > 0:
                 return True, "Favorite removed."
@@ -1906,8 +1940,18 @@ def get_favorites(user_id, page=1, page_size=20):
 
     try:
         with conn.cursor() as cursor:
+            # Get the numeric SYSTEM_ID from the PEOPLE table
+            cursor.execute("SELECT SYSTEM_ID FROM PEOPLE WHERE UPPER(USER_ID) = UPPER(:username)", username=user_id)
+            user_result = cursor.fetchone()
+
+            if not user_result:
+                logging.error(f"Could not find user '{user_id}' in PEOPLE table for fetching favorites.")
+                return [], 0
+            
+            db_user_id = user_result[0]
+
             # Count total favorites
-            cursor.execute("SELECT COUNT(*) FROM LKP_FAVORITES_DOC WHERE USER_ID = :user_id", [user_id])
+            cursor.execute("SELECT COUNT(*) FROM LKP_FAVORITES_DOC WHERE USER_ID = :user_id", [db_user_id])
             total_rows = cursor.fetchone()[0]
 
             # Fetch paginated favorites
@@ -1919,7 +1963,7 @@ def get_favorites(user_id, page=1, page_size=20):
                 ORDER BY p.DOCNUMBER DESC
                 OFFSET :offset ROWS FETCH NEXT :page_size ROWS ONLY
             """
-            cursor.execute(query, user_id=user_id, offset=offset, page_size=page_size)
+            cursor.execute(query, user_id=db_user_id, offset=offset, page_size=page_size)
 
             rows = cursor.fetchall()
             dst = dms_system_login() # Login to DMS to get thumbnails

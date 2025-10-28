@@ -34,7 +34,7 @@ def editor_required(f):
 
 # --- Authentication Routes (from Archiving Backend) ---
 @app.route('/api/auth/pta-login', methods=['POST'])
-def login():
+def pta_login():
     data = request.get_json()
     username = data.get('username')
     password = data.get('password')
@@ -63,6 +63,26 @@ def login():
         logging.warning(f"DMS login failed for user '{username}'.")
         return jsonify({"error": "Invalid DMS credentials"}), 401
 
+@app.route('/api/auth/login', methods=['POST'])
+def login():
+    data = request.get_json()
+    username = data.get('username')
+    password = data.get('password')
+
+    if not username or not password:
+        return jsonify({"error": "Username and password are required"}), 400
+
+    # Use the DMS user login function for authentication
+    dst = wsdl_client.dms_user_login(username, password)
+
+    if dst:
+        session['user'] = {'username': username}
+        session['dst'] = dst  # Store the DMS token in the session
+        return jsonify({"message": "Login successful", "user": session['user']}), 200
+    else:
+        logging.warning(f"DMS login failed for user '{username}'.")
+        return jsonify({"error": "Invalid DMS credentials"}), 401
+
 @app.route('/api/auth/logout', methods=['POST'])
 def logout():
     username = session.get('user', {}).get('username', 'Unknown user')
@@ -73,6 +93,8 @@ def logout():
 
 @app.route('/api/auth/user', methods=['GET'])
 def get_user():
+    logging.info(f"session '{session}'.")
+
     user = session.get('user')
     if user:
         return jsonify({'user': user}), 200
@@ -555,6 +577,10 @@ def clean_repeated_words(text):
 def api_get_documents():
     """Handles fetching documents for the frontend viewer, including full memory view."""
     try:
+        # Get user from session to pass to the database function
+        user = session.get('user')
+        username = user.get('username') if user else None
+
         page = request.args.get('page', 1, type=int)
         page_size = request.args.get('pageSize', 20, type=int)
         search_term = request.args.get('search', None, type=str)
@@ -575,7 +601,7 @@ def api_get_documents():
         if page_size < 1: page_size = 20
         if page_size > 100: page_size = 100
 
-        # Pass memory params to the DB function if present
+        # Pass memory params and the username to the DB function
         documents, total_rows = db_connector.fetch_documents_from_oracle(
             page=page,
             page_size=page_size,
@@ -588,7 +614,8 @@ def api_get_documents():
             years=years,
             sort=sort,
             memory_month=memory_month, # Pass through
-            memory_day=memory_day      # Pass through
+            memory_day=memory_day,      # Pass through
+            user_id=username          # Pass the username for favorite checking
         )
 
         total_pages = math.ceil(total_rows / page_size) if total_rows > 0 else 1
@@ -602,7 +629,7 @@ def api_get_documents():
     except Exception as e:
          logging.error(f"Error in /api/documents endpoint: {e}", exc_info=True)
          return jsonify({"error": "Failed to fetch documents due to server error."}), 500
-
+    
 @app.route('/api/image/<doc_id>')
 def api_get_image(doc_id):
     """Serves the full image content for a given document ID."""
