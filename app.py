@@ -93,8 +93,6 @@ def logout():
 
 @app.route('/api/auth/user', methods=['GET'])
 def get_user():
-    logging.info(f"session '{session}'.")
-
     user = session.get('user')
     if user:
         return jsonify({'user': user}), 200
@@ -427,28 +425,21 @@ def api_upload_document():
         return jsonify({"success": False, "error": "No selected file"}), 400
 
     file_stream = file.stream
+    # Read the content once to pass to EXIF and WSDL upload
     file_bytes = file_stream.read()
-    file_stream.seek(0) # Reset stream pointer
+    file_stream.seek(0) # Reset stream pointer for the actual upload
 
     # --- Date Taken Logic ---
-    # Priority: 1. Form data, 2. EXIF data, 3. None
     doc_date_taken = None
     date_taken_str = request.form.get('date_taken') # Expected format: YYYY-MM-DD HH:MM:SS
-
     if date_taken_str:
         try:
-            # Attempt to parse the date string from the form
             doc_date_taken = datetime.strptime(date_taken_str, '%Y-%m-%d %H:%M:%S')
             logging.info(f"Using date_taken from form data: {doc_date_taken}")
         except ValueError:
-            logging.warning(f"Could not parse date_taken '{date_taken_str}' from form. Proceeding without it.")
-            # Optionally fall back to EXIF or None, depending on requirements.
-            # For now, we prioritize user input, so if parsing fails, we might prefer None.
-            # If EXIF should be fallback even if user input fails parsing:
-            # doc_date_taken = db_connector.get_exif_date(io.BytesIO(file_bytes))
-            # logging.info(f"Falling back to extracted EXIF date: {doc_date_taken}")
+            logging.warning(f"Could not parse date_taken '{date_taken_str}' from form.")
     else:
-        # If no date_taken in form, try extracting from EXIF
+        # Try extracting from EXIF if not provided in form
         doc_date_taken = db_connector.get_exif_date(io.BytesIO(file_bytes))
         logging.info(f"Using extracted EXIF date: {doc_date_taken}")
     # --- End Date Taken Logic ---
@@ -463,7 +454,6 @@ def api_upload_document():
         app_id = 'UNKNOWN'
 
     # --- Docname Logic ---
-    # Priority: 1. Form data (if not empty), 2. Original filename (without ext)
     docname = request.form.get('docname')
     if not docname or not docname.strip():
         docname = os.path.splitext(original_filename)[0] # Fallback to original filename base
@@ -474,6 +464,17 @@ def api_upload_document():
 
     abstract = request.form.get('abstract', 'Uploaded via EDMS Viewer') # Keep default if needed
 
+    # --- Event ID ---
+    event_id_str = request.form.get('event_id')
+    event_id = None
+    if event_id_str:
+        try:
+            event_id = int(event_id_str)
+            logging.info(f"Event ID from form: {event_id}")
+        except ValueError:
+            logging.warning(f"Invalid event_id '{event_id_str}' received from form.")
+    # --- End Event ID ---
+
     logging.info(f"Upload request received for file: {original_filename}. Mapped to APP_ID: {app_id}")
 
     dst = wsdl_client.dms_system_login()
@@ -481,11 +482,12 @@ def api_upload_document():
         return jsonify({"success": False, "error": "Failed to authenticate with DMS."}), 500
 
     metadata = {
-        "docname": docname, # Use potentially edited docname
+        "docname": docname,
         "abstract": abstract,
         "app_id": app_id,
-        "filename": original_filename, # Keep original filename for reference/DMS internal? Check DMS needs
-        "doc_date": doc_date_taken # Pass the determined date (could be None)
+        "filename": original_filename,
+        "doc_date": doc_date_taken,
+        "event_id": event_id # Pass event_id to wsdl client
     }
 
     # Pass the original file stream (reset pointer) for the actual upload
@@ -629,7 +631,52 @@ def api_get_documents():
     except Exception as e:
          logging.error(f"Error in /api/documents endpoint: {e}", exc_info=True)
          return jsonify({"error": "Failed to fetch documents due to server error."}), 500
-    
+
+@app.route('/api/document/<int:doc_id>/event', methods=['PUT'])
+def link_document_event(doc_id):
+    # --- ADD THESE LINES ---
+    logging.info(f"--- HIT ROUTE: PUT /api/document/{doc_id}/event ---")
+    print(f"--- HIT ROUTE: PUT /api/document/{doc_id}/event ---")
+    # -----------------------
+    data = request.get_json()
+    if data is None:
+         logging.error(f"Request for PUT /api/document/{doc_id}/event did not contain valid JSON data.")
+         return jsonify({"error": "Missing or invalid JSON data in request body."}), 400
+    logging.info(f"Received data: {data}") # Log the received data
+    # --- END ADD ---
+
+    event_id = data.get('event_id') # Can be None to unlink
+
+    # Add extra logging around event_id processing
+    logging.info(f"Extracted event_id: {event_id} (Type: {type(event_id)})")
+
+    if event_id is not None:
+        try:
+            event_id = int(event_id)
+            logging.info(f"Converted event_id to int: {event_id}")
+        except (ValueError, TypeError):
+            logging.error(f"Invalid non-integer event_id received: {event_id}")
+            return jsonify({"error": "Invalid event_id provided. Must be an integer or null."}), 400
+
+    success, message = db_connector.link_document_to_event(doc_id, event_id)
+
+    if success:
+        return jsonify({"message": message}), 200
+    else:
+        # Determine appropriate status code
+        status_code = 404 if "not found" in message.lower() else 500
+        return jsonify({"error": message}), status_code
+
+@app.route('/api/document/<int:doc_id>/event', methods=['GET'])
+def get_document_event(doc_id):
+    """Fetches the event linked to a specific document."""
+    event_info = db_connector.get_event_for_document(doc_id)
+    if event_info:
+        return jsonify(event_info), 200
+    else:
+        # Return 404 if no event is linked or document doesn't exist
+        return jsonify({"error": "No event associated with this document or document not found."}), 404
+
 @app.route('/api/image/<doc_id>')
 def api_get_image(doc_id):
     """Serves the full image content for a given document ID."""

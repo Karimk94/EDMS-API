@@ -4,6 +4,7 @@ import logging
 import base64
 from zeep import Client, Settings, xsd
 from zeep.exceptions import Fault
+import db_connector
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -44,9 +45,11 @@ def dms_system_login():
 def upload_document_to_dms(dst, file_stream, metadata):
     """
     Uploads a document to the DMS following the 9-step sequence, for AI processing.
+    Also links the document to an event if event_id is provided in metadata.
     """
     svc_client, obj_client = None, None
     created_doc_number, version_id, put_doc_id, stream_id = None, None, None, None
+    event_id = metadata.get('event_id') # Get event_id from metadata
 
     try:
         settings = Settings(strict=False, xml_huge_tree=True)
@@ -55,7 +58,7 @@ def upload_document_to_dms(dst, file_stream, metadata):
 
         string_type = svc_client.get_type('{http://www.w3.org/2001/XMLSchema}string')
         int_type = svc_client.get_type('{http://www.w3.org/2001/XMLSchema}int')
-        
+
         logging.info("Step 2: CreateObject - Creating document profile.")
         string_array_type = svc_client.get_type(
             '{http://schemas.microsoft.com/2003/10/Serialization/Arrays}ArrayOfstring')
@@ -76,7 +79,7 @@ def upload_document_to_dms(dst, file_stream, metadata):
             xsd.AnyObject(string_type, DMS_USER),
             xsd.AnyObject(string_type, '1')
         ]
-        
+
         doc_date = metadata.get('doc_date')
         if doc_date:
             logging.info(f"doc_date is : {doc_date}")
@@ -140,7 +143,13 @@ def upload_document_to_dms(dst, file_stream, metadata):
         chunk_size = 48 * 1024
         total_bytes_written = 0
         while True:
-            chunk = file_stream.read(chunk_size)
+            # Ensure file_stream is readable and reset if necessary (though seek(0) was done before calling)
+            try:
+                chunk = file_stream.read(chunk_size)
+            except Exception as read_err:
+                 logging.error(f"Error reading from file stream during upload: {read_err}")
+                 raise Exception(f"Failed to read file stream: {read_err}")
+
             if not chunk:
                 break
 
@@ -228,25 +237,33 @@ def upload_document_to_dms(dst, file_stream, metadata):
         else:
             logging.info("UpdateObject successful.")
 
+        if created_doc_number and event_id is not None: # Check explicitly for None
+            logging.info(f"Linking uploaded document {created_doc_number} to event {event_id}.")
+            success, message = db_connector.link_document_to_event(created_doc_number, event_id)
+            if not success:
+                # Log a warning but don't fail the whole upload
+                logging.warning(f"Failed to link document {created_doc_number} to event {event_id}: {message}")
+
         return created_doc_number
 
     except Exception as e:
         logging.error(f"DMS upload failed. Error: {e}", exc_info=True)
         return None
     finally:
+        # Cleanup DMS objects
         if obj_client:
+            if stream_id: # Release stream first
+                try:
+                    obj_client.service.ReleaseObject(call={'objectID': stream_id})
+                    logging.info("Step 8: Released streamID object.")
+                except Exception as e:
+                    logging.warning(f"Failed to release streamID object {stream_id}: {e}")
             if put_doc_id:
                 try:
                     obj_client.service.ReleaseObject(call={'objectID': put_doc_id})
                     logging.info("Step 7: Released putDocID object.")
                 except Exception as e:
                     logging.warning(f"Failed to release putDocID object {put_doc_id}: {e}")
-            if stream_id:
-                try:
-                    obj_client.service.ReleaseObject(call={'objectID': stream_id})
-                    logging.info("Step 8: Released streamID object.")
-                except Exception as e:
-                    logging.warning(f"Failed to release streamID object {stream_id}: {e}")
 
 def get_image_by_docnumber(dst, doc_number):
     """Retrieves a single document's image bytes from the DMS using the multi-step process."""

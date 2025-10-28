@@ -2045,7 +2045,7 @@ def get_events(page=1, page_size=10, search=None):
                     SELECT SYSTEM_ID, EVENT_NAME
                     FROM LKP_PHOTO_EVENT
                     {where_clause}
-                    ORDER BY EVENT_NAME
+                    ORDER BY SYSTEM_ID DESC
                     OFFSET :offset ROWS FETCH NEXT :page_size ROWS ONLY
                 """
                 # Create specific parameters for the fetch query
@@ -2081,29 +2081,167 @@ def get_events(page=1, page_size=10, search=None):
                  logging.error(f"Error closing DB connection in get_events: {close_e}")
 
 def create_event(event_name):
-    """Creates a new event."""
+    """Creates a new event or returns the ID if it already exists."""
     conn = get_connection()
     if not conn:
         return None, "Database connection failed."
     try:
         with conn.cursor() as cursor:
-            # Check if event already exists
-            cursor.execute("SELECT SYSTEM_ID FROM LKP_PHOTO_EVENT WHERE EVENT_NAME = :event_name", [event_name])
-            if cursor.fetchone():
-                return None, "Event with this name already exists."
+            # Check if event already exists (case-insensitive)
+            cursor.execute("SELECT SYSTEM_ID FROM LKP_PHOTO_EVENT WHERE UPPER(EVENT_NAME) = UPPER(:event_name)", event_name=event_name.strip())
+            result = cursor.fetchone()
+            if result:
+                 # Return existing event ID if found
+                 existing_event_id = result[0]
+                 logging.info(f"Event '{event_name}' already exists with ID {existing_event_id}.")
+                 return existing_event_id, "Event with this name already exists."
 
             # Get next SYSTEM_ID
             cursor.execute("SELECT NVL(MAX(SYSTEM_ID), 0) + 1 FROM LKP_PHOTO_EVENT")
             system_id = cursor.fetchone()[0]
 
             # Insert new event
-            cursor.execute("INSERT INTO LKP_PHOTO_EVENT (SYSTEM_ID, EVENT_NAME, LAST_UPDATE) VALUES (:1, :2, SYSDATE)",
-                           [system_id, event_name])
+            cursor.execute("INSERT INTO LKP_PHOTO_EVENT (SYSTEM_ID, EVENT_NAME, LAST_UPDATE, DISABLED) VALUES (:1, :2, SYSDATE, 0)",
+                           [system_id, event_name.strip()]) # Trim name before insert
             conn.commit()
+            logging.info(f"Event '{event_name}' created successfully with ID {system_id}.")
             return system_id, "Event created successfully."
     except oracledb.Error as e:
         conn.rollback()
+        logging.error(f"Database error creating event '{event_name}': {e}", exc_info=True)
         return None, f"Database error: {e}"
     finally:
         if conn:
             conn.close()
+
+def link_document_to_event(doc_id, event_id):
+    """Links a document to an event, replacing any existing link for that document."""
+    conn = get_connection()
+    if not conn:
+        logging.error(f"DB connection error linking event for doc {doc_id}")
+        return False, "Database connection failed."
+
+    try:
+        with conn.cursor() as cursor:
+            # Check if document exists
+            logging.info(f"Checking existence for DOCNUMBER = {doc_id}")
+            cursor.execute("SELECT 1 FROM PROFILE WHERE DOCNUMBER = :1", [doc_id])
+            doc_exists = cursor.fetchone() is not None
+            if not doc_exists:
+                logging.warning(f"Document check failed: DOCNUMBER = {doc_id} not found.")
+                return False, f"Document with ID {doc_id} not found."
+            logging.info(f"Document check passed for DOCNUMBER = {doc_id}")
+
+            # If event_id is provided, check if it exists and is enabled
+            if event_id is not None:
+                logging.info(f"Checking existence for EVENT_ID = {event_id}")
+                cursor.execute("SELECT 1 FROM LKP_PHOTO_EVENT WHERE SYSTEM_ID = :1 AND DISABLED = '0'", [event_id])
+                event_exists = cursor.fetchone() is not None
+                if not event_exists:
+                    logging.warning(f"Event check failed: EVENT_ID = {event_id} not found or disabled.")
+                    return False, f"Event with ID {event_id} not found or is disabled."
+                logging.info(f"Event check passed for EVENT_ID = {event_id}")
+
+
+            # Use MERGE to insert or update the link
+            logging.info(f"Executing MERGE for DOCNUMBER={doc_id}, EVENT_ID={event_id}")
+            # --- Revised MERGE statement with standard NULL checks ---
+            merge_sql = """
+            MERGE INTO LKP_EVENT_DOC de
+            USING (SELECT :doc_id AS docnumber FROM dual) src ON (de.DOCNUMBER = src.docnumber)
+            WHEN MATCHED THEN
+                UPDATE SET
+                    de.EVENT_ID = :event_id,
+                    de.LAST_UPDATE = SYSDATE,
+                    de.DISABLED = CASE WHEN :event_id IS NULL THEN '1' ELSE '0' END
+                -- Revised WHERE clause using standard NULL comparisons explicitly
+                WHERE
+                    -- Condition 1: EVENT_ID needs update (handles NULLs explicitly)
+                    (
+                        (de.EVENT_ID IS NULL AND :event_id IS NOT NULL) OR
+                        (de.EVENT_ID IS NOT NULL AND :event_id IS NULL) OR
+                        (de.EVENT_ID != :event_id)
+                    )
+                    -- Condition 2: DISABLED status needs update (handles NULLs explicitly, assumes de.DISABLED could be NULL)
+                    OR
+                    (
+                        (de.DISABLED IS NULL AND (CASE WHEN :event_id IS NULL THEN '1' ELSE '0' END) IS NOT NULL) OR
+                        (de.DISABLED IS NOT NULL AND (CASE WHEN :event_id IS NULL THEN '1' ELSE '0' END) IS NULL) OR
+                        (de.DISABLED != (CASE WHEN :event_id IS NULL THEN '1' ELSE '0' END))
+                    )
+            WHEN NOT MATCHED THEN
+                INSERT (SYSTEM_ID, DOCNUMBER, EVENT_ID, LAST_UPDATE, DISABLED)
+                VALUES (
+                    (SELECT NVL(MAX(SYSTEM_ID), 0) + 1 FROM LKP_EVENT_DOC),
+                    :doc_id,
+                    :event_id,
+                    SYSDATE,
+                    '0' -- When inserting a new link, it should not be disabled
+                )
+            """
+            # --- End Revised MERGE statement ---
+
+            cursor.execute(merge_sql, {'doc_id': doc_id, 'event_id': event_id})
+
+            rows_affected = cursor.rowcount
+            conn.commit()
+
+            action = "linked to" if event_id is not None else "unlinked from"
+            event_desc = f"event {event_id}" if event_id is not None else "any event"
+            return True, f"Document event link updated successfully."
+
+    except oracledb.Error as e:
+        error_obj, = e.args
+        logging.error(f"Oracle error linking document {doc_id} to event {event_id}: {error_obj.message}", exc_info=True)
+        try:
+            conn.rollback()
+        except oracledb.Error:
+             logging.error(f"Failed to rollback transaction for doc {doc_id} event link.")
+        return False, f"Database error occurred: {error_obj.message}"
+    except Exception as e:
+        logging.error(f"Unexpected error linking document {doc_id} to event {event_id}: {e}", exc_info=True)
+        try:
+            conn.rollback()
+        except Exception:
+             pass
+        return False, "An unexpected server error occurred."
+    finally:
+        if conn:
+            try:
+                conn.close()
+            except oracledb.Error:
+                logging.error(f"Error closing DB connection after linking event for doc {doc_id}.")
+
+def get_event_for_document(doc_id):
+    """Fetches the currently linked event ID and name for a document."""
+    conn = get_connection()
+    if not conn:
+        logging.error(f"DB connection error fetching event for doc {doc_id}")
+        return None
+
+    event_info = None
+    try:
+        with conn.cursor() as cursor:
+            query = """
+                SELECT e.SYSTEM_ID, e.EVENT_NAME
+                FROM LKP_EVENT_DOC de
+                JOIN LKP_PHOTO_EVENT e ON de.EVENT_ID = e.SYSTEM_ID
+                WHERE de.DOCNUMBER = :doc_id AND de.DISABLED = '0' AND e.DISABLED = '0'
+            """
+            cursor.execute(query, doc_id=doc_id)
+            result = cursor.fetchone()
+            if result:
+                event_info = {"event_id": result[0], "event_name": result[1]}
+                logging.debug(f"Found event {result[1]} (ID: {result[0]}) linked to doc {doc_id}")
+            else:
+                 logging.debug(f"No active event link found for doc {doc_id}")
+
+    except oracledb.Error as e:
+        error_obj, = e.args
+        logging.error(f"Oracle error fetching event for doc {doc_id}: {error_obj.message}", exc_info=True)
+    except Exception as e:
+        logging.error(f"Unexpected error fetching event for doc {doc_id}: {e}", exc_info=True)
+    finally:
+        if conn:
+            conn.close()
+    return event_info
