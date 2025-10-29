@@ -22,7 +22,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 
 app = Flask(__name__)
 
-app.secret_key = os.getenv('FLASK_SECRET_KEY', 'a_default_secret_key_for_dev') # Added default for dev
+app.secret_key = os.getenv('FLASK_SECRET_KEY')
 CORS(app, supports_credentials=True, resources={r"/api/*": {"origins": "*"}})
 
 # --- Security Decorator ---
@@ -102,7 +102,7 @@ def get_user():
         # Return an error if no user is in the session
         return jsonify({'error': 'Not authenticated'}), 401
 
-# --- AI Processing Routes (Original Middleware) ---
+# --- AI Processing Routes ---
 def process_document(doc, dms_session_token):
     """
     Processes a single document, handling its own errors and returning a dictionary
@@ -576,7 +576,7 @@ def clean_repeated_words(text):
 
     return " ".join(result_words)
 
-# --- Viewer API Routes (Original Middleware) ---
+# --- Viewer API Routes ---
 @app.route('/api/documents')
 def api_get_documents():
     """Handles fetching documents for the frontend viewer, including full memory view."""
@@ -1224,6 +1224,16 @@ def get_event_documents_route(event_id):
         # Optionally, include total_documents count if needed by frontend
         # "total_documents": total_rows # Need get_documents_for_event to return total_rows too
     })
+
+@app.route('/api/journey', methods=['GET'])
+def get_journey_data():
+    """Fetches all events grouped by year for the journey timeline."""
+    try:
+        journey_data = db_connector.fetch_journey_data()
+        return jsonify(journey_data)
+    except Exception as e:
+        logging.error(f"Error in /api/journey endpoint: {e}", exc_info=True)
+        return jsonify({"error": "Failed to fetch journey data due to server error."}), 500
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))

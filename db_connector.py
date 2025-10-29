@@ -2409,3 +2409,74 @@ def get_documents_for_event(event_id, page=1, page_size=1):
     finally:
         if conn:
             conn.close()
+
+def fetch_journey_data():
+    """Fetches all events and their associated documents, grouped by year."""
+    conn = get_connection()
+    if not conn:
+        logging.error("Failed to get DB connection in fetch_journey_data.")
+        return {}
+
+    dst = dms_system_login()
+    if not dst:
+        logging.error("Could not log into DMS in fetch_journey_data.")
+        return {}
+
+    journey_data = {}
+    try:
+        with conn.cursor() as cursor:
+            # Fetch all events with at least one document, ordered by date
+            sql = """
+                SELECT
+                    EXTRACT(YEAR FROM p.RTADOCDATE) as event_year,
+                    e.EVENT_NAME,
+                    de.DOCNUMBER
+                FROM LKP_PHOTO_EVENT e
+                JOIN LKP_EVENT_DOC de ON e.SYSTEM_ID = de.EVENT_ID
+                JOIN PROFILE p ON de.DOCNUMBER = p.DOCNUMBER
+                WHERE e.DISABLED = '0' AND de.DISABLED = '0' AND p.RTADOCDATE IS NOT NULL
+                ORDER BY event_year DESC, e.EVENT_NAME
+            """
+            cursor.execute(sql)
+
+            # Group documents by year and event name
+            events_by_year = {}
+            for year, event_name, docnumber in cursor.fetchall():
+                if year not in events_by_year:
+                    events_by_year[year] = {}
+                if event_name not in events_by_year[year]:
+                    events_by_year[year][event_name] = []
+                events_by_year[year][event_name].append(docnumber)
+
+            # Process each event to get thumbnails
+            for year, events in events_by_year.items():
+                if year not in journey_data:
+                    journey_data[year] = []
+
+                for event_name, docnumbers in events.items():
+                    thumbnail_urls = []
+                    # Fetch up to 4 thumbnails for each event
+                    for doc_id in docnumbers[:4]:
+                        thumbnail_path = f"cache/{doc_id}.jpg"
+                        cached_path = os.path.join(thumbnail_cache_dir, f"{doc_id}.jpg")
+                        if not os.path.exists(cached_path):
+                            # Create thumbnail if it doesn't exist
+                            _, media_type, file_ext = get_media_info_from_dms(dst, doc_id)
+                            media_bytes = get_media_content_from_dms(dst, doc_id)
+                            if media_bytes:
+                                create_thumbnail(doc_id, media_type, file_ext, media_bytes)
+                        thumbnail_urls.append(thumbnail_path)
+                    
+                    journey_data[year].append({
+                        "title": event_name,
+                        "gallery": [f"cache/{doc_id}.jpg" for doc_id in docnumbers],
+                        "thumbnail": thumbnail_urls[0] if thumbnail_urls else ""
+                    })
+
+    except oracledb.Error as e:
+        logging.error(f"Oracle error in fetch_journey_data: {e}", exc_info=True)
+    finally:
+        if conn:
+            conn.close()
+
+    return journey_data
