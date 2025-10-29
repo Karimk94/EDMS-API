@@ -676,8 +676,7 @@ def get_document_event(doc_id):
     if event_info:
         return jsonify(event_info), 200
     else:
-        # Return 404 if no event is linked or document doesn't exist
-        return jsonify({"error": "No event associated with this document or document not found."}), 404
+        return jsonify(None), 200
 
 @app.route('/api/image/<doc_id>')
 def api_get_image(doc_id):
@@ -1154,27 +1153,28 @@ def get_favorites_route():
 # --- Events API Routes ---
 @app.route('/api/events', methods=['GET'])
 def get_events_route():
-    """Fetches paginated events with associated document thumbnails."""
+    """Fetches paginated events."""
     page = request.args.get('page', 1, type=int)
     search = request.args.get('search', None, type=str)
-    page_size = request.args.get('pageSize', 20, type=int) # Use pageSize like documents endpoint
+    page_size = request.args.get('pageSize', 20, type=int)
+    fetch_all = request.args.get('fetch_all', 'false', type=str).lower() == 'true'
 
-    # Basic validation
     if page < 1: page = 1
     if page_size < 1: page_size = 20
     if page_size > 100: page_size = 100
 
-    logging.debug(f"Fetching events - Page: {page}, PageSize: {page_size}, Search: '{search}'")
+    logging.debug(f"Fetching events - Page: {page}, PageSize: {page_size}, Search: '{search}', Fetch all: {fetch_all}")
 
-    # Call the updated database function which now returns events_list and total_pages
-    events_list, total_pages = db_connector.get_events(page=page, page_size=page_size, search=search)
+    events_list, total_rows = db_connector.get_events(page=page, page_size=page_size, search=search, fetch_all=fetch_all)
 
-    # Return the structure similar to the /documents endpoint
+    total_pages = math.ceil(total_rows / page_size) if total_rows > 0 else 1
+    has_more = (page * page_size) < total_rows
+
     return jsonify({
         "events": events_list,
         "page": page,
         "total_pages": total_pages,
-        # "total_events": total_rows # You might need to adjust get_events to also return total_rows if needed separately
+        "hasMore": has_more
     })
 
 @app.route('/api/events', methods=['POST'])
