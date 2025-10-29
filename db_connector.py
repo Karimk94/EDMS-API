@@ -292,6 +292,45 @@ def get_user_security_level(username):
                 # Now, get the security level using the user_id
                 query = """
                     SELECT sl.NAME
+                    FROM LKP_EDMS_USR_SECUR us
+                    JOIN LKP_EDMS_SECURITY sl ON us.SECURITY_LEVEL_ID = sl.SYSTEM_ID
+                    WHERE us.USER_ID = :user_id
+                """
+                cursor.execute(query, user_id=user_id)
+                level_result = cursor.fetchone()
+                if level_result:
+                    security_level = level_result[0]
+                else:
+                    logging.warning(f"No security level found for user_id {user_id} (DMS user: {username})")
+            else:
+                 logging.warning(f"No PEOPLE record found for DMS user: {username}")
+                 # If level_result is None, security_level remains None and will be returned
+    except oracledb.Error as e:
+        logging.error(f"Oracle Database error in get_user_security_level for {username}: {e}", exc_info=True)
+    finally:
+        if conn:
+            conn.close()
+    return security_level
+
+def get_pta_user_security_level(username):
+    """Fetches the user's security level name from the database using their user ID from the PEOPLE table."""
+    conn = get_connection()
+    if not conn:
+        return None  # Return None if DB connection fails
+
+    security_level = None  # Default value is now None
+    try:
+        with conn.cursor() as cursor:
+            # Use upper for case-insensitive comparison
+            cursor.execute("SELECT SYSTEM_ID FROM PEOPLE WHERE UPPER(USER_ID) = UPPER(:username)", username=username)
+            user_result = cursor.fetchone()
+
+            if user_result:
+                user_id = user_result[0]
+
+                # Now, get the security level using the user_id
+                query = """
+                    SELECT sl.NAME
                     FROM LKP_PTA_USR_SECUR us
                     JOIN LKP_PTA_SECURITY sl ON us.SECURITY_LEVEL_ID = sl.SYSTEM_ID
                     WHERE us.USER_ID = :user_id

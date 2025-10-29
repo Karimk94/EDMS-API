@@ -49,7 +49,7 @@ def pta_login():
 
     if dst:
         # If DMS login is successful, get security level from our new table
-        security_level = db_connector.get_user_security_level(username)
+        security_level = db_connector.get_pta_user_security_level(username)
 
         if security_level is None:
              # User exists in DMS but not in our security setup, or DB error
@@ -78,8 +78,18 @@ def login():
     dst = wsdl_client.dms_user_login(username, password)
 
     if dst:
-        session['user'] = {'username': username}
+        # If DMS login is successful, get security level from our new table
+        security_level = db_connector.get_user_security_level(username)
+
+        if security_level is None:
+             # User exists in DMS but not in our security setup, or DB error
+             logging.warning(f"User '{username}' authenticated via DMS but has no security level assigned in middleware DB.")
+             return jsonify({"error": "User not authorized for this application"}), 401
+
+
+        session['user'] = {'username': username, 'security_level': security_level}
         session['dst'] = dst  # Store the DMS token in the session
+        logging.info(f"User '{username}' logged in successfully with security level '{security_level}'.")
         return jsonify({"message": "Login successful", "user": session['user']}), 200
     else:
         logging.warning(f"DMS login failed for user '{username}'.")
