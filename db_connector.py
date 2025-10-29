@@ -2007,72 +2007,154 @@ def get_favorites(user_id, page=1, page_size=20):
         if conn:
             conn.close()
 
-def get_events(page=1, page_size=10, search=None):
-    """Fetches a paginated list of existing events, optionally filtered by search term."""
+def get_events(page=1, page_size=20, search=None):
+    """
+    Fetches a paginated list of events that have associated documents,
+    including up to 4 thumbnails per event.
+    """
     conn = get_connection()
     if not conn:
         logging.error("Failed to get DB connection in get_events.")
-        return [], False # Return empty list and hasMore=False on connection error
+        return [], 0 # Return empty list and total_pages=0 on connection error
 
-    events = []
+    dst = dms_system_login() # Login to DMS for getting thumbnails later
+    if not dst:
+        logging.error("Could not log into DMS in get_events. Cannot fetch thumbnails.")
+        # Decide if you want to return events without thumbnails or fail completely
+        # For now, let's continue but thumbnails will be missing.
+        # return [], 0
+
+    events_dict = {}
     total_rows = 0
     offset = (page - 1) * page_size
-    # Base parameters used in both queries if search exists
     base_params = {}
-    where_clause = ""
+    where_clauses = ["e.DISABLED = '0'"] # Ensure event is not disabled
 
     if search:
-        # Use a clear placeholder name
-        where_clause = "WHERE UPPER(EVENT_NAME) LIKE :search_term"
-        search_like = f"%{search.upper()}%"
-        base_params['search_term'] = search_like
-        logging.debug(f"Search term applied: {search_like}")
+        where_clauses.append("UPPER(e.EVENT_NAME) LIKE :search_term")
+        base_params['search_term'] = f"%{search.upper()}%"
+        logging.debug(f"Search term applied: {base_params['search_term']}")
 
+    final_where_clause = "WHERE " + " AND ".join(where_clauses) if where_clauses else ""
 
     try:
         with conn.cursor() as cursor:
-            # Count total matching rows first
-            count_query = f"SELECT COUNT(*) FROM LKP_PHOTO_EVENT {where_clause}"
+            # Count total matching *events with documents*
+            count_query = f"""
+                SELECT COUNT(DISTINCT e.SYSTEM_ID)
+                FROM LKP_PHOTO_EVENT e
+                JOIN LKP_EVENT_DOC de ON e.SYSTEM_ID = de.EVENT_ID AND de.DISABLED = '0'
+                {final_where_clause}
+            """
             logging.debug(f"Executing count query: {count_query} with params: {base_params}")
-            cursor.execute(count_query, base_params) # Use base_params (only includes search if present)
+            cursor.execute(count_query, base_params)
             count_result = cursor.fetchone()
             total_rows = count_result[0] if count_result else 0
-            logging.debug(f"Total rows found: {total_rows}")
+            logging.debug(f"Total events with documents found: {total_rows}")
 
-            # Fetch paginated data only if there are rows to fetch
-            if total_rows > 0 and offset < total_rows: # Check offset too
+            total_pages = math.ceil(total_rows / page_size) if total_rows > 0 else 1
+
+            # Fetch paginated events and associated document IDs
+            if total_rows > 0 and offset < total_rows:
                 fetch_query = f"""
-                    SELECT SYSTEM_ID, EVENT_NAME
-                    FROM LKP_PHOTO_EVENT
-                    {where_clause}
-                    ORDER BY SYSTEM_ID DESC
-                    OFFSET :offset ROWS FETCH NEXT :page_size ROWS ONLY
+                    WITH EventDocsRanked AS (
+                        SELECT
+                            e.SYSTEM_ID AS event_id,
+                            e.EVENT_NAME,
+                            de.DOCNUMBER,
+                            p.RTADOCDATE, -- Use RTADOCDATE for ordering documents within an event
+                            ROW_NUMBER() OVER(PARTITION BY e.SYSTEM_ID ORDER BY p.RTADOCDATE DESC, de.DOCNUMBER DESC) as rn
+                        FROM LKP_PHOTO_EVENT e
+                        JOIN LKP_EVENT_DOC de ON e.SYSTEM_ID = de.EVENT_ID AND de.DISABLED = '0'
+                        JOIN PROFILE p ON de.DOCNUMBER = p.DOCNUMBER -- Join PROFILE to get RTADOCDATE
+                        {final_where_clause}
+                    ),
+                    PaginatedEvents AS (
+                        SELECT DISTINCT event_id, EVENT_NAME
+                        FROM EventDocsRanked
+                        ORDER BY event_id DESC
+                        OFFSET :offset ROWS FETCH NEXT :page_size ROWS ONLY
+                    )
+                    SELECT
+                        pe.event_id,
+                        pe.EVENT_NAME,
+                        edr.DOCNUMBER
+                    FROM PaginatedEvents pe
+                    JOIN EventDocsRanked edr ON pe.event_id = edr.event_id
+                    WHERE edr.rn <= 4 -- Limit to top 4 documents per event
+                    ORDER BY pe.event_id DESC, edr.rn ASC -- Ensure docs are ordered correctly for processing
                 """
-                # Create specific parameters for the fetch query
-                fetch_params = base_params.copy() # Start with search term if it exists
+                fetch_params = base_params.copy()
                 fetch_params['offset'] = offset
                 fetch_params['page_size'] = page_size
 
                 logging.debug(f"Executing fetch query: {fetch_query} with params: {fetch_params}")
-                cursor.execute(fetch_query, fetch_params) # Use fetch_params
+                cursor.execute(fetch_query, fetch_params)
 
-                events = [{"id": row[0], "name": row[1]} for row in cursor.fetchall()]
-                logging.debug(f"Fetched {len(events)} events for page {page}.")
-            else:
-                events = [] # Ensure events is an empty list if no rows or offset is too high
-                logging.debug("Skipping fetch query as total_rows is 0 or offset is beyond total rows.")
+                # Process results: group documents by event_id
+                for event_id, event_name, doc_id in cursor.fetchall():
+                    if event_id not in events_dict:
+                        events_dict[event_id] = {
+                            "id": event_id,
+                            "name": event_name,
+                            "doc_ids": [], # Store doc_ids first
+                            "thumbnail_urls": [] # Initialize empty list for URLs
+                        }
+                    # Only add up to 4 doc_ids per event
+                    if len(events_dict[event_id]["doc_ids"]) < 4:
+                        events_dict[event_id]["doc_ids"].append(doc_id)
 
+                logging.debug(f"Fetched details for {len(events_dict)} events on page {page}.")
 
-            has_more = (page * page_size) < total_rows
-            return events, has_more
+                # --- Fetch Thumbnails (after grouping) ---
+                if dst: # Only if DMS login succeeded
+                    for event_id in events_dict:
+                        for doc_id in events_dict[event_id]["doc_ids"]:
+                            thumbnail_path = None
+                            try:
+                                # Check cache first
+                                cached_thumbnail_file = f"{doc_id}.jpg"
+                                cached_path = os.path.join(thumbnail_cache_dir, cached_thumbnail_file)
+
+                                if os.path.exists(cached_path):
+                                    thumbnail_path = f"cache/{cached_thumbnail_file}"
+                                else:
+                                    # Get media info and content ONLY if not cached
+                                    _, media_type, file_ext = get_media_info_from_dms(dst, doc_id)
+                                    media_bytes = get_media_content_from_dms(dst, doc_id)
+                                    if media_bytes:
+                                        thumbnail_path = create_thumbnail(doc_id, media_type, file_ext, media_bytes)
+                                    else:
+                                        logging.warning(f"Could not retrieve media content for doc {doc_id} to create event thumbnail.")
+
+                                if thumbnail_path:
+                                    events_dict[event_id]["thumbnail_urls"].append(thumbnail_path)
+                                else:
+                                    # Append a placeholder or handle missing thumbnail if desired
+                                     events_dict[event_id]["thumbnail_urls"].append("") # Or a path to a default image
+
+                            except Exception as thumb_e:
+                                logging.error(f"Error processing thumbnail for event doc {doc_id}: {thumb_e}", exc_info=True)
+                                events_dict[event_id]["thumbnail_urls"].append("") # Append placeholder on error
+
+                # Convert dict back to list, remove temporary doc_ids key
+                events_list = []
+                for event_id in sorted(events_dict.keys(), reverse=True): # Ensure consistent order
+                    del events_dict[event_id]["doc_ids"] # Remove the temporary list of doc IDs
+                    events_list.append(events_dict[event_id])
+
+                return events_list, total_pages # Return list and total pages
+
+            else: # No events found or page out of range
+                return [], total_pages # Return empty list
 
     except oracledb.Error as e:
         error_obj, = e.args
         logging.error(f"Oracle Error fetching events: {error_obj.message} (Code: {error_obj.code})", exc_info=True)
-        return [], False # Return empty list and hasMore=False on error
+        return [], 0 # Return empty list and total_pages=0 on error
     except Exception as e:
          logging.error(f"Unexpected error fetching events: {e}", exc_info=True)
-         return [], False
+         return [], 0
     finally:
         if conn:
             try:
@@ -2245,3 +2327,85 @@ def get_event_for_document(doc_id):
         if conn:
             conn.close()
     return event_info
+
+def get_documents_for_event(event_id, page=1, page_size=1):
+    """Fetches paginated documents linked to a specific event."""
+    conn = get_connection()
+    if not conn:
+        logging.error(f"DB connection error fetching documents for event {event_id}")
+        return [], 0, "Database connection failed."
+
+    offset = (page - 1) * page_size
+    documents = []
+    total_rows = 0
+    error_message = None
+
+    try:
+        with conn.cursor() as cursor:
+            # Count total documents for the event
+            count_query = """
+                SELECT COUNT(de.DOCNUMBER)
+                FROM LKP_EVENT_DOC de
+                JOIN LKP_PHOTO_EVENT e ON de.EVENT_ID = e.SYSTEM_ID
+                WHERE de.EVENT_ID = :event_id AND de.DISABLED = '0' AND e.DISABLED = '0'
+            """
+            cursor.execute(count_query, event_id=event_id)
+            count_result = cursor.fetchone()
+            total_rows = count_result[0] if count_result else 0
+
+            if total_rows == 0:
+                return [], 0, None # No documents found
+
+            # Fetch paginated document details
+            # Order by RTADOCDATE descending, then DOCNUMBER as fallback
+            fetch_query = """
+                SELECT p.DOCNUMBER, p.ABSTRACT, p.AUTHOR, p.RTADOCDATE as DOC_DATE, p.DOCNAME
+                FROM PROFILE p
+                JOIN LKP_EVENT_DOC de ON p.DOCNUMBER = de.DOCNUMBER
+                WHERE de.EVENT_ID = :event_id AND de.DISABLED = '0'
+                ORDER BY p.RTADOCDATE DESC NULLS LAST, p.DOCNUMBER DESC
+                OFFSET :offset ROWS FETCH NEXT :page_size ROWS ONLY
+            """
+            cursor.execute(fetch_query, event_id=event_id, offset=offset, page_size=page_size)
+            rows = cursor.fetchall()
+
+            dst = dms_system_login() # Login to DMS to get media type
+
+            for row in rows:
+                doc_id, abstract, author, doc_date, docname = row
+                media_type = 'image' # Default
+                is_favorite = False # Need user context to determine this, default to false for event view
+
+                if dst:
+                    try:
+                        _, media_type, _ = get_media_info_from_dms(dst, doc_id)
+                         # Could add favorite check here if user_id is passed
+                    except Exception as e:
+                        logging.error(f"Error getting media info for event doc {doc_id}: {e}")
+
+                documents.append({
+                    "doc_id": doc_id,
+                    "title": abstract or "", # Use abstract as title here
+                    "docname": docname or "",
+                    "author": author or "N/A",
+                    "date": doc_date.strftime('%Y-%m-%d %H:%M:%S') if doc_date else "N/A",
+                    "thumbnail_url": f"cache/{doc_id}.jpg", # Assume thumbnail exists for simplicity in this view
+                    "media_type": media_type,
+                    "is_favorite": is_favorite
+                })
+
+            total_pages = math.ceil(total_rows / page_size) if total_rows > 0 else 1
+            return documents, total_pages, None
+
+    except oracledb.Error as e:
+        error_obj, = e.args
+        error_message = f"Oracle error fetching event documents: {error_obj.message}"
+        logging.error(f"{error_message} (Code: {error_obj.code})", exc_info=True)
+        return [], 0, error_message
+    except Exception as e:
+        error_message = f"Unexpected error fetching event documents: {e}"
+        logging.error(error_message, exc_info=True)
+        return [], 0, error_message
+    finally:
+        if conn:
+            conn.close()

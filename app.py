@@ -1,4 +1,5 @@
-from flask import Flask, jsonify, request, Response, send_from_directory, stream_with_context, send_file, session, abort
+from flask import Flask, jsonify, request, Response, send_from_directory, stream_with_context, send_file, session, abort, g
+from flask_gssapi import GSSAPI
 from flask_cors import CORS
 import db_connector
 import api_client
@@ -20,6 +21,7 @@ from datetime import datetime
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 app = Flask(__name__)
+
 app.secret_key = os.getenv('FLASK_SECRET_KEY', 'a_default_secret_key_for_dev') # Added default for dev
 CORS(app, supports_credentials=True, resources={r"/api/*": {"origins": "*"}})
 
@@ -1152,23 +1154,27 @@ def get_favorites_route():
 # --- Events API Routes ---
 @app.route('/api/events', methods=['GET'])
 def get_events_route():
-    # Get pagination and search parameters from query string
+    """Fetches paginated events with associated document thumbnails."""
     page = request.args.get('page', 1, type=int)
     search = request.args.get('search', None, type=str)
-    page_size = 10
+    page_size = request.args.get('pageSize', 20, type=int) # Use pageSize like documents endpoint
 
-    if page < 1:
-        page = 1
+    # Basic validation
+    if page < 1: page = 1
+    if page_size < 1: page_size = 20
+    if page_size > 100: page_size = 100
 
-    logging.debug(f"Fetching events - Page: {page}, Search: '{search}'")
+    logging.debug(f"Fetching events - Page: {page}, PageSize: {page_size}, Search: '{search}'")
 
-    # Call the updated database function
-    events_list, has_more = db_connector.get_events(page=page, page_size=page_size, search=search)
+    # Call the updated database function which now returns events_list and total_pages
+    events_list, total_pages = db_connector.get_events(page=page, page_size=page_size, search=search)
 
-    # Return the structure expected by react-select-async-paginate
+    # Return the structure similar to the /documents endpoint
     return jsonify({
         "events": events_list,
-        "hasMore": has_more
+        "page": page,
+        "total_pages": total_pages,
+        # "total_events": total_rows # You might need to adjust get_events to also return total_rows if needed separately
     })
 
 @app.route('/api/events', methods=['POST'])
@@ -1183,7 +1189,42 @@ def create_event_route():
     else:
         return jsonify({"error": message}), 400
 
-# ... (rest of the file)
+@app.route('/api/events/<int:event_id>/documents', methods=['GET'])
+def get_event_documents_route(event_id):
+    """Fetches paginated documents associated with a specific event."""
+    page = request.args.get('page', 1, type=int)
+    # Use a page size of 1 for the slider modal
+    page_size = 1 # Fetch one document at a time for the modal slider
+
+    if page < 1: page = 1
+
+    logging.debug(f"Fetching documents for Event ID: {event_id} - Page: {page}")
+
+    documents, total_pages, error_message = db_connector.get_documents_for_event(
+        event_id=event_id,
+        page=page,
+        page_size=page_size
+    )
+
+    if error_message:
+        # Determine appropriate status code based on error message if needed
+        status_code = 500 # Default to internal server error
+        if "not found" in error_message.lower():
+             status_code = 404
+        return jsonify({"error": error_message}), status_code
+
+    # The function now returns a list (usually with one item due to page_size=1)
+    # Return the first document if available, or null
+    current_doc = documents[0] if documents else None
+
+    return jsonify({
+        "document": current_doc, # Send the single document object for the current page
+        "page": page,
+        "total_pages": total_pages,
+        # Optionally, include total_documents count if needed by frontend
+        # "total_documents": total_rows # Need get_documents_for_event to return total_rows too
+    })
+
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     logging.info(f"Starting server on host 0.0.0.0 port {port}")
