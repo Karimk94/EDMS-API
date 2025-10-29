@@ -2274,7 +2274,7 @@ def link_document_to_event(doc_id, event_id):
             # If event_id is provided, check if it exists and is enabled
             if event_id is not None:
                 logging.info(f"Checking existence for EVENT_ID = {event_id}")
-                cursor.execute("SELECT 1 FROM LKP_PHOTO_EVENT WHERE SYSTEM_ID = :1 AND DISABLED = '0'", [event_id])
+                cursor.execute("SELECT 1 FROM LKP_PHOTO_EVENT WHERE SYSTEM_ID = :1", [event_id])
                 event_exists = cursor.fetchone() is not None
                 if not event_exists:
                     logging.warning(f"Event check failed: EVENT_ID = {event_id} not found or disabled.")
