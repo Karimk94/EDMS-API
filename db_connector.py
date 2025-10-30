@@ -2537,3 +2537,88 @@ def fetch_journey_data():
             conn.close()
 
     return journey_data
+
+def get_user_details(username):
+    """Fetches user details including security level and language preference."""
+    conn = get_connection()
+    if not conn:
+        return None
+
+    user_details = None
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT SYSTEM_ID FROM PEOPLE WHERE UPPER(USER_ID) = UPPER(:username)", username=username)
+            user_result = cursor.fetchone()
+
+            if user_result:
+                user_id = user_result[0]
+
+                query = """
+                    SELECT sl.NAME, us.LANG
+                    FROM LKP_EDMS_USR_SECUR us
+                    JOIN LKP_EDMS_SECURITY sl ON us.SECURITY_LEVEL_ID = sl.SYSTEM_ID
+                    WHERE us.USER_ID = :user_id
+                """
+                cursor.execute(query, user_id=user_id)
+                details_result = cursor.fetchone()
+
+                if details_result:
+                    security_level, lang = details_result
+                    user_details = {
+                        'username': username,
+                        'security_level': security_level,
+                        'lang': lang or 'en'
+                    }
+                else:
+                    logging.warning(f"No security details found for user_id {user_id} (DMS user: {username})")
+            else:
+                logging.warning(f"No PEOPLE record found for DMS user: {username}")
+
+    except oracledb.Error as e:
+        logging.error(f"Oracle Database error in get_user_details for {username}: {e}", exc_info=True)
+    finally:
+        if conn:
+            conn.close()
+
+    return user_details
+
+def update_user_language(username, lang):
+    """Updates the language preference for a user."""
+    conn = get_connection()
+    if not conn:
+        return False
+
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT SYSTEM_ID FROM PEOPLE WHERE UPPER(USER_ID) = UPPER(:username)", username=username)
+            user_result = cursor.fetchone()
+
+            if not user_result:
+                logging.error(f"Cannot update language. User '{username}' not found in PEOPLE table.")
+                return False
+
+            user_id = user_result[0]
+
+            # Update the LANG in the security table
+            update_query = """
+                UPDATE LKP_EDMS_USR_SECUR
+                SET LANG = :lang
+                WHERE USER_ID = :user_id
+            """
+            cursor.execute(update_query, lang=lang, user_id=user_id)
+
+            if cursor.rowcount == 0:
+                logging.warning(f"No rows updated for user '{username}' (user_id: {user_id}). They may not have a security record.")
+                return False
+
+            conn.commit()
+            logging.info(f"Successfully updated language to '{lang}' for user '{username}'.")
+            return True
+
+    except oracledb.Error as e:
+        logging.error(f"Oracle Database error in update_user_language for {username}: {e}", exc_info=True)
+        conn.rollback()
+        return False
+    finally:
+        if conn:
+            conn.close()

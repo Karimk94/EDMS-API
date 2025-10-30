@@ -105,12 +105,33 @@ def logout():
 
 @app.route('/api/auth/user', methods=['GET'])
 def get_user():
-    user = session.get('user')
-    if user:
-        return jsonify({'user': user}), 200
+    user_session = session.get('user')
+    if user_session:
+        user_details = db_connector.get_user_details(user_session['username'])
+        return jsonify({'user': user_details}), 200
     else:
-        # Return an error if no user is in the session
         return jsonify({'error': 'Not authenticated'}), 401
+
+@app.route('/api/user/language', methods=['PUT'])
+def update_user_language():
+    if 'user' not in session:
+        return jsonify({"error": "Unauthorized"}), 401
+
+    data = request.get_json()
+    lang = data.get('lang')
+
+    if lang not in ['en', 'ar']:
+        return jsonify({"error": "Invalid language"}), 400
+
+    success = db_connector.update_user_language(session['user']['username'], lang)
+
+    if success:
+        user_session = session['user']
+        user_session['lang'] = lang
+        session['user'] = user_session
+        return jsonify({"message": "Language updated"}), 200
+    else:
+        return jsonify({"error": "Failed to update language"}), 500
 
 # --- AI Processing Routes ---
 def process_document(doc, dms_session_token):
