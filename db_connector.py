@@ -1209,7 +1209,7 @@ def get_dashboard_counts():
         return {
             "total_employees": 0,
             "active_employees": 0,
-            "judicial_warrants": 0,
+            "inactive_employees": 0,
             "expiring_soon": 0,
         }
 
@@ -1231,13 +1231,12 @@ def get_dashboard_counts():
 
             # Judicial Warrants
             cursor.execute("""
-                SELECT COUNT(DISTINCT arch.SYSTEM_ID)
+               SELECT COUNT(*)
                 FROM LKP_PTA_EMP_ARCH arch
-                JOIN LKP_PTA_EMP_DOCS doc ON arch.SYSTEM_ID = doc.PTA_EMP_ARCH_ID
-                JOIN LKP_PTA_DOC_TYPES dt ON doc.DOC_TYPE_ID = dt.SYSTEM_ID
-                WHERE (TRIM(dt.NAME) LIKE '%Warrant Decisions%' OR TRIM(dt.NAME) LIKE '%القرارات الخاصة بالضبطية%') AND doc.DISABLED = '0'
+                JOIN LKP_PTA_EMP_STATUS stat ON arch.STATUS_ID = stat.SYSTEM_ID
+                WHERE TRIM(stat.NAME_ENGLISH) = 'Inactive'
             """)
-            counts["judicial_warrants"] = cursor.fetchone()[0]
+            counts["inactive_employees"] = cursor.fetchone()[0]
 
             # Expiring Soon (in the next 30 days)
             cursor.execute("""
@@ -2568,6 +2567,49 @@ def get_user_details(username):
                         'username': username,
                         'security_level': security_level,
                         'lang': lang or 'en'
+                    }
+                else:
+                    logging.warning(f"No security details found for user_id {user_id} (DMS user: {username})")
+            else:
+                logging.warning(f"No PEOPLE record found for DMS user: {username}")
+
+    except oracledb.Error as e:
+        logging.error(f"Oracle Database error in get_user_details for {username}: {e}", exc_info=True)
+    finally:
+        if conn:
+            conn.close()
+
+    return user_details
+
+def get_pta_user_details(username):
+    """Fetches user details including security level and language preference."""
+    conn = get_connection()
+    if not conn:
+        return None
+
+    user_details = None
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT SYSTEM_ID FROM PEOPLE WHERE UPPER(USER_ID) = UPPER(:username)", username=username)
+            user_result = cursor.fetchone()
+
+            if user_result:
+                user_id = user_result[0]
+
+                query = """
+                    SELECT sl.NAME
+                    FROM LKP_PTA_USR_SECUR us
+                    JOIN LKP_PTA_SECURITY sl ON us.SECURITY_LEVEL_ID = sl.SYSTEM_ID
+                    WHERE us.USER_ID = :user_id
+                """
+                cursor.execute(query, user_id=user_id)
+                details_result = cursor.fetchone()
+
+                if details_result:
+                    security_level = details_result
+                    user_details = {
+                        'username': username,
+                        'security_level': security_level,
                     }
                 else:
                     logging.warning(f"No security details found for user_id {user_id} (DMS user: {username})")

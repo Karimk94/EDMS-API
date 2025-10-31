@@ -111,6 +111,15 @@ def get_user():
         return jsonify({'user': user_details}), 200
     else:
         return jsonify({'error': 'Not authenticated'}), 401
+    
+@app.route('/api/auth/pta-user', methods=['GET'])
+def get_pta_user():
+    user_session = session.get('user')
+    if user_session:
+        user_details = db_connector.get_pta_user_details(user_session['username'])
+        return jsonify({'user': user_details}), 200
+    else:
+        return jsonify({'error': 'Not authenticated'}), 401
 
 @app.route('/api/user/language', methods=['PUT'])
 def update_user_language():
