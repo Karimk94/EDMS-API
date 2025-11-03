@@ -858,13 +858,15 @@ def api_get_persons():
 @app.route('/api/tags')
 def api_get_tags():
     """Fetches all unique tags (keywords and persons) for the filter dropdown."""
-    tags = db_connector.fetch_all_tags()
+    lang = request.args.get('lang', 'en', type=str)
+    tags = db_connector.fetch_all_tags(lang=lang)
     return jsonify(tags)
 
 @app.route('/api/tags/<int:doc_id>')
 def api_get_tags_for_document(doc_id):
     """Fetches all tags for a specific document ID."""
-    tags = db_connector.fetch_tags_for_document(doc_id)
+    lang = request.args.get('lang', 'en', type=str)
+    tags = db_connector.fetch_tags_for_document(doc_id, lang=lang)
     return jsonify({"tags": tags})
 
 @app.route('/api/processing_status', methods=['POST'])

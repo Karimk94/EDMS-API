@@ -847,21 +847,25 @@ def fetch_lkp_persons(page=1, page_size=20, search=''):
             conn.close()
     return persons, total_rows
 
-def fetch_all_tags():
-    """Fetches all unique keywords and person names to be used as tags."""
+def fetch_all_tags(lang='en'):
+    """Fetches all unique keywords and person names to be used as tags, based on language."""
     conn = get_connection()
     if not conn: return []
 
     tags = set()
     try:
         with conn.cursor() as cursor:
+            keyword_column = "k.DESCRIPTION" if lang == 'ar' else "k.KEYWORD_ID"
+            person_column = "p.NAME_ARABIC" if lang == 'ar' else "p.NAME_ENGLISH"
+
             cursor.execute(
-                "SELECT KEYWORD_ID FROM KEYWORD k JOIN LKP_DOCUMENT_TAGS ldt ON ldt.TAG_ID = k.SYSTEM_ID")
+                f"SELECT {keyword_column} FROM KEYWORD k JOIN LKP_DOCUMENT_TAGS ldt ON ldt.TAG_ID = k.SYSTEM_ID WHERE {keyword_column} IS NOT NULL"
+            )
             for row in cursor:
                 if row[0]:
                     tags.add(row[0].strip())
 
-            cursor.execute("SELECT NAME_ENGLISH FROM LKP_PERSON")
+            cursor.execute(f"SELECT {person_column} FROM LKP_PERSON p WHERE {person_column} IS NOT NULL")
             for row in cursor:
                 if row[0]:
                     tags.add(row[0].strip())
@@ -873,8 +877,8 @@ def fetch_all_tags():
 
     return sorted(list(tags))
 
-def fetch_tags_for_document(doc_id):
-    """Fetches all keyword and person tags for a single document."""
+def fetch_tags_for_document(doc_id, lang='en'):
+    """Fetches all keyword and person tags for a single document, based on language."""
     conn = get_connection()
     if not conn:
         return []
@@ -886,11 +890,15 @@ def fetch_tags_for_document(doc_id):
             result = cursor.fetchone()
             abstract = result[0] if result else None
 
-            tag_query = """
-                SELECT k.KEYWORD_ID
+            # Determine which columns to select based on language
+            keyword_column = "k.DESCRIPTION" if lang == 'ar' else "k.KEYWORD_ID"
+            person_column = "p.NAME_ARABIC" if lang == 'ar' else "p.NAME_ENGLISH"
+
+            tag_query = f"""
+                SELECT {keyword_column}
                 FROM LKP_DOCUMENT_TAGS ldt
                 JOIN KEYWORD k ON ldt.TAG_ID = k.SYSTEM_ID
-                WHERE ldt.DOCNUMBER = :doc_id
+                WHERE ldt.DOCNUMBER = :doc_id AND {keyword_column} IS NOT NULL
             """
             cursor.execute(tag_query, {'doc_id': doc_id})
             for tag_row in cursor:
@@ -898,10 +906,10 @@ def fetch_tags_for_document(doc_id):
                     doc_tags.add(tag_row[0])
 
             if abstract:
-                person_query = """
-                    SELECT NAME_ENGLISH
-                    FROM LKP_PERSON
-                    WHERE :abstract LIKE '%' || UPPER(NAME_ENGLISH) || '%'
+                person_query = f"""
+                    SELECT {person_column}
+                    FROM LKP_PERSON p
+                    WHERE :abstract LIKE '%' || UPPER(NAME_ENGLISH) || '%' AND {person_column} IS NOT NULL
                 """
                 cursor.execute(person_query, {'abstract': abstract.upper()})
                 for person_row in cursor:
