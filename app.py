@@ -838,7 +838,18 @@ def api_add_person():
     username = session.get('user', {}).get('username', 'Unknown user')
     logging.info(f"User '{username}' adding person: {name}")
 
-    success, message = db_connector.add_person_to_lkp(name.strip())
+    try:
+        name_english = name.strip()
+        # Translate the name using the same client as tags
+        name_arabic = api_client.translate_text(name_english)
+        if not name_arabic:
+            logging.warning(f"Could not translate name '{name_english}' to Arabic. Storing as NULL.")
+            name_arabic = None
+    except Exception as e:
+        logging.error(f"Error during translation for person '{name}': {e}")
+        name_arabic = None # Store NULL on translation error
+
+    success, message = db_connector.add_person_to_lkp(name_english, name_arabic)
     if success:
         return jsonify({'message': message})
     else:

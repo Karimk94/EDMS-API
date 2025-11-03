@@ -797,23 +797,23 @@ def update_abstract_with_vips(doc_id, vip_names):
         if conn:
             conn.close()
 
-def add_person_to_lkp(person_name):
+def add_person_to_lkp(person_name_english, person_name_arabic=None):
     """Adds a new person to the LKP_PERSON lookup table."""
     conn = get_connection()
     if not conn: return False, "Could not connect to the database."
     try:
         with conn.cursor() as cursor:
-            cursor.execute("SELECT COUNT(SYSTEM_ID) FROM LKP_PERSON WHERE NAME_ENGLISH = :1", [person_name])
+            cursor.execute("SELECT COUNT(SYSTEM_ID) FROM LKP_PERSON WHERE NAME_ENGLISH = :1", [person_name_english])
             if cursor.fetchone()[0] > 0:
-                return True, f"'{person_name}' already exists in LKP_PERSON."
+                return True, f"'{person_name_english}' already exists in LKP_PERSON."
 
             insert_query = """
-                INSERT INTO LKP_PERSON (NAME_ENGLISH, LAST_UPDATE, DISABLED, SYSTEM_ID)
-                VALUES (:1, SYSDATE, 0, (SELECT NVL(MAX(SYSTEM_ID), 0) + 1 FROM LKP_PERSON))
+                INSERT INTO LKP_PERSON (NAME_ENGLISH, NAME_ARABIC, LAST_UPDATE, DISABLED, SYSTEM_ID)
+                VALUES (:1, :2, SYSDATE, 0, (SELECT NVL(MAX(SYSTEM_ID), 0) + 1 FROM LKP_PERSON))
             """
-            cursor.execute(insert_query, [person_name])
+            cursor.execute(insert_query, [person_name_english, person_name_arabic])
             conn.commit()
-            return True, f"Successfully added '{person_name}' to LKP_PERSON."
+            return True, f"Successfully added '{person_name_english}' to LKP_PERSON."
     except oracledb.Error as e:
         return False, f"Database error: {e}"
     finally:
