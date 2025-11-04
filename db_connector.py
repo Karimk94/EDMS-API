@@ -530,26 +530,59 @@ def fetch_documents_from_oracle(page=1, page_size=20, search_term=None, date_fro
             logging.error(f"Invalid memory date parameters provided: {e}")
             memory_month = None 
 
-    if memory_month is None: # Apply standard filters only if not fetching memories
+    if memory_month is None:
+        
         if search_term:
-            words = [word for word in re.findall(r'\b\w+\b', search_term.upper()) if word]
-            if words:
-                search_conditions = []
-                for i, word in enumerate(words):
-                    key = f"search_word_{i}"
-                    search_conditions.append(f"(UPPER(p.ABSTRACT) LIKE :{key} OR UPPER(p.DOCNAME) LIKE :{key})")
-                    params[key] = f"%{word}%"
-                where_clauses.append(" AND ".join(search_conditions))
+            key = "search_term"
+            key_upper = "search_term_upper"
+            
+            params[key] = f"%{search_term}%"
+            params[key_upper] = f"%{search_term.upper()}%"
+            
+            base_search = f"""
+            (
+                p.ABSTRACT LIKE :{key} OR UPPER(p.ABSTRACT) LIKE :{key_upper} OR
+                p.DOCNAME LIKE :{key} OR UPPER(p.DOCNAME) LIKE :{key_upper}
+            )
+            """
+            
+            search_conditions = [base_search] 
+
+            if lang == 'ar':
+                keyword_subquery = f"""
+                EXISTS (
+                    SELECT 1 FROM LKP_DOCUMENT_TAGS ldt
+                    JOIN KEYWORD k ON ldt.TAG_ID = k.SYSTEM_ID
+                    WHERE ldt.DOCNUMBER = p.DOCNUMBER AND k.DESCRIPTION LIKE :{key} AND ldt.DISABLED = '0'
+                )
+                """
+                search_conditions.append(keyword_subquery)
+                
+                person_subquery = f"""
+                EXISTS (
+                    SELECT 1 FROM LKP_PERSON p_filter
+                    WHERE p_filter.NAME_ARABIC LIKE :{key}
+                    AND (
+                         UPPER(p.ABSTRACT) LIKE '%' || UPPER(p_filter.NAME_ENGLISH) || '%'
+                         OR (p_filter.NAME_ARABIC IS NOT NULL AND p.ABSTRACT LIKE '%' || p_filter.NAME_ARABIC || '%')
+                    )
+                )
+                """
+                search_conditions.append(person_subquery)
+            
+            where_clauses.append(f"({ ' OR '.join(search_conditions) })")
 
         if persons:
-            person_list = [p.strip().upper() for p in persons.split(',') if p.strip()]
+            person_list = [p.strip() for p in persons.split(',') if p.strip()]
             if person_list:
                 op = " OR " if person_condition == 'any' else " AND "
                 person_conditions = []
                 for i, person in enumerate(person_list):
                     key = f'person_{i}'
-                    person_conditions.append(f"UPPER(p.ABSTRACT) LIKE :{key}")
+                    key_upper = f'person_{i}_upper'
+                    person_conditions.append(f"(p.ABSTRACT LIKE :{key} OR UPPER(p.ABSTRACT) LIKE :{key_upper})")
                     params[key] = f"%{person}%"
+                    params[key_upper] = f"%{person.upper()}%"
                 where_clauses.append(f"({op.join(person_conditions)})")
 
         if date_from:
@@ -585,7 +618,7 @@ def fetch_documents_from_oracle(page=1, page_size=20, search_term=None, date_fro
 
 
         if tags:
-            tag_list = [t.strip().upper() for t in tags.split(',') if t.strip()]
+            tag_list = [t.strip() for t in tags.split(',') if t.strip()]
             if tag_list:
                 tag_conditions = []
                 keyword_column = "DESCRIPTION" if lang == 'ar' else "KEYWORD_ID"
@@ -593,55 +626,65 @@ def fetch_documents_from_oracle(page=1, page_size=20, search_term=None, date_fro
 
                 for i, tag in enumerate(tag_list):
                     key = f'tag_{i}'
-                    
+                    key_upper = f'tag_{i}_upper'
+                    params[key] = tag
+                    params[key_upper] = tag.upper()
+
+                    if lang == 'ar':
+                        keyword_compare = f"k.{keyword_column} = :{key}"
+                    else:
+                        keyword_compare = f"UPPER(k.{keyword_column}) = :{key_upper}"
+
                     keyword_subquery = f"""
                     EXISTS (
                         SELECT 1 FROM LKP_DOCUMENT_TAGS ldt
                         JOIN KEYWORD k ON ldt.TAG_ID = k.SYSTEM_ID
-                        WHERE ldt.DOCNUMBER = p.DOCNUMBER AND UPPER(k.{keyword_column}) = :{key} AND ldt.DISABLED = '0'
+                        WHERE ldt.DOCNUMBER = p.DOCNUMBER AND {keyword_compare} AND ldt.DISABLED = '0'
                     )
                     """
+                    
+                    if lang == 'ar':
+                        person_compare = f"p_filter.{person_filter_column} = :{key}"
+                    else:
+                        person_compare = f"UPPER(p_filter.{person_filter_column}) = :{key_upper}"
                     
                     person_subquery = f"""
                     EXISTS (
                         SELECT 1 FROM LKP_PERSON p_filter
-                        WHERE UPPER(p_filter.{person_filter_column}) = :{key}
-                        AND UPPER(p.ABSTRACT) LIKE '%' || UPPER(p_filter.NAME_ENGLISH) || '%'
+                        WHERE {person_compare}
+                        AND (
+                             UPPER(p.ABSTRACT) LIKE '%' || UPPER(p_filter.NAME_ENGLISH) || '%'
+                             OR (p_filter.NAME_ARABIC IS NOT NULL AND p.ABSTRACT LIKE '%' || p_filter.NAME_ARABIC || '%')
+                        )
                     )
                     """
                     
                     tag_conditions.append(f"({keyword_subquery} OR {person_subquery})")
-                    params[key] = tag
                 
                 where_clauses.append(" AND ".join(tag_conditions))
 
-    # --- Combine WHERE clauses ---
     final_where_clause = base_where + ("AND " + " AND ".join(where_clauses) if where_clauses else "")
 
     # --- Sorting Logic ---
-    order_by_clause = "ORDER BY p.DOCNUMBER DESC" # Default
+    order_by_clause = "ORDER BY p.DOCNUMBER DESC"
     if memory_month is not None:
-        # Default sort for memories view (uses RTADOCDATE)
         order_by_clause = "ORDER BY p.RTADOCDATE DESC, p.DOCNUMBER DESC"
-        if sort == 'rtadocdate_asc': # Allow explicit sort for memories too
+        if sort == 'rtadocdate_asc': 
             order_by_clause = "ORDER BY p.RTADOCDATE ASC, p.DOCNUMBER ASC"
     else:
         if sort == 'date_desc':
             order_by_clause = "ORDER BY p.RTADOCDATE DESC, p.DOCNUMBER DESC"
         elif sort == 'date_asc':
             order_by_clause = "ORDER BY p.RTADOCDATE ASC, p.DOCNUMBER ASC"
-        # Add other standard sort options if needed
 
     try:
         with conn.cursor() as cursor:
-            # Count total matching rows
             count_query = f"SELECT COUNT(p.DOCNUMBER) FROM PROFILE p {final_where_clause}"
             logging.debug(f"Count Query: {count_query}")
             logging.debug(f"Count Params: {params}")
             cursor.execute(count_query, params)
             total_rows = cursor.fetchone()[0]
 
-            # Fetch paginated data - select RTADOCDATE if fetching memories
             date_column = "p.RTADOCDATE" if memory_month is not None else "p.RTADOCDATE"
             fetch_query = f"""
             SELECT p.DOCNUMBER, p.ABSTRACT, p.AUTHOR, {date_column} as DOC_DATE, p.DOCNAME,
@@ -667,8 +710,8 @@ def fetch_documents_from_oracle(page=1, page_size=20, search_term=None, date_fro
             for row in rows:
                 doc_id, abstract, author, doc_date, docname, is_favorite = row
                 thumbnail_path = None
-                media_type = 'image' # Default
-                file_ext = '.jpg'   # Default
+                media_type = 'image'
+                file_ext = '.jpg'
 
                 try:
                     original_filename, media_type, file_ext = get_media_info_from_dms(dst, doc_id)
@@ -680,7 +723,6 @@ def fetch_documents_from_oracle(page=1, page_size=20, search_term=None, date_fro
                     else:
                         media_bytes = get_media_content_from_dms(dst, doc_id)
                         if media_bytes:
-                            # Pass correct media type to thumbnail creator
                             thumbnail_path = create_thumbnail(doc_id, media_type, file_ext, media_bytes)
                         else:
                              logging.warning(f"Could not retrieve media content for doc {doc_id} to create thumbnail.")
@@ -694,8 +736,7 @@ def fetch_documents_from_oracle(page=1, page_size=20, search_term=None, date_fro
                     "title": abstract or "",
                     "docname": docname or "",
                     "author": author or "N/A",
-                    # Format the correct date based on which one was selected
-                    "date": doc_date.strftime('%Y-%m-%d %H:%M:%S') if doc_date else "N/A",
+                    "date": doc_date.strftime('%Y-m-%d %H:%M:%S') if doc_date else "N/A",
                     "thumbnail_url": thumbnail_path or "",
                     "media_type": media_type,
                     "is_favorite": bool(is_favorite)
