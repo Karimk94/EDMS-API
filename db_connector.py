@@ -628,11 +628,11 @@ def fetch_documents_from_oracle(page=1, page_size=20, search_term=None, date_fro
                     key = f'tag_{i}'
                     key_upper = f'tag_{i}_upper'
                     params[key] = tag
-                    params[key_upper] = tag.upper()
 
                     if lang == 'ar':
                         keyword_compare = f"k.{keyword_column} = :{key}"
                     else:
+                        params[key_upper] = tag.upper()
                         keyword_compare = f"UPPER(k.{keyword_column}) = :{key_upper}"
 
                     keyword_subquery = f"""
