@@ -621,7 +621,6 @@ def clean_repeated_words(text):
 def api_get_documents():
     """Handles fetching documents for the frontend viewer, including full memory view."""
     try:
-        # Get user from session to pass to the database function
         user = session.get('user')
         username = user.get('username') if user else None
 
@@ -635,6 +634,7 @@ def api_get_documents():
         tags = request.args.get('tags', None, type=str)
         years = request.args.get('years', None, type=str)
         sort = request.args.get('sort', None, type=str)
+        lang = request.args.get('lang', 'en', type=str)
 
         # Check for memory-specific parameters
         memory_month = request.args.get('memoryMonth', None, type=str)
@@ -657,9 +657,10 @@ def api_get_documents():
             tags=tags,
             years=years,
             sort=sort,
-            memory_month=memory_month, # Pass through
-            memory_day=memory_day,      # Pass through
-            user_id=username          # Pass the username for favorite checking
+            memory_month=memory_month,
+            memory_day=memory_day,
+            user_id=username,
+            lang=lang
         )
 
         total_pages = math.ceil(total_rows / page_size) if total_rows > 0 else 1

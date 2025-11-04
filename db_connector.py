@@ -475,7 +475,7 @@ def check_processing_status(docnumbers):
 
 def fetch_documents_from_oracle(page=1, page_size=20, search_term=None, date_from=None, date_to=None,
                                 persons=None, person_condition='any', tags=None, years=None, sort=None,
-                                memory_month=None, memory_day=None, user_id=None): # Added user_id parameter
+                                memory_month=None, memory_day=None, user_id=None, lang='en'):
     """Fetches a paginated list of documents from Oracle, handling filtering, memories, and thumbnail logic."""
     conn = get_connection()
     if not conn: return [], 0
@@ -495,7 +495,6 @@ def fetch_documents_from_oracle(page=1, page_size=20, search_term=None, date_fro
                     db_user_id = user_result[0]
         except oracledb.Error as e:
             logging.error(f"Could not fetch user system ID for {user_id}: {e}")
-            # Continue without favorite info if this fails
 
     offset = (page - 1) * page_size
     documents = []
@@ -522,7 +521,6 @@ def fetch_documents_from_oracle(page=1, page_size=20, search_term=None, date_fro
                 params['memory_day'] = day_int
             where_clauses.append("EXTRACT(YEAR FROM p.RTADOCDATE) < :current_year")
             params['current_year'] = current_year
-            # Optionally add image filter here too if memories should only be images
             where_clauses.append("""
                 (LOWER(p.DOCNAME) LIKE '%.jpg' OR LOWER(p.DOCNAME) LIKE '%.jpeg' OR LOWER(p.DOCNAME) LIKE '%.png' OR
                  LOWER(p.DOCNAME) LIKE '%.gif' OR LOWER(p.DOCNAME) LIKE '%.bmp')
@@ -590,18 +588,31 @@ def fetch_documents_from_oracle(page=1, page_size=20, search_term=None, date_fro
             tag_list = [t.strip().upper() for t in tags.split(',') if t.strip()]
             if tag_list:
                 tag_conditions = []
+                keyword_column = "DESCRIPTION" if lang == 'ar' else "KEYWORD_ID"
+                person_filter_column = "NAME_ARABIC" if lang == 'ar' else "NAME_ENGLISH"
+
                 for i, tag in enumerate(tag_list):
                     key = f'tag_{i}'
+                    
                     keyword_subquery = f"""
                     EXISTS (
                         SELECT 1 FROM LKP_DOCUMENT_TAGS ldt
                         JOIN KEYWORD k ON ldt.TAG_ID = k.SYSTEM_ID
-                        WHERE ldt.DOCNUMBER = p.DOCNUMBER AND UPPER(k.KEYWORD_ID) = :{key} AND ldt.DISABLED = '0' AND k.DISABLED = '0'
+                        WHERE ldt.DOCNUMBER = p.DOCNUMBER AND UPPER(k.{keyword_column}) = :{key} AND ldt.DISABLED = '0'
                     )
                     """
-                    person_subquery = f"UPPER(p.ABSTRACT) LIKE '%' || :{key} || '%'"
+                    
+                    person_subquery = f"""
+                    EXISTS (
+                        SELECT 1 FROM LKP_PERSON p_filter
+                        WHERE UPPER(p_filter.{person_filter_column}) = :{key}
+                        AND UPPER(p.ABSTRACT) LIKE '%' || UPPER(p_filter.NAME_ENGLISH) || '%'
+                    )
+                    """
+                    
                     tag_conditions.append(f"({keyword_subquery} OR {person_subquery})")
                     params[key] = tag
+                
                 where_clauses.append(" AND ".join(tag_conditions))
 
     # --- Combine WHERE clauses ---
@@ -620,7 +631,6 @@ def fetch_documents_from_oracle(page=1, page_size=20, search_term=None, date_fro
         elif sort == 'date_asc':
             order_by_clause = "ORDER BY p.RTADOCDATE ASC, p.DOCNUMBER ASC"
         # Add other standard sort options if needed
-
 
     try:
         with conn.cursor() as cursor:
