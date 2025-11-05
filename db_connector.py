@@ -736,7 +736,7 @@ def fetch_documents_from_oracle(page=1, page_size=20, search_term=None, date_fro
                     "title": abstract or "",
                     "docname": docname or "",
                     "author": author or "N/A",
-                    "date": doc_date.strftime('%Y-m-%d %H:%M:%S') if doc_date else "N/A",
+                    "date": doc_date.strftime('%Y-%m-%d %H:%M:%S') if doc_date else "N/A",
                     "thumbnail_url": thumbnail_path or "",
                     "media_type": media_type,
                     "is_favorite": bool(is_favorite)
