@@ -482,7 +482,7 @@ def fetch_documents_from_oracle(page=1, page_size=20, search_term=None, date_fro
     if not dst:
         logging.error("Could not log into DMS. Aborting document fetch.")
         return [], 0
-    
+
     db_user_id = None
     if user_id:
         try:
@@ -526,49 +526,40 @@ def fetch_documents_from_oracle(page=1, page_size=20, search_term=None, date_fro
 
         except (ValueError, TypeError) as e:
             logging.error(f"Invalid memory date parameters provided: {e}")
-            memory_month = None 
+            memory_month = None
 
     if memory_month is None:
-        
         if search_term:
-            key = "search_term"
-            key_upper = "search_term_upper"
-            
-            params[key] = f"%{search_term}%"
-            params[key_upper] = f"%{search_term.upper()}%"
-            
-            base_search = f"""
-            (
-                p.ABSTRACT LIKE :{key} OR UPPER(p.ABSTRACT) LIKE :{key_upper} OR
-                p.DOCNAME LIKE :{key} OR UPPER(p.DOCNAME) LIKE :{key_upper}
-            )
-            """
-            
-            search_conditions = [base_search] 
+            search_words = [word.strip() for word in search_term.split(' ') if word.strip()]
+            if search_words:
+                word_conditions = []
+                for i, word in enumerate(search_words):
+                    key = f"search_word_{i}"
+                    key_upper = f"search_word_{i}_upper"
+                    params[key] = f"%{word}%"
+                    params[key_upper] = f"%{word.upper()}%"
 
-            if lang == 'ar':
-                keyword_subquery = f"""
-                EXISTS (
-                    SELECT 1 FROM LKP_DOCUMENT_TAGS ldt
-                    JOIN KEYWORD k ON ldt.TAG_ID = k.SYSTEM_ID
-                    WHERE ldt.DOCNUMBER = p.DOCNUMBER AND k.DESCRIPTION LIKE :{key} AND ldt.DISABLED = '0'
-                )
-                """
-                search_conditions.append(keyword_subquery)
-                
-                person_subquery = f"""
-                EXISTS (
-                    SELECT 1 FROM LKP_PERSON p_filter
-                    WHERE p_filter.NAME_ARABIC LIKE :{key}
-                    AND (
-                         UPPER(p.ABSTRACT) LIKE '%' || UPPER(p_filter.NAME_ENGLISH) || '%'
-                         OR (p_filter.NAME_ARABIC IS NOT NULL AND p.ABSTRACT LIKE '%' || p_filter.NAME_ARABIC || '%')
+                    word_condition = f"""
+                    (
+                        p.ABSTRACT LIKE :{key} OR UPPER(p.ABSTRACT) LIKE :{key_upper} OR
+                        p.DOCNAME LIKE :{key} OR UPPER(p.DOCNAME) LIKE :{key_upper} OR
+                        EXISTS (
+                            SELECT 1 FROM LKP_DOCUMENT_TAGS ldt
+                            JOIN KEYWORD k ON ldt.TAG_ID = k.SYSTEM_ID
+                            WHERE ldt.DOCNUMBER = p.DOCNUMBER AND (k.DESCRIPTION LIKE :{key} OR UPPER(k.KEYWORD_ID) LIKE :{key_upper}) AND ldt.DISABLED = '0'
+                        ) OR
+                        EXISTS (
+                            SELECT 1 FROM LKP_PERSON p_filter
+                            WHERE (p_filter.NAME_ARABIC LIKE :{key} OR UPPER(p_filter.NAME_ENGLISH) LIKE :{key_upper})
+                            AND (
+                                 UPPER(p.ABSTRACT) LIKE '%' || UPPER(p_filter.NAME_ENGLISH) || '%'
+                                 OR (p_filter.NAME_ARABIC IS NOT NULL AND p.ABSTRACT LIKE '%' || p_filter.NAME_ARABIC || '%')
+                            )
+                        )
                     )
-                )
-                """
-                search_conditions.append(person_subquery)
-            
-            where_clauses.append(f"({ ' OR '.join(search_conditions) })")
+                    """
+                    word_conditions.append(word_condition)
+                where_clauses.append(f"({ ' AND '.join(word_conditions) })")
 
         if persons:
             person_list = [p.strip() for p in persons.split(',') if p.strip()]
@@ -640,12 +631,12 @@ def fetch_documents_from_oracle(page=1, page_size=20, search_term=None, date_fro
                         WHERE ldt.DOCNUMBER = p.DOCNUMBER AND {keyword_compare} AND ldt.DISABLED = '0'
                     )
                     """
-                    
+
                     if lang == 'ar':
                         person_compare = f"p_filter.{person_filter_column} = :{key}"
                     else:
                         person_compare = f"UPPER(p_filter.{person_filter_column}) = :{key_upper}"
-                    
+
                     person_subquery = f"""
                     EXISTS (
                         SELECT 1 FROM LKP_PERSON p_filter
@@ -656,9 +647,9 @@ def fetch_documents_from_oracle(page=1, page_size=20, search_term=None, date_fro
                         )
                     )
                     """
-                    
+
                     tag_conditions.append(f"({keyword_subquery} OR {person_subquery})")
-                
+
                 where_clauses.append(" AND ".join(tag_conditions))
 
     final_where_clause = base_where + ("AND " + " AND ".join(where_clauses) if where_clauses else "")
@@ -667,7 +658,7 @@ def fetch_documents_from_oracle(page=1, page_size=20, search_term=None, date_fro
     order_by_clause = "ORDER BY p.DOCNUMBER DESC"
     if memory_month is not None:
         order_by_clause = "ORDER BY p.RTADOCDATE DESC, p.DOCNUMBER DESC"
-        if sort == 'rtadocdate_asc': 
+        if sort == 'rtadocdate_asc':
             order_by_clause = "ORDER BY p.RTADOCDATE ASC, p.DOCNUMBER ASC"
     else:
         if sort == 'date_desc':
