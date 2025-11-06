@@ -75,7 +75,6 @@ def get_exif_date(image_stream):
     return None
 
 # --- DMS Communication ---
-
 def dms_system_login():
     """Logs into the DMS SOAP service using system credentials from .env and returns a session token (DST)."""
     return wsdl_client.dms_system_login()
@@ -188,7 +187,6 @@ def get_dms_stream_details(dst, doc_number):
     return wsdl_client.get_dms_stream_details(dst, doc_number)
 
 # --- Caching, Streaming, and Thumbnail Logic ---
-
 def stream_and_cache_generator(obj_client, stream_id, content_id, final_cache_path):
     """
     A generator that streams data from DMS, yields it for the user,
@@ -823,7 +821,7 @@ def update_document_processing_status(docnumber, new_abstract, o_detected, ocr, 
             conn.close()
 
 def update_abstract_with_vips(doc_id, vip_names):
-    """Appends VIP names to a document's abstract."""
+    """Appends or updates VIP names in a document's abstract."""
     conn = get_connection()
     if not conn: return False, "Could not connect to the database."
     try:
@@ -831,14 +829,20 @@ def update_abstract_with_vips(doc_id, vip_names):
             cursor.execute("SELECT ABSTRACT FROM PROFILE WHERE DOCNUMBER = :1", [doc_id])
             result = cursor.fetchone()
             if result is None: return False, f"Document with ID {doc_id} not found."
+            
             current_abstract = result[0] or ""
 
-            if "VIPs :" in current_abstract:
-                return True, "Abstract already contains VIPs section."
+            base_abstract = re.sub(r'\s*\n*VIPs\s*:.*', '', current_abstract, flags=re.IGNORECASE).strip()
 
-            names_str = ", ".join(vip_names)
-            vips_section = f" VIPs : {names_str}"
-            new_abstract = current_abstract + (" " if current_abstract else "") + vips_section
+            names_str = ", ".join(sorted(list(set(vip_names))))
+            
+            if names_str:
+                vips_section = f"VIPs: {names_str}"
+                
+                new_abstract = base_abstract + ("\n\n" if base_abstract else "") + vips_section
+            else:
+                new_abstract = base_abstract
+
             cursor.execute("UPDATE PROFILE SET ABSTRACT = :1 WHERE DOCNUMBER = :2", [new_abstract, doc_id])
             conn.commit()
             return True, "Abstract updated successfully."
@@ -871,7 +875,7 @@ def add_person_to_lkp(person_name_english, person_name_arabic=None):
         if conn:
             conn.close()
 
-def fetch_lkp_persons(page=1, page_size=20, search=''):
+def fetch_lkp_persons(page=1, page_size=20, search='', lang='en'):
     """Fetches a paginated list of people from the LKP_PERSON table."""
     conn = get_connection()
     if not conn: return [], 0
@@ -879,17 +883,39 @@ def fetch_lkp_persons(page=1, page_size=20, search=''):
     offset = (page - 1) * page_size
     persons = []
     total_rows = 0
-    search_term = f"%{search.upper()}%"
-    count_query = "SELECT COUNT(SYSTEM_ID) FROM LKP_PERSON WHERE UPPER(NAME_ENGLISH) LIKE :search OR UPPER(NAME_ARABIC) LIKE :search"
-    fetch_query = "SELECT SYSTEM_ID, NAME_ENGLISH, NVL(NAME_ARABIC, '') FROM LKP_PERSON WHERE UPPER(NAME_ENGLISH) LIKE :search OR UPPER(NAME_ARABIC) LIKE :search ORDER BY NAME_ENGLISH OFFSET :offset ROWS FETCH NEXT :page_size ROWS ONLY"
+    
+    search_term_upper = f"%{search.upper()}%"
+    search_term_normal = f"%{search}%"
+    
+    # Search both English and Arabic columns regardless of lang
+    search_clause = "WHERE (UPPER(NAME_ENGLISH) LIKE :search_upper OR NAME_ARABIC LIKE :search_normal)"
+    params = {'search_upper': search_term_upper, 'search_normal': search_term_normal}
+
+    count_query = f"SELECT COUNT(SYSTEM_ID) FROM LKP_PERSON {search_clause}"
+    
+    # Determine sort order
+    order_by_column = "NAME_ENGLISH" if lang == 'en' else "NAME_ARABIC"
+
+    fetch_query = f"""
+        SELECT SYSTEM_ID, NAME_ENGLISH, NVL(NAME_ARABIC, '')
+        FROM LKP_PERSON
+        {search_clause}
+        ORDER BY {order_by_column}
+        OFFSET :offset ROWS FETCH NEXT :page_size ROWS ONLY
+    """
+    
+    params_paginated = params.copy()
+    params_paginated['offset'] = offset
+    params_paginated['page_size'] = page_size
 
     try:
         with conn.cursor() as cursor:
-            cursor.execute(count_query, search=search_term)
+            cursor.execute(count_query, params)
             total_rows = cursor.fetchone()[0]
 
-            cursor.execute(fetch_query, search=search_term, offset=offset, page_size=page_size)
+            cursor.execute(fetch_query, params_paginated)
             for row in cursor:
+                # The frontend will construct the label. Send all data.
                 persons.append({"id": row[0], "name_english": row[1], "name_arabic": row[2]})
     except oracledb.Error as e:
         print(f"❌ Oracle Database error in fetch_lkp_persons: {e}")
@@ -1199,8 +1225,14 @@ def delete_tag_from_document(doc_id, tag):
 
     try:
         with conn.cursor() as cursor:
-            # First, assume the tag is a keyword and try to delete it.
-            cursor.execute("SELECT SYSTEM_ID FROM KEYWORD WHERE KEYWORD_ID = :1", [tag.lower()])
+            # --- 1. Check if the tag is a KEYWORD (English or Arabic) ---
+            # Checks KEYWORD_ID (English, case-insensitive) OR DESCRIPTION (Arabic, case-sensitive)
+            cursor.execute("""
+                SELECT SYSTEM_ID 
+                FROM KEYWORD 
+                WHERE UPPER(KEYWORD_ID) = :tag_upper OR DESCRIPTION = :tag_normal
+            """, tag_upper=tag.upper(), tag_normal=tag)
+            
             keyword_result = cursor.fetchone()
 
             if keyword_result:
@@ -1216,8 +1248,14 @@ def delete_tag_from_document(doc_id, tag):
                     conn.commit()
                     return True, "Tag deleted successfully."
 
-            # If the tag was not found as a keyword or no rows were deleted, check if it's a person.
-            cursor.execute("SELECT NAME_ENGLISH FROM LKP_PERSON WHERE UPPER(NAME_ENGLISH) = :1", [tag.upper()])
+            # --- 2. If not a keyword, check if it's a PERSON (English or Arabic) ---
+            # Checks NAME_ENGLISH (case-insensitive) OR NAME_ARABIC (case-sensitive)
+            cursor.execute("""
+                SELECT NAME_ENGLISH 
+                FROM LKP_PERSON 
+                WHERE UPPER(NAME_ENGLISH) = :tag_upper OR NAME_ARABIC = :tag_normal
+            """, tag_upper=tag.upper(), tag_normal=tag)
+            
             person_result = cursor.fetchone()
 
             if person_result:
@@ -1229,29 +1267,33 @@ def delete_tag_from_document(doc_id, tag):
 
                 current_abstract = abstract_result[0]
                 # Find the VIPs section
-                vips_match = re.search(r'VIPs:\s*(.*)', current_abstract, re.IGNORECASE)
+                vips_match = re.search(r'VIPs\s*:\s*(.*)', current_abstract, re.IGNORECASE)
                 if vips_match:
                     vips_str = vips_match.group(1)
                     vips_list = [name.strip() for name in vips_str.split(',')]
                     
-                    # Remove the person from the list (case-insensitive)
+                    # Remove the person from the list (case-insensitive for both English and Arabic)
+                    # .upper() works for Arabic (returns the same string) and English
                     original_len = len(vips_list)
-                    vips_list = [name for name in vips_list if name.lower() != tag.lower()]
+                    tag_upper = tag.upper()
+                    vips_list = [name for name in vips_list if name.upper() != tag_upper]
 
                     if len(vips_list) < original_len:
                         # Reconstruct the abstract
                         if vips_list:
                             new_vips_str = "VIPs: " + ", ".join(vips_list)
-                            new_abstract = current_abstract.replace(vips_match.group(0), new_vips_str)
+                            # Use regex sub to replace the old vips_match group 0
+                            new_abstract = re.sub(re.escape(vips_match.group(0)), new_vips_str, current_abstract, flags=re.IGNORECASE)
                         else:
                             # If no VIPs are left, remove the entire VIPs line
-                            new_abstract = current_abstract.replace(vips_match.group(0), '').strip()
+                            new_abstract = re.sub(r'\s*\n*VIPs\s*:.*', '', current_abstract, flags=re.IGNORECASE).strip()
 
                         cursor.execute("UPDATE PROFILE SET ABSTRACT = :1 WHERE DOCNUMBER = :2", [new_abstract, doc_id])
                         conn.commit()
                         return True, "Person tag removed from abstract successfully."
 
-            conn.commit()
+            # --- 3. If not found as keyword or person ---
+            conn.commit() 
             return False, f"Tag '{tag}' not found for this document."
 
     except oracledb.Error as e:
@@ -2423,7 +2465,7 @@ def get_event_for_document(doc_id):
                 SELECT e.SYSTEM_ID, e.EVENT_NAME
                 FROM LKP_EVENT_DOC de
                 JOIN LKP_PHOTO_EVENT e ON de.EVENT_ID = e.SYSTEM_ID
-                WHERE de.DOCNUMBER = :doc_id AND de.DISABLED = '0' AND e.DISABLED = '0'
+                WHERE de.DOCNUMBER = :doc_id AND de.DISABLED = '0' AND (e.DISABLED = '0' OR e.DISABLED IS NULL)
             """
             cursor.execute(query, doc_id=doc_id)
             result = cursor.fetchone()

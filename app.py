@@ -833,22 +833,36 @@ def api_add_person():
     """Adds a person to the lookup table."""
     data = request.get_json()
     name = data.get('name')
+    lang = data.get('lang', 'en')
+
     if not name or not isinstance(name, str) or len(name.strip()) < 2:
         return jsonify({'error': 'Invalid data provided. Name must be a string with at least 2 characters.'}), 400
 
     username = session.get('user', {}).get('username', 'Unknown user')
-    logging.info(f"User '{username}' adding person: {name}")
+    logging.info(f"User '{username}' adding person: {name} (lang: {lang})")
 
     try:
-        name_english = name.strip()
-        # Translate the name using the same client as tags
-        name_arabic = api_client.translate_text(name_english)
-        if not name_arabic:
-            logging.warning(f"Could not translate name '{name_english}' to Arabic. Storing as NULL.")
-            name_arabic = None
+        name_english = ""
+        name_arabic = ""
+        
+        is_arabic = (lang == 'ar') or (not name.strip().isascii())
+
+        if is_arabic:
+            name_arabic = name.strip()
+            name_english = api_client.translate_text(name_arabic)
+            if not name_english:
+                 logging.error(f"Failed to add person: Could not get English translation for Arabic name '{name_arabic}'.")
+                 return jsonify({'error': 'Failed to get English translation for Arabic name.'}), 500
+        else:
+            name_english = name.strip()
+            name_arabic = api_client.translate_text(name_english)
+            if not name_arabic:
+                logging.warning(f"Could not translate name '{name_english}' to Arabic. Storing as NULL.")
+                name_arabic = None
+
     except Exception as e:
         logging.error(f"Error during translation for person '{name}': {e}")
-        name_arabic = None # Store NULL on translation error
+        return jsonify({'error': f'Translation service error: {e}'}), 500
 
     success, message = db_connector.add_person_to_lkp(name_english, name_arabic)
     if success:
@@ -861,10 +875,13 @@ def api_get_persons():
     """Fetches people from the lookup table for autocomplete."""
     page = request.args.get('page', 1, type=int)
     search = request.args.get('search', '', type=str)
-    persons, total_rows = db_connector.fetch_lkp_persons(page=page, search=search)
+    lang = request.args.get('lang', 'en', type=str)
+    
+    persons, total_rows = db_connector.fetch_lkp_persons(page=page, search=search, lang=lang)
+    
     return jsonify({
         'options': persons,
-        'hasMore': (page * 20) < total_rows # Assuming page size is 20
+        'hasMore': (page * 20) < total_rows
     })
 
 @app.route('/api/tags')
@@ -897,20 +914,52 @@ def api_processing_status():
 
 @app.route('/api/tags/<int:doc_id>', methods=['POST'])
 def api_add_tag(doc_id):
-    """Adds a new tag to a document."""
+    """Adds a new tag to a document, handling translation."""
     data = request.get_json()
     tag = data.get('tag')
-    if not tag:
-        return jsonify({'error': 'Invalid data provided.'}), 400
+    if not tag or len(tag.strip()) < 2:
+        return jsonify({'error': 'Invalid data provided. Tag must be at least 2 characters.'}), 400
 
     username = session.get('user', {}).get('username', 'Unknown user')
     logging.info(f"User '{username}' adding tag '{tag}' to doc_id {doc_id}")
 
-    success, message = db_connector.add_tag_to_document(doc_id, tag)
-    if success:
-        return jsonify({'message': message})
-    else:
-        return jsonify({'error': message}), 500
+    try:
+        # --- Language Detection & Translation ---
+        # A simple check: if it contains non-ASCII, assume Arabic.
+        is_arabic = not tag.isascii()
+        
+        english_keyword = ""
+        arabic_keyword = ""
+
+        if is_arabic:
+            arabic_keyword = tag
+            english_keyword = api_client.translate_text(tag)
+            if not english_keyword:
+                 logging.warning(f"Could not translate Arabic tag '{tag}' to English.")
+                 return jsonify({'error': 'Failed to get English translation for Arabic tag.'}), 500
+        else:
+            english_keyword = tag
+            arabic_keyword = api_client.translate_text(tag)
+            if not arabic_keyword:
+                 logging.warning(f"Could not translate English tag '{tag}' to Arabic.")
+                 return jsonify({'error': 'Failed to get Arabic translation for English tag.'}), 500
+
+        # --- End Translation ---
+
+        # We now have both versions. Use the correct batch-insertion function.
+        keyword_to_insert = {
+            'english': english_keyword,
+            'arabic': arabic_keyword
+        }
+        
+        # This function is designed to handle duplicates and link the tag.
+        db_connector.insert_keywords_and_tags(doc_id, [keyword_to_insert])
+
+        return jsonify({'message': 'Tag added successfully.'}), 201
+
+    except Exception as e:
+        logging.error(f"Error in api_add_tag for doc {doc_id} with tag '{tag}': {e}", exc_info=True)
+        return jsonify({'error': f'Server error: {e}'}), 500
 
 @app.route('/api/tags/<int:doc_id>/<tag>', methods=['PUT'])
 def api_update_tag(doc_id, tag):
