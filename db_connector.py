@@ -703,7 +703,7 @@ def fetch_documents_from_oracle(page=1, page_size=20, search_term=None, date_fro
             cursor.execute(fetch_query, params_paginated)
 
             rows = cursor.fetchall()
-            logging.info(f"Fetched {len(rows)} rows for page {page}.")
+            # logging.info(f"Fetched {len(rows)} rows for page {page}.")
 
             for row in rows:
                 doc_id, abstract, author, doc_date, docname, is_favorite = row
@@ -811,7 +811,7 @@ def update_document_processing_status(docnumber, new_abstract, o_detected, ocr, 
         logging.error(f"DB_UPDATE_ERROR: Oracle error while updating docnumber {docnumber}: {e}", exc_info=True)
         try:
             conn.rollback()
-            logging.info(f"DB_ROLLBACK: Transaction for docnumber {docnumber} was rolled back.")
+            # logging.info(f"DB_ROLLBACK: Transaction for docnumber {docnumber} was rolled back.")
         except oracledb.Error as rb_e:
             logging.error(f"DB_ROLLBACK_ERROR: Failed to rollback transaction for docnumber {docnumber}: {rb_e}",
                           exc_info=True)
@@ -1111,7 +1111,7 @@ def insert_keywords_and_tags(docnumber, keywords):
                       exc_info=True)
         try:
             conn.rollback()
-            logging.info(f"DB_ROLLBACK: Transaction for docnumber {docnumber} keywords was rolled back.")
+            # logging.info(f"DB_ROLLBACK: Transaction for docnumber {docnumber} keywords was rolled back.")
         except oracledb.Error as rb_e:
             logging.error(
                 f"DB_ROLLBACK_ERROR: Failed to rollback transaction for docnumber {docnumber} keywords: {rb_e}",
@@ -2332,7 +2332,7 @@ def create_event(event_name):
             if result:
                  # Return existing event ID if found
                  existing_event_id = result[0]
-                 logging.info(f"Event '{event_name}' already exists with ID {existing_event_id}.")
+                 # logging.info(f"Event '{event_name}' already exists with ID {existing_event_id}.")
                  return existing_event_id, "Event with this name already exists."
 
             # Get next SYSTEM_ID
@@ -2343,7 +2343,7 @@ def create_event(event_name):
             cursor.execute("INSERT INTO LKP_PHOTO_EVENT (SYSTEM_ID, EVENT_NAME, LAST_UPDATE, DISABLED) VALUES (:1, :2, SYSDATE, 0)",
                            [system_id, event_name.strip()]) # Trim name before insert
             conn.commit()
-            logging.info(f"Event '{event_name}' created successfully with ID {system_id}.")
+            # logging.info(f"Event '{event_name}' created successfully with ID {system_id}.")
             return system_id, "Event created successfully."
     except oracledb.Error as e:
         conn.rollback()
@@ -2363,27 +2363,27 @@ def link_document_to_event(doc_id, event_id):
     try:
         with conn.cursor() as cursor:
             # Check if document exists
-            logging.info(f"Checking existence for DOCNUMBER = {doc_id}")
+            # logging.info(f"Checking existence for DOCNUMBER = {doc_id}")
             cursor.execute("SELECT 1 FROM PROFILE WHERE DOCNUMBER = :1", [doc_id])
             doc_exists = cursor.fetchone() is not None
             if not doc_exists:
                 logging.warning(f"Document check failed: DOCNUMBER = {doc_id} not found.")
                 return False, f"Document with ID {doc_id} not found."
-            logging.info(f"Document check passed for DOCNUMBER = {doc_id}")
+            # logging.info(f"Document check passed for DOCNUMBER = {doc_id}")
 
             # If event_id is provided, check if it exists and is enabled
             if event_id is not None:
-                logging.info(f"Checking existence for EVENT_ID = {event_id}")
+                # logging.info(f"Checking existence for EVENT_ID = {event_id}")
                 cursor.execute("SELECT 1 FROM LKP_PHOTO_EVENT WHERE SYSTEM_ID = :1", [event_id])
                 event_exists = cursor.fetchone() is not None
                 if not event_exists:
                     logging.warning(f"Event check failed: EVENT_ID = {event_id} not found or disabled.")
                     return False, f"Event with ID {event_id} not found or is disabled."
-                logging.info(f"Event check passed for EVENT_ID = {event_id}")
+                # logging.info(f"Event check passed for EVENT_ID = {event_id}")
 
 
             # Use MERGE to insert or update the link
-            logging.info(f"Executing MERGE for DOCNUMBER={doc_id}, EVENT_ID={event_id}")
+            # logging.info(f"Executing MERGE for DOCNUMBER={doc_id}, EVENT_ID={event_id}")
             # --- Revised MERGE statement with standard NULL checks ---
             merge_sql = """
             MERGE INTO LKP_EVENT_DOC de
@@ -2755,7 +2755,7 @@ def update_user_language(username, lang):
                 return False
 
             conn.commit()
-            logging.info(f"Successfully updated language to '{lang}' for user '{username}'.")
+            # logging.info(f"Successfully updated language to '{lang}' for user '{username}'.")
             return True
 
     except oracledb.Error as e:
