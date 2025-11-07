@@ -2,6 +2,27 @@ import requests
 import os
 import io
 import time
+import logging
+
+EMBEDDING_API_URL = os.getenv("EMBEDDING_API_URL")
+
+def get_embedding_from_service(text):
+    """Calls the external embedding service."""
+    if not EMBEDDING_API_URL:
+        logging.error("EMBEDDING_API_URL is not set.")
+        return None
+
+    try:
+        response = requests.post(
+            f"{EMBEDDING_API_URL.rstrip('/')}/embed",
+            json={"text": text},
+            timeout=60
+        )
+        response.raise_for_status()
+        return response.json().get('embedding')
+    except requests.exceptions.RequestException as e:
+        logging.error(f"Failed to get embedding from service: {e}", exc_info=True)
+        return None
 
 def data_chunk_generator(data, chunk_size=262144):
     """Yields chunks of binary data from a BytesIO object."""

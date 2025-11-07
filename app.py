@@ -645,7 +645,6 @@ def api_get_documents():
         if page_size < 1: page_size = 20
         if page_size > 100: page_size = 100
 
-        # Pass memory params and the username to the DB function
         documents, total_rows = db_connector.fetch_documents_from_oracle(
             page=page,
             page_size=page_size,
@@ -679,7 +678,7 @@ def api_get_documents():
 def link_document_event(doc_id):
     # --- ADD THESE LINES ---
     logging.info(f"--- HIT ROUTE: PUT /api/document/{doc_id}/event ---")
-    print(f"--- HIT ROUTE: PUT /api/document/{doc_id}/event ---")
+    # print(f"--- HIT ROUTE: PUT /api/document/{doc_id}/event ---")
     # -----------------------
     data = request.get_json()
     if data is None:
@@ -1131,7 +1130,7 @@ def api_get_memories():
         # Get month from query param, default to current month
         month_str = request.args.get('month')
         month = int(month_str) if month_str and month_str.isdigit() else current_dt.month
-        print(f"month is: {month}")
+        # print(f"month is: {month}")
 
         # Get day from query param, optional
         day_str = request.args.get('day')

@@ -8,12 +8,17 @@ from PIL import Image
 import io
 import shutil
 import logging
-from moviepy import VideoFileClip
+from moviepy.video.io.VideoFileClip import VideoFileClip
 import fitz
 from datetime import datetime, timedelta
 import wsdl_client
 import json
 import math
+try:
+    import vector_client
+except ImportError:
+    logging.warning("vector_client.py not found. Vector search capabilities will be disabled.")
+    vector_client = None
 
 load_dotenv()
 
@@ -391,7 +396,6 @@ def get_specific_documents_for_processing(docnumbers):
          logging.error("Failed to get DB connection in get_specific_documents_for_processing.")
          return []
 
-
     try:
         with conn.cursor() as cursor:
             # Ensure docnumbers are integers for binding
@@ -502,6 +506,19 @@ def fetch_documents_from_oracle(page=1, page_size=20, search_term=None, date_fro
     params = {}
     where_clauses = []
 
+    vector_doc_ids = None
+    use_vector_search = (
+        vector_client is not None and 
+        search_term and 
+        not memory_month and 
+        sort is None # Vector search implies relevance sort
+    )
+
+    if use_vector_search:
+        logging.info(f"Attempting vector search for: {search_term}")
+        vector_doc_ids = vector_client.query_documents(search_term, n_results=page_size) 
+        # vector_doc_ids is None on failure, [] on no results.
+
     if memory_month is not None:
         try:
             month_int = int(memory_month)
@@ -529,37 +546,49 @@ def fetch_documents_from_oracle(page=1, page_size=20, search_term=None, date_fro
             memory_month = None
 
     if memory_month is None:
-        if search_term:
-            search_words = [word.strip() for word in search_term.split(' ') if word.strip()]
-            if search_words:
-                word_conditions = []
-                for i, word in enumerate(search_words):
-                    key = f"search_word_{i}"
-                    key_upper = f"search_word_{i}_upper"
-                    params[key] = f"%{word}%"
-                    params[key_upper] = f"%{word.upper()}%"
+        if vector_doc_ids is None or len(vector_doc_ids) == 0:
+            if use_vector_search:
+                logging.info(f"Vector search returned no results or failed. Falling back to keyword search for: {search_term}")
 
-                    word_condition = f"""
-                    (
-                        p.ABSTRACT LIKE :{key} OR UPPER(p.ABSTRACT) LIKE :{key_upper} OR
-                        p.DOCNAME LIKE :{key} OR UPPER(p.DOCNAME) LIKE :{key_upper} OR
-                        EXISTS (
-                            SELECT 1 FROM LKP_DOCUMENT_TAGS ldt
-                            JOIN KEYWORD k ON ldt.TAG_ID = k.SYSTEM_ID
-                            WHERE ldt.DOCNUMBER = p.DOCNUMBER AND (k.DESCRIPTION LIKE :{key} OR UPPER(k.KEYWORD_ID) LIKE :{key_upper}) AND ldt.DISABLED = '0'
-                        ) OR
-                        EXISTS (
-                            SELECT 1 FROM LKP_PERSON p_filter
-                            WHERE (p_filter.NAME_ARABIC LIKE :{key} OR UPPER(p_filter.NAME_ENGLISH) LIKE :{key_upper})
-                            AND (
-                                 UPPER(p.ABSTRACT) LIKE '%' || UPPER(p_filter.NAME_ENGLISH) || '%'
-                                 OR (p_filter.NAME_ARABIC IS NOT NULL AND p.ABSTRACT LIKE '%' || p_filter.NAME_ARABIC || '%')
+            if search_term:
+                search_words = [word.strip() for word in search_term.split(' ') if word.strip()]
+                if search_words:
+                    word_conditions = []
+                    for i, word in enumerate(search_words):
+                        key = f"search_word_{i}"
+                        key_upper = f"search_word_{i}_upper"
+                        params[key] = f"%{word}%"
+                        params[key_upper] = f"%{word.upper()}%"
+
+                        word_condition = f"""
+                        (
+                            p.ABSTRACT LIKE :{key} OR UPPER(p.ABSTRACT) LIKE :{key_upper} OR
+                            p.DOCNAME LIKE :{key} OR UPPER(p.DOCNAME) LIKE :{key_upper} OR
+                            EXISTS (
+                                SELECT 1 FROM LKP_DOCUMENT_TAGS ldt
+                                JOIN KEYWORD k ON ldt.TAG_ID = k.SYSTEM_ID
+                                WHERE ldt.DOCNUMBER = p.DOCNUMBER AND (k.DESCRIPTION LIKE :{key} OR UPPER(k.KEYWORD_ID) LIKE :{key_upper}) AND ldt.DISABLED = '0'
+                            ) OR
+                            EXISTS (
+                                SELECT 1 FROM LKP_PERSON p_filter
+                                WHERE (p_filter.NAME_ARABIC LIKE :{key} OR UPPER(p_filter.NAME_ENGLISH) LIKE :{key_upper})
+                                AND (
+                                     UPPER(p.ABSTRACT) LIKE '%' || UPPER(p_filter.NAME_ENGLISH) || '%'
+                                     OR (p_filter.NAME_ARABIC IS NOT NULL AND p.ABSTRACT LIKE '%' || p_filter.NAME_ARABIC || '%')
+                                )
                             )
                         )
-                    )
-                    """
-                    word_conditions.append(word_condition)
-                where_clauses.append(f"({ ' AND '.join(word_conditions) })")
+                        """
+                        word_conditions.append(word_condition)
+                    where_clauses.append(f"({ ' AND '.join(word_conditions) })")
+        
+        else:
+            logging.info(f"Using {len(vector_doc_ids)} doc_ids from vector search.")
+            # Add placeholders for the vector doc IDs
+            vector_placeholders = ','.join([f":vec_id_{i}" for i in range(len(vector_doc_ids))])
+            where_clauses.append(f"p.docnumber IN ({vector_placeholders})")
+            for i, doc_id in enumerate(vector_doc_ids):
+                params[f'vec_id_{i}'] = doc_id
 
         if persons:
             person_list = [p.strip() for p in persons.split(',') if p.strip()]
@@ -655,8 +684,15 @@ def fetch_documents_from_oracle(page=1, page_size=20, search_term=None, date_fro
     final_where_clause = base_where + ("AND " + " AND ".join(where_clauses) if where_clauses else "")
 
     # --- Sorting Logic ---
-    order_by_clause = "ORDER BY p.DOCNUMBER DESC"
-    if memory_month is not None:
+    order_by_clause = "ORDER BY p.DOCNUMBER DESC" # Default fallback
+    
+    # --- NEW: VECTOR RE-ORDERING ---
+    if vector_doc_ids and len(vector_doc_ids) > 0:
+        # This SQL trick preserves the relevance order from ChromaDB
+        order_case_sql = " ".join([f"WHEN :vec_id_{i} THEN {i+1}" for i in range(len(vector_doc_ids))])
+        order_by_clause = f"ORDER BY CASE p.docnumber {order_case_sql} END"
+    # --- END: VECTOR RE-ORDERING ---
+    elif memory_month is not None:
         order_by_clause = "ORDER BY p.RTADOCDATE DESC, p.DOCNUMBER DESC"
         if sort == 'rtadocdate_asc':
             order_by_clause = "ORDER BY p.RTADOCDATE ASC, p.DOCNUMBER ASC"
@@ -798,6 +834,16 @@ def update_document_processing_status(docnumber, new_abstract, o_detected, ocr, 
             conn.commit()
             # logging.info(f"DB_UPDATE_SUCCESS: Successfully updated status for docnumber {docnumber}.")
 
+            # --- NEW: VECTOR INDEXING HOOK ---
+            if status == 3 and vector_client: # If processing was successful
+                logging.info(f"Queueing vector update for doc_id {docnumber}.")
+                try:
+                    # Run in a thread? For now, run inline.
+                    vector_client.add_or_update_document(docnumber, new_abstract)
+                except Exception as e:
+                    logging.error(f"Failed to update vector index for doc_id {docnumber}: {e}", exc_info=True)
+            # --- END: VECTOR INDEXING HOOK ---
+
     except oracledb.Error as e:
         logging.error(f"DB_UPDATE_ERROR: Oracle error while updating docnumber {docnumber}: {e}", exc_info=True)
         try:
@@ -836,6 +882,15 @@ def update_abstract_with_vips(doc_id, vip_names):
 
             cursor.execute("UPDATE PROFILE SET ABSTRACT = :1 WHERE DOCNUMBER = :2", [new_abstract, doc_id])
             conn.commit()
+
+            # --- NEW: VECTOR INDEXING HOOK ---
+            if vector_client:
+                try:
+                    vector_client.add_or_update_document(doc_id, new_abstract)
+                except Exception as e:
+                    logging.error(f"Failed to update vector index for doc_id {doc_id} after VIP update: {e}", exc_info=True)
+            # --- END: VECTOR INDEXING HOOK ---
+
             return True, "Abstract updated successfully."
     except oracledb.Error as e:
         return False, f"Database error: {e}"
@@ -1281,6 +1336,15 @@ def delete_tag_from_document(doc_id, tag):
 
                         cursor.execute("UPDATE PROFILE SET ABSTRACT = :1 WHERE DOCNUMBER = :2", [new_abstract, doc_id])
                         conn.commit()
+
+                        # --- NEW: VECTOR INDEXING HOOK ---
+                        if vector_client:
+                            try:
+                                vector_client.add_or_update_document(doc_id, new_abstract)
+                            except Exception as e:
+                                logging.error(f"Failed to update vector index for doc_id {doc_id} after tag delete: {e}", exc_info=True)
+                        # --- END: VECTOR INDEXING HOOK ---
+
                         return True, "Person tag removed from abstract successfully."
 
             # --- 3. If not found as keyword or person ---
@@ -1918,11 +1982,15 @@ def update_document_metadata(doc_id, new_abstract=None, new_date_taken=Ellipsis)
 
     update_parts = []
     params = {}
+    abstract_to_index = None # For vector indexing
 
     # Build the SET part of the UPDATE statement dynamically
     if new_abstract is not None:
         update_parts.append("ABSTRACT = :abstract")
         params['abstract'] = new_abstract
+        abstract_to_index = new_abstract # Store for indexing
+    else:
+        abstract_to_index = None # Will need to fetch it if only date changes
 
     if new_date_taken is not Ellipsis: # Check against Ellipsis to see if date update is requested
         if new_date_taken is None:
@@ -1955,6 +2023,15 @@ def update_document_metadata(doc_id, new_abstract=None, new_date_taken=Ellipsis)
             if cursor.fetchone() is None:
                 return False, f"Document with ID {doc_id} not found."
 
+            # --- MODIFICATION ---
+            # If abstract isn't being updated, but we need it for re-indexing
+            if abstract_to_index is None and new_abstract is None:
+                cursor.execute("SELECT ABSTRACT FROM PROFILE WHERE DOCNUMBER = :1", [doc_id])
+                result = cursor.fetchone()
+                if result:
+                    abstract_to_index = result[0]
+            # --- END MODIFICATION ---
+
             # Perform the update
             cursor.execute(sql, params)
 
@@ -1966,6 +2043,16 @@ def update_document_metadata(doc_id, new_abstract=None, new_date_taken=Ellipsis)
                 return False, f"Update affected 0 rows for Document ID {doc_id}. Check if data actually changed."
 
             conn.commit()
+
+            # --- NEW: VECTOR INDEXING HOOK ---
+            # Only re-index if the abstract was actually changed
+            if new_abstract is not None and vector_client:
+                try:
+                    vector_client.add_or_update_document(doc_id, abstract_to_index)
+                except Exception as e:
+                    logging.error(f"Failed to update vector index for doc_id {doc_id} after metadata update: {e}", exc_info=True)
+            # --- END: VECTOR INDEXING HOOK ---
+
             return True, "Metadata updated successfully."
 
     except oracledb.Error as e:

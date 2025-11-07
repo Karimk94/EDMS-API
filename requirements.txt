@@ -9,3 +9,5 @@ moviepy
 PyMuPDF
 waitress
 flask-gssapi
+chromadb==0.4.24
+marshmallow==3.20.1
