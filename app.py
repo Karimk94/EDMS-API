@@ -1,5 +1,4 @@
 from flask import Flask, jsonify, request, Response, send_from_directory, stream_with_context, send_file, session, abort, g
-from flask_gssapi import GSSAPI
 from flask_cors import CORS
 import db_connector
 import api_client
@@ -74,27 +73,25 @@ def login():
     if not username or not password:
         return jsonify({"error": "Username and password are required"}), 400
 
-    # Use the DMS user login function for authentication
     dst = wsdl_client.dms_user_login(username, password)
 
     if dst:
-        # If DMS login is successful, get security level from our new table
-        security_level = db_connector.get_user_security_level(username)
+        # Fetch full user details including security level, lang, and theme
+        user_details = db_connector.get_user_details(username)
 
-        if security_level is None:
-             # User exists in DMS but not in our security setup, or DB error
+        if user_details is None or 'security_level' not in user_details:
              logging.warning(f"User '{username}' authenticated via DMS but has no security level assigned in middleware DB.")
              return jsonify({"error": "User not authorized for this application"}), 401
-
-
-        session['user'] = {'username': username, 'security_level': security_level}
-        session['dst'] = dst  # Store the DMS token in the session
-        logging.info(f"User '{username}' logged in successfully with security level '{security_level}'.")
-        return jsonify({"message": "Login successful", "user": session['user']}), 200
+        
+        # Store full user details in session
+        session['user'] = user_details
+        session['dst'] = dst
+        logging.info(f"User '{username}' logged in successfully with security level '{user_details.get('security_level')}' and theme '{user_details.get('theme')}'.")
+        return jsonify({"message": "Login successful", "user": user_details}), 200
     else:
         logging.warning(f"DMS login failed for user '{username}'.")
         return jsonify({"error": "Invalid DMS credentials"}), 401
-
+    
 @app.route('/api/auth/logout', methods=['POST'])
 def logout():
     username = session.get('user', {}).get('username', 'Unknown user')
@@ -106,12 +103,20 @@ def logout():
 @app.route('/api/auth/user', methods=['GET'])
 def get_user():
     user_session = session.get('user')
-    if user_session:
+    if user_session and 'username' in user_session:
+        # Re-fetch from DB to ensure details are fresh
         user_details = db_connector.get_user_details(user_session['username'])
-        return jsonify({'user': user_details}), 200
+        if user_details:
+            session['user'] = user_details # Update session
+            return jsonify({'user': user_details}), 200
+        else:
+            # User was in session but not in DB? Log them out.
+            session.pop('user', None)
+            session.pop('dst', None)
+            return jsonify({'error': 'User not found'}), 401
     else:
         return jsonify({'error': 'Not authenticated'}), 401
-    
+   
 @app.route('/api/auth/pta-user', methods=['GET'])
 def get_pta_user():
     user_session = session.get('user')
@@ -135,6 +140,7 @@ def update_user_language():
     success = db_connector.update_user_language(session['user']['username'], lang)
 
     if success:
+        # Update session
         user_session = session['user']
         user_session['lang'] = lang
         session['user'] = user_session
@@ -142,7 +148,33 @@ def update_user_language():
     else:
         return jsonify({"error": "Failed to update language"}), 500
 
+@app.route('/api/user/theme', methods=['PUT'])
+def api_update_user_theme():
+    if 'user' not in session:
+        return jsonify({"error": "Unauthorized"}), 401
+
+    data = request.get_json()
+    theme = data.get('theme')
+
+    if theme not in ['light', 'dark']:
+        return jsonify({"error": "Invalid theme"}), 400
+
+    username = session['user']['username']
+    success = db_connector.update_user_theme(username, theme)
+
+    if success:
+        # Update session
+        user_session = session['user']
+        user_session['theme'] = theme
+        session['user'] = user_session
+        logging.info(f"User '{username}' updated theme to '{theme}'.")
+        return jsonify({"message": "Theme updated"}), 200
+    else:
+        logging.error(f"Failed to update theme for user '{username}'.")
+        return jsonify({"error": "Failed to update theme"}), 500
+
 # --- AI Processing Routes ---
+
 def process_document(doc, dms_session_token):
     """
     Processes a single document, handling its own errors and returning a dictionary
@@ -676,7 +708,6 @@ def api_get_documents():
 
 @app.route('/api/document/<int:doc_id>/event', methods=['PUT'])
 def link_document_event(doc_id):
-    # --- ADD THESE LINES ---
     logging.info(f"--- HIT ROUTE: PUT /api/document/{doc_id}/event ---")
     # print(f"--- HIT ROUTE: PUT /api/document/{doc_id}/event ---")
     # -----------------------
@@ -1146,7 +1177,7 @@ def api_get_memories():
         if day is not None and not 1 <= day <= 31:
              return jsonify({"error": "Invalid day provided."}), 400
 
-        logging.info(f"Fetching memories for Month: {month}, Day: {day}, Limit: {limit}")
+        # logging.info(f"Fetching memories for Month: {month}, Day: {day}, Limit: {limit}")
         memories = db_connector.fetch_memories_from_oracle(month=month, day=day, limit=limit)
 
         return jsonify({"memories": memories})
