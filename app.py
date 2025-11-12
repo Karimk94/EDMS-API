@@ -536,6 +536,9 @@ def api_upload_document():
         docname = os.path.splitext(original_filename)[0] # Fallback to original filename base
     else:
         docname = docname.strip() # Use stripped name from form
+        name_base, name_ext = os.path.splitext(docname)
+        if name_ext.lstrip('.').upper() == file_extension:
+            docname = name_base
     logging.info(f"Using docname: {docname}")
     # --- End Docname Logic ---
 
@@ -578,7 +581,7 @@ def api_upload_document():
     else:
         logging.error(f"Failed to upload {original_filename} to DMS.")
         return jsonify({"success": False, "error": "Failed to upload file to DMS."}), 500
-    
+
 @app.route('/api/process_uploaded_documents', methods=['POST'])
 def api_process_uploaded_documents():
     data = request.get_json()

@@ -502,21 +502,21 @@ def fetch_documents_from_oracle(page=1, page_size=20, search_term=None, date_fro
     documents = []
     total_rows = 0
 
-    base_where = "WHERE p.docnumber >= 19677386 AND p.FORM = 2740 " #19662092
+    base_where = "WHERE p.docnumber >= 19677386 AND p.FORM = 2740 "  # 19662092
     params = {}
     where_clauses = []
 
     vector_doc_ids = None
     use_vector_search = (
-        vector_client is not None and 
-        search_term and 
-        not memory_month and 
-        sort is None # Vector search implies relevance sort
+            vector_client is not None and
+            search_term and
+            not memory_month and
+            sort is None  # Vector search implies relevance sort
     )
 
     if use_vector_search:
         logging.info(f"Attempting vector search for: {search_term}")
-        vector_doc_ids = vector_client.query_documents(search_term, n_results=page_size) 
+        vector_doc_ids = vector_client.query_documents(search_term, n_results=page_size)
         # vector_doc_ids is None on failure, [] on no results.
 
     if memory_month is not None:
@@ -548,7 +548,8 @@ def fetch_documents_from_oracle(page=1, page_size=20, search_term=None, date_fro
     if memory_month is None:
         if vector_doc_ids is None or len(vector_doc_ids) == 0:
             if use_vector_search:
-                logging.info(f"Vector search returned no results or failed. Falling back to keyword search for: {search_term}")
+                logging.info(
+                    f"Vector search returned no results or failed. Falling back to keyword search for: {search_term}")
 
             if search_term:
                 search_words = [word.strip() for word in search_term.split(' ') if word.strip()]
@@ -580,8 +581,8 @@ def fetch_documents_from_oracle(page=1, page_size=20, search_term=None, date_fro
                         )
                         """
                         word_conditions.append(word_condition)
-                    where_clauses.append(f"({ ' AND '.join(word_conditions) })")
-        
+                    where_clauses.append(f"({' AND '.join(word_conditions)})")
+
         else:
             logging.info(f"Using {len(vector_doc_ids)} doc_ids from vector search.")
             # Add placeholders for the vector doc IDs
@@ -605,18 +606,18 @@ def fetch_documents_from_oracle(page=1, page_size=20, search_term=None, date_fro
 
         if date_from:
             try:
-                 datetime.strptime(date_from, '%Y-%m-%d %H:%M:%S')
-                 where_clauses.append("p.RTADOCDATE >= TO_DATE(:date_from, 'YYYY-MM-DD HH24:MI:SS')")
-                 params['date_from'] = date_from
+                datetime.strptime(date_from, '%Y-%m-%d %H:%M:%S')
+                where_clauses.append("p.RTADOCDATE >= TO_DATE(:date_from, 'YYYY-MM-DD HH24:MI:SS')")
+                params['date_from'] = date_from
             except ValueError:
                 logging.warning(f"Invalid date_from format received: {date_from}")
         if date_to:
             try:
-                 datetime.strptime(date_to, '%Y-%m-%d %H:%M:%S')
-                 where_clauses.append("p.RTADOCDATE <= TO_DATE(:date_to, 'YYYY-MM-DD HH24:MI:SS')")
-                 params['date_to'] = date_to
+                datetime.strptime(date_to, '%Y-%m-%d %H:%M:%S')
+                where_clauses.append("p.RTADOCDATE <= TO_DATE(:date_to, 'YYYY-MM-DD HH24:MI:SS')")
+                params['date_to'] = date_to
             except ValueError:
-                 logging.warning(f"Invalid date_to format received: {date_to}")
+                logging.warning(f"Invalid date_to format received: {date_to}")
 
         if years:
             year_list_str = years.split(',')
@@ -625,15 +626,18 @@ def fetch_documents_from_oracle(page=1, page_size=20, search_term=None, date_fro
             for y_str in year_list_str:
                 try:
                     year_int = int(y_str.strip())
-                    if 1900 < year_int < 2100: year_list_int.append(year_int)
-                    else: valid_years = False; break
-                except ValueError: valid_years = False; break
+                    if 1900 < year_int < 2100:
+                        year_list_int.append(year_int)
+                    else:
+                        valid_years = False; break
+                except ValueError:
+                    valid_years = False; break
             if valid_years and year_list_int:
-                 year_placeholders = ', '.join([f":year_{i}" for i in range(len(year_list_int))])
-                 where_clauses.append(f"EXTRACT(YEAR FROM p.RTADOCDATE) IN ({year_placeholders})")
-                 for i, year in enumerate(year_list_int): params[f'year_{i}'] = year
-            elif not valid_years: logging.warning(f"Invalid year format received: {years}")
-
+                year_placeholders = ', '.join([f":year_{i}" for i in range(len(year_list_int))])
+                where_clauses.append(f"EXTRACT(YEAR FROM p.RTADOCDATE) IN ({year_placeholders})")
+                for i, year in enumerate(year_list_int): params[f'year_{i}'] = year
+            elif not valid_years:
+                logging.warning(f"Invalid year format received: {years}")
 
         if tags:
             tag_list = [t.strip() for t in tags.split(',') if t.strip()]
@@ -645,13 +649,19 @@ def fetch_documents_from_oracle(page=1, page_size=20, search_term=None, date_fro
                 for i, tag in enumerate(tag_list):
                     key = f'tag_{i}'
                     key_upper = f'tag_{i}_upper'
-                    params[key] = tag
 
+                    # --- FIX START: Conditionals to prevent unused bind variables ---
                     if lang == 'ar':
-                        keyword_compare = f"k.{keyword_column} = :{key}"
+                        params[key] = tag  # Only add base key if Arabic (using direct match)
+                        # Use TRIM for Arabic as well to be safe
+                        keyword_compare = f"TRIM(k.{keyword_column}) = :{key}"
+                        person_compare = f"TRIM(p_filter.{person_filter_column}) = :{key}"
                     else:
-                        params[key_upper] = tag.upper()
-                        keyword_compare = f"UPPER(k.{keyword_column}) = :{key_upper}"
+                        params[key_upper] = tag.upper()  # Only add upper key if English (using upper match)
+                        # Use TRIM and UPPER for English
+                        keyword_compare = f"UPPER(TRIM(k.{keyword_column})) = :{key_upper}"
+                        person_compare = f"UPPER(TRIM(p_filter.{person_filter_column})) = :{key_upper}"
+                    # --- FIX END ---
 
                     keyword_subquery = f"""
                     EXISTS (
@@ -660,11 +670,6 @@ def fetch_documents_from_oracle(page=1, page_size=20, search_term=None, date_fro
                         WHERE ldt.DOCNUMBER = p.DOCNUMBER AND {keyword_compare} AND ldt.DISABLED = '0'
                     )
                     """
-
-                    if lang == 'ar':
-                        person_compare = f"p_filter.{person_filter_column} = :{key}"
-                    else:
-                        person_compare = f"UPPER(p_filter.{person_filter_column}) = :{key_upper}"
 
                     person_subquery = f"""
                     EXISTS (
@@ -684,12 +689,12 @@ def fetch_documents_from_oracle(page=1, page_size=20, search_term=None, date_fro
     final_where_clause = base_where + ("AND " + " AND ".join(where_clauses) if where_clauses else "")
 
     # --- Sorting Logic ---
-    order_by_clause = "ORDER BY p.DOCNUMBER DESC" # Default fallback
-    
+    order_by_clause = "ORDER BY p.DOCNUMBER DESC"  # Default fallback
+
     # --- NEW: VECTOR RE-ORDERING ---
     if vector_doc_ids and len(vector_doc_ids) > 0:
         # This SQL trick preserves the relevance order from ChromaDB
-        order_case_sql = " ".join([f"WHEN :vec_id_{i} THEN {i+1}" for i in range(len(vector_doc_ids))])
+        order_case_sql = " ".join([f"WHEN :vec_id_{i} THEN {i + 1}" for i in range(len(vector_doc_ids))])
         order_by_clause = f"ORDER BY CASE p.docnumber {order_case_sql} END"
     # --- END: VECTOR RE-ORDERING ---
     elif memory_month is not None:
@@ -750,11 +755,11 @@ def fetch_documents_from_oracle(page=1, page_size=20, search_term=None, date_fro
                         if media_bytes:
                             thumbnail_path = create_thumbnail(doc_id, media_type, file_ext, media_bytes)
                         else:
-                             logging.warning(f"Could not retrieve media content for doc {doc_id} to create thumbnail.")
+                            logging.warning(f"Could not retrieve media content for doc {doc_id} to create thumbnail.")
 
                 except Exception as media_info_e:
-                     logging.error(f"Error processing media info/thumbnail for doc {doc_id}: {media_info_e}", exc_info=True)
-
+                    logging.error(f"Error processing media info/thumbnail for doc {doc_id}: {media_info_e}",
+                                  exc_info=True)
 
                 documents.append({
                     "doc_id": doc_id,
@@ -767,12 +772,14 @@ def fetch_documents_from_oracle(page=1, page_size=20, search_term=None, date_fro
                     "is_favorite": bool(is_favorite)
                 })
     except oracledb.Error as e:
-         logging.error(f"Oracle error fetching documents: {e}", exc_info=True)
-         return [], 0
+        logging.error(f"Oracle error fetching documents: {e}", exc_info=True)
+        return [], 0
     finally:
         if conn:
-            try: conn.close()
-            except oracledb.Error: logging.error("Error closing DB connection.")
+            try:
+                conn.close()
+            except oracledb.Error:
+                logging.error("Error closing DB connection.")
     return documents, total_rows
 
 def get_documents_to_process():
