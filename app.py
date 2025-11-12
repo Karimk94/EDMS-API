@@ -1,4 +1,4 @@
-from flask import Flask, jsonify, request, Response, send_from_directory, stream_with_context, send_file, session, abort, g
+from flask import Flask, jsonify, request, Response, send_from_directory, stream_with_context, send_file, session, abort
 from flask_cors import CORS
 import db_connector
 import api_client
@@ -14,13 +14,13 @@ from threading import Thread
 import mimetypes
 from functools import wraps
 import io
-from datetime import datetime 
+from datetime import datetime, timedelta
 
 # --- Logging Setup ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 app = Flask(__name__)
-
+app.config['PERMANENT_SESSION_LIFETIME'] = timedelta(days=60)
 app.secret_key = os.getenv('FLASK_SECRET_KEY')
 CORS(app, supports_credentials=True, resources={r"/api/*": {"origins": "*"}})
 
@@ -57,7 +57,8 @@ def pta_login():
 
 
         session['user'] = {'username': username, 'security_level': security_level}
-        session['dst'] = dst  # Store the DMS token in the session
+        # session['dst'] = dst
+        session.permanent = True
         logging.info(f"User '{username}' logged in successfully with security level '{security_level}'.")
         return jsonify({"message": "Login successful", "user": session['user']}), 200
     else:
@@ -85,7 +86,9 @@ def login():
         
         # Store full user details in session
         session['user'] = user_details
-        session['dst'] = dst
+        # session['dst'] = dst
+        session.permanent = True
+
         logging.info(f"User '{username}' logged in successfully with security level '{user_details.get('security_level')}' and theme '{user_details.get('theme')}'.")
         return jsonify({"message": "Login successful", "user": user_details}), 200
     else:
@@ -96,7 +99,7 @@ def login():
 def logout():
     username = session.get('user', {}).get('username', 'Unknown user')
     session.pop('user', None)
-    session.pop('dst', None)
+    # session.pop('dst', None)
     logging.info(f"User '{username}' logged out.")
     return jsonify({"message": "Logout successful"}), 200
 
@@ -112,7 +115,7 @@ def get_user():
         else:
             # User was in session but not in DB? Log them out.
             session.pop('user', None)
-            session.pop('dst', None)
+            # session.pop('dst', None)
             return jsonify({'error': 'User not found'}), 401
     else:
         return jsonify({'error': 'Not authenticated'}), 401
@@ -1033,10 +1036,14 @@ def get_employees():
 @app.route('/api/employees', methods=['POST'])
 @editor_required
 def add_employee_archive():
-    if 'user' not in session or 'dst' not in session:
+    if 'user' not in session:
         return jsonify({"error": "Unauthorized"}), 401
 
     try:
+        dst = wsdl_client.dms_system_login()
+        if not dst:
+            return jsonify({"error": "Failed to get system-level DMS token"}), 500
+
         dms_user = session['user']['username']
         employee_data = json.loads(request.form.get('employee_data'))
 
@@ -1070,9 +1077,13 @@ def get_employee_details(archive_id):
 @app.route('/api/employees/<int:archive_id>', methods=['PUT'])
 @editor_required
 def update_employee_archive(archive_id):
-    if 'user' not in session or 'dst' not in session: return jsonify({"error": "Unauthorized"}), 401
+    if 'user' not in session: 
+        return jsonify({"error": "Unauthorized"}), 401
 
     try:
+        dst = wsdl_client.dms_system_login()
+        if not dst:
+            return jsonify({"error": "Failed to get system-level DMS token"}), 500
         dms_user = session['user']['username']
         employee_data = json.loads(request.form.get('employee_data'))
 
@@ -1140,15 +1151,18 @@ def get_document_file(docnumber):
     """
     Securely streams a document from the DMS to the client.
     """
-    if 'user' not in session or 'dst' not in session:
+    if 'user' not in session:
         return jsonify({"error": "Unauthorized"}), 401
 
-    dst = session['dst']
+    dst = wsdl_client.dms_system_login()
+    if not dst:
+        return jsonify({"error": "Failed to get system-level DMS token"}), 500
+    
     file_bytes, filename = wsdl_client.get_document_from_dms(dst, docnumber)
 
     if file_bytes and filename:
         mimetype = mimetypes.guess_type(filename)[0] or 'application/octet-stream'
-        return Response(file_bytes, mimetype=mimetype, headers={"Content-Disposition": f"inline; filename={filename}"}) # Suggest inline display
+        return Response(file_bytes, mimetype=mimetype, headers={"Content-Disposition": f"inline; filename={filename}"})
     else:
         logging.warning(f"Document not found or retrieval failed for docnumber: {docnumber}")
         return jsonify({"error": "Document not found or could not be retrieved from DMS."}), 404
