@@ -477,8 +477,8 @@ def check_processing_status(docnumbers):
 
 def fetch_documents_from_oracle(page=1, page_size=20, search_term=None, date_from=None, date_to=None,
                                 persons=None, person_condition='any', tags=None, years=None, sort=None,
-                                memory_month=None, memory_day=None, user_id=None, lang='en'):
-    """Fetches a paginated list of documents from Oracle, handling filtering, memories, and thumbnail logic."""
+                                memory_month=None, memory_day=None, user_id=None, lang='en', security_level='Editor'):
+    """Fetches a paginated list of documents, applying visibility rules for Viewers."""
     conn = get_connection()
     if not conn: return [], 0
 
@@ -502,22 +502,23 @@ def fetch_documents_from_oracle(page=1, page_size=20, search_term=None, date_fro
     documents = []
     total_rows = 0
 
-    base_where = "WHERE p.docnumber >= 19677386 AND p.FORM = 2740 "  # 19662092
+    base_where = "WHERE p.docnumber >= 19677386 AND p.FORM = 2740 "
     params = {}
     where_clauses = []
+
+    shortlist_sql = "AND k.SHORTLISTED = '1'" if security_level == 'Viewer' else ""
 
     vector_doc_ids = None
     use_vector_search = (
             vector_client is not None and
             search_term and
             not memory_month and
-            sort is None  # Vector search implies relevance sort
+            sort is None
     )
 
     if use_vector_search:
         logging.info(f"Attempting vector search for: {search_term}")
         vector_doc_ids = vector_client.query_documents(search_term, n_results=page_size)
-        # vector_doc_ids is None on failure, [] on no results.
 
     if memory_month is not None:
         try:
@@ -568,7 +569,10 @@ def fetch_documents_from_oracle(page=1, page_size=20, search_term=None, date_fro
                             EXISTS (
                                 SELECT 1 FROM LKP_DOCUMENT_TAGS ldt
                                 JOIN KEYWORD k ON ldt.TAG_ID = k.SYSTEM_ID
-                                WHERE ldt.DOCNUMBER = p.DOCNUMBER AND (k.DESCRIPTION LIKE :{key} OR UPPER(k.KEYWORD_ID) LIKE :{key_upper}) AND ldt.DISABLED = '0'
+                                WHERE ldt.DOCNUMBER = p.DOCNUMBER 
+                                AND (k.DESCRIPTION LIKE :{key} OR UPPER(k.KEYWORD_ID) LIKE :{key_upper}) 
+                                AND ldt.DISABLED = '0'
+                                {shortlist_sql}
                             ) OR
                             EXISTS (
                                 SELECT 1 FROM LKP_PERSON p_filter
@@ -585,7 +589,6 @@ def fetch_documents_from_oracle(page=1, page_size=20, search_term=None, date_fro
 
         else:
             logging.info(f"Using {len(vector_doc_ids)} doc_ids from vector search.")
-            # Add placeholders for the vector doc IDs
             vector_placeholders = ','.join([f":vec_id_{i}" for i in range(len(vector_doc_ids))])
             where_clauses.append(f"p.docnumber IN ({vector_placeholders})")
             for i, doc_id in enumerate(vector_doc_ids):
@@ -650,24 +653,23 @@ def fetch_documents_from_oracle(page=1, page_size=20, search_term=None, date_fro
                     key = f'tag_{i}'
                     key_upper = f'tag_{i}_upper'
 
-                    # --- FIX START: Conditionals to prevent unused bind variables ---
                     if lang == 'ar':
-                        params[key] = tag  # Only add base key if Arabic (using direct match)
-                        # Use TRIM for Arabic as well to be safe
+                        params[key] = tag
                         keyword_compare = f"TRIM(k.{keyword_column}) = :{key}"
                         person_compare = f"TRIM(p_filter.{person_filter_column}) = :{key}"
                     else:
-                        params[key_upper] = tag.upper()  # Only add upper key if English (using upper match)
-                        # Use TRIM and UPPER for English
+                        params[key_upper] = tag.upper()
                         keyword_compare = f"UPPER(TRIM(k.{keyword_column})) = :{key_upper}"
                         person_compare = f"UPPER(TRIM(p_filter.{person_filter_column})) = :{key_upper}"
-                    # --- FIX END ---
 
                     keyword_subquery = f"""
                     EXISTS (
                         SELECT 1 FROM LKP_DOCUMENT_TAGS ldt
                         JOIN KEYWORD k ON ldt.TAG_ID = k.SYSTEM_ID
-                        WHERE ldt.DOCNUMBER = p.DOCNUMBER AND {keyword_compare} AND ldt.DISABLED = '0'
+                        WHERE ldt.DOCNUMBER = p.DOCNUMBER 
+                        AND {keyword_compare} 
+                        AND ldt.DISABLED = '0'
+                        {shortlist_sql}
                     )
                     """
 
@@ -688,15 +690,10 @@ def fetch_documents_from_oracle(page=1, page_size=20, search_term=None, date_fro
 
     final_where_clause = base_where + ("AND " + " AND ".join(where_clauses) if where_clauses else "")
 
-    # --- Sorting Logic ---
-    order_by_clause = "ORDER BY p.DOCNUMBER DESC"  # Default fallback
-
-    # --- NEW: VECTOR RE-ORDERING ---
+    order_by_clause = "ORDER BY p.DOCNUMBER DESC"
     if vector_doc_ids and len(vector_doc_ids) > 0:
-        # This SQL trick preserves the relevance order from ChromaDB
         order_case_sql = " ".join([f"WHEN :vec_id_{i} THEN {i + 1}" for i in range(len(vector_doc_ids))])
         order_by_clause = f"ORDER BY CASE p.docnumber {order_case_sql} END"
-    # --- END: VECTOR RE-ORDERING ---
     elif memory_month is not None:
         order_by_clause = "ORDER BY p.RTADOCDATE DESC, p.DOCNUMBER DESC"
         if sort == 'rtadocdate_asc':
@@ -710,12 +707,10 @@ def fetch_documents_from_oracle(page=1, page_size=20, search_term=None, date_fro
     try:
         with conn.cursor() as cursor:
             count_query = f"SELECT COUNT(p.DOCNUMBER) FROM PROFILE p {final_where_clause}"
-            logging.debug(f"Count Query: {count_query}")
-            logging.debug(f"Count Params: {params}")
             cursor.execute(count_query, params)
             total_rows = cursor.fetchone()[0]
 
-            date_column = "p.RTADOCDATE" if memory_month is not None else "p.RTADOCDATE"
+            date_column = "p.RTADOCDATE"
             fetch_query = f"""
             SELECT p.DOCNUMBER, p.ABSTRACT, p.AUTHOR, {date_column} as DOC_DATE, p.DOCNAME,
                    CASE WHEN f.DOCNUMBER IS NOT NULL THEN 1 ELSE 0 END as IS_FAVORITE
@@ -730,18 +725,18 @@ def fetch_documents_from_oracle(page=1, page_size=20, search_term=None, date_fro
             params_paginated['offset'] = offset
             params_paginated['page_size'] = page_size
 
-            logging.debug(f"Fetch Query: {fetch_query}")
-            logging.debug(f"Fetch Params: {params_paginated}")
             cursor.execute(fetch_query, params_paginated)
-
             rows = cursor.fetchall()
-            # logging.info(f"Fetched {len(rows)} rows for page {page}.")
 
             for row in rows:
                 doc_id, abstract, author, doc_date, docname, is_favorite = row
                 thumbnail_path = None
                 media_type = 'image'
                 file_ext = '.jpg'
+
+                final_abstract = abstract or ""
+                if security_level == 'Viewer':
+                    final_abstract = ""
 
                 try:
                     original_filename, media_type, file_ext = get_media_info_from_dms(dst, doc_id)
@@ -763,7 +758,7 @@ def fetch_documents_from_oracle(page=1, page_size=20, search_term=None, date_fro
 
                 documents.append({
                     "doc_id": doc_id,
-                    "title": abstract or "",
+                    "title": final_abstract,
                     "docname": docname or "",
                     "author": author or "N/A",
                     "date": doc_date.strftime('%Y-%m-%d %H:%M:%S') if doc_date else "N/A",
@@ -977,8 +972,8 @@ def fetch_lkp_persons(page=1, page_size=20, search='', lang='en'):
             conn.close()
     return persons, total_rows
 
-def fetch_all_tags(lang='en'):
-    """Fetches all unique keywords and person names to be used as tags, based on language."""
+def fetch_all_tags(lang='en', security_level='Editor'):
+    """Fetches all unique tags (keywords and persons) considering security level."""
     conn = get_connection()
     if not conn: return []
 
@@ -988,8 +983,11 @@ def fetch_all_tags(lang='en'):
             keyword_column = "k.DESCRIPTION" if lang == 'ar' else "k.KEYWORD_ID"
             person_column = "p.NAME_ARABIC" if lang == 'ar' else "p.NAME_ENGLISH"
 
+            # If Viewer, only fetch shortlisted tags
+            shortlist_clause = "AND k.SHORTLISTED = '1'" if security_level == 'Viewer' else ""
+
             cursor.execute(
-                f"SELECT {keyword_column} FROM KEYWORD k JOIN LKP_DOCUMENT_TAGS ldt ON ldt.TAG_ID = k.SYSTEM_ID WHERE {keyword_column} IS NOT NULL"
+                f"SELECT {keyword_column} FROM KEYWORD k JOIN LKP_DOCUMENT_TAGS ldt ON ldt.TAG_ID = k.SYSTEM_ID WHERE {keyword_column} IS NOT NULL {shortlist_clause}"
             )
             for row in cursor:
                 if row[0]:
@@ -1007,33 +1005,47 @@ def fetch_all_tags(lang='en'):
 
     return sorted(list(tags))
 
-def fetch_tags_for_document(doc_id, lang='en'):
-    """Fetches all keyword and person tags for a single document, based on language."""
+def fetch_tags_for_document(doc_id, lang='en', security_level='Editor'):
+    """
+    Fetches all keyword and person tags for a single document.
+    Returns a list of dictionaries: {'text': 'TagName', 'shortlisted': 1/0, 'type': 'keyword'/'person'}
+    """
     conn = get_connection()
     if not conn:
         return []
 
-    doc_tags = set()
+    doc_tags = []
+    seen_tags = set()
+
     try:
         with conn.cursor() as cursor:
             cursor.execute("SELECT ABSTRACT FROM PROFILE WHERE DOCNUMBER = :doc_id", {'doc_id': doc_id})
             result = cursor.fetchone()
             abstract = result[0] if result else None
 
-            # Determine which columns to select based on language
             keyword_column = "k.DESCRIPTION" if lang == 'ar' else "k.KEYWORD_ID"
             person_column = "p.NAME_ARABIC" if lang == 'ar' else "p.NAME_ENGLISH"
 
+            shortlist_clause = "AND k.SHORTLISTED = '1'" if security_level == 'Viewer' else ""
+
             tag_query = f"""
-                SELECT {keyword_column}
+                SELECT {keyword_column}, k.SHORTLISTED
                 FROM LKP_DOCUMENT_TAGS ldt
                 JOIN KEYWORD k ON ldt.TAG_ID = k.SYSTEM_ID
-                WHERE ldt.DOCNUMBER = :doc_id AND {keyword_column} IS NOT NULL
+                WHERE ldt.DOCNUMBER = :doc_id AND {keyword_column} IS NOT NULL {shortlist_clause}
             """
             cursor.execute(tag_query, {'doc_id': doc_id})
-            for tag_row in cursor:
-                if tag_row[0]:
-                    doc_tags.add(tag_row[0])
+            for row in cursor:
+                tag_text = row[0].strip() if row[0] else ""
+                is_shortlisted = row[1] if row[1] else '0'
+
+                if tag_text and tag_text not in seen_tags:
+                    seen_tags.add(tag_text)
+                    doc_tags.append({
+                        'text': tag_text,
+                        'shortlisted': 1 if str(is_shortlisted) == '1' else 0,
+                        'type': 'keyword'
+                    })
 
             if abstract:
                 person_query = f"""
@@ -1042,16 +1054,67 @@ def fetch_tags_for_document(doc_id, lang='en'):
                     WHERE :abstract LIKE '%' || UPPER(NAME_ENGLISH) || '%' AND {person_column} IS NOT NULL
                 """
                 cursor.execute(person_query, {'abstract': abstract.upper()})
-                for person_row in cursor:
-                    if person_row[0]:
-                        doc_tags.add(person_row[0])
+                for row in cursor:
+                    person_name = row[0].strip() if row[0] else ""
+                    if person_name and person_name not in seen_tags:
+                        seen_tags.add(person_name)
+                        doc_tags.append({
+                            'text': person_name,
+                            'shortlisted': 0,
+                            'type': 'person'
+                        })
+
     except oracledb.Error as e:
         print(f"❌ Oracle Database error in fetch_tags_for_document for doc_id {doc_id}: {e}")
     finally:
         if conn:
             conn.close()
 
-    return sorted(list(doc_tags))
+    # Sort by text
+    return sorted(doc_tags, key=lambda x: x['text'].lower())
+
+def toggle_tag_shortlist(tag, lang='en'):
+    """
+    Toggles the SHORTLISTED status of a keyword (0 -> 1 or 1 -> 0).
+    Identifies the keyword by name (English or Arabic).
+    """
+    conn = get_connection()
+    if not conn: return False, "Database connection failed."
+
+    try:
+        with conn.cursor() as cursor:
+            # 1. Find the Keyword ID and current status
+            # Check both English ID and Arabic Description
+            cursor.execute("""
+                           SELECT SYSTEM_ID, SHORTLISTED
+                           FROM KEYWORD
+                           WHERE UPPER(KEYWORD_ID) = :tag_upper
+                              OR DESCRIPTION = :tag_normal
+                           """, tag_upper=tag.upper(), tag_normal=tag)
+
+            result = cursor.fetchone()
+            if not result:
+                return False, "Tag not found in keywords (cannot shortlist Persons)."
+
+            keyword_id = result[0]
+            current_status = str(result[1]) if result[1] else '0'
+
+            # Toggle status
+            new_status = '0' if current_status == '1' else '1'
+
+            # 2. Update the keyword
+            cursor.execute("UPDATE KEYWORD SET SHORTLISTED = :new_status WHERE SYSTEM_ID = :id",
+                           new_status=new_status, id=keyword_id)
+            conn.commit()
+
+            return True, {"new_status": int(new_status)}
+
+    except oracledb.Error as e:
+        if conn: conn.rollback()
+        logging.error(f"Database error toggling shortlist: {e}", exc_info=True)
+        return False, f"Database error: {e}"
+    finally:
+        if conn: conn.close()
 
 def clear_thumbnail_cache():
     """Deletes all files in the thumbnail cache directory."""

@@ -661,6 +661,7 @@ def api_get_documents():
     try:
         user = session.get('user')
         username = user.get('username') if user else None
+        security_level = user.get('security_level', 'Viewer') if user else 'Viewer'
 
         page = request.args.get('page', 1, type=int)
         page_size = request.args.get('pageSize', 20, type=int)
@@ -676,9 +677,8 @@ def api_get_documents():
 
         # Check for memory-specific parameters
         memory_month = request.args.get('memoryMonth', None, type=str)
-        memory_day = request.args.get('memoryDay', None, type=str) # Optional day
+        memory_day = request.args.get('memoryDay', None, type=str)
 
-        # Basic validation
         if page < 1: page = 1
         if page_size < 1: page_size = 20
         if page_size > 100: page_size = 100
@@ -697,7 +697,8 @@ def api_get_documents():
             memory_month=memory_month,
             memory_day=memory_day,
             user_id=username,
-            lang=lang
+            lang=lang,
+            security_level=security_level
         )
 
         total_pages = math.ceil(total_rows / page_size) if total_rows > 0 else 1
@@ -924,15 +925,38 @@ def api_get_persons():
 def api_get_tags():
     """Fetches all unique tags (keywords and persons) for the filter dropdown."""
     lang = request.args.get('lang', 'en', type=str)
-    tags = db_connector.fetch_all_tags(lang=lang)
+    user = session.get('user')
+    security_level = user.get('security_level', 'Viewer') if user else 'Viewer'
+
+    tags = db_connector.fetch_all_tags(lang=lang, security_level=security_level)
     return jsonify(tags)
 
 @app.route('/api/tags/<int:doc_id>')
 def api_get_tags_for_document(doc_id):
     """Fetches all tags for a specific document ID."""
     lang = request.args.get('lang', 'en', type=str)
-    tags = db_connector.fetch_tags_for_document(doc_id, lang=lang)
+    user = session.get('user')
+    security_level = user.get('security_level', 'Viewer') if user else 'Viewer'
+
+    tags = db_connector.fetch_tags_for_document(doc_id, lang=lang, security_level=security_level)
     return jsonify({"tags": tags})
+
+@app.route('/api/tags/shortlist', methods=['POST'])
+@editor_required
+def api_toggle_shortlist():
+    """Toggles the shortlisted status of a tag."""
+    data = request.get_json()
+    tag = data.get('tag')
+
+    if not tag:
+        return jsonify({'error': 'Tag is required'}), 400
+
+    success, result = db_connector.toggle_tag_shortlist(tag)
+
+    if success:
+        return jsonify(result)
+    else:
+        return jsonify({'error': result}), 400
 
 @app.route('/api/processing_status', methods=['POST'])
 def api_processing_status():
