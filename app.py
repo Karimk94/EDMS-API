@@ -33,38 +33,6 @@ def editor_required(f):
         return f(*args, **kwargs)
     return decorated_function
 
-# --- Authentication Routes (from Archiving Backend) ---
-@app.route('/api/auth/pta-login', methods=['POST'])
-def pta_login():
-    data = request.get_json()
-    username = data.get('username')
-    password = data.get('password')
-
-    if not username or not password:
-        return jsonify({"error": "Username and password are required"}), 400
-
-    # Use the DMS user login function for authentication
-    dst = wsdl_client.dms_user_login(username, password)
-
-    if dst:
-        # If DMS login is successful, get security level from our new table
-        security_level = db_connector.get_pta_user_security_level(username)
-
-        if security_level is None:
-             # User exists in DMS but not in our security setup, or DB error
-             logging.warning(f"User '{username}' authenticated via DMS but has no security level assigned in middleware DB.")
-             return jsonify({"error": "User not authorized for this application"}), 401
-
-
-        session['user'] = {'username': username, 'security_level': security_level}
-        # session['dst'] = dst
-        session.permanent = True
-        logging.info(f"User '{username}' logged in successfully with security level '{security_level}'.")
-        return jsonify({"message": "Login successful", "user": session['user']}), 200
-    else:
-        logging.warning(f"DMS login failed for user '{username}'.")
-        return jsonify({"error": "Invalid DMS credentials"}), 401
-
 @app.route('/api/auth/login', methods=['POST'])
 def login():
     data = request.get_json()
@@ -83,7 +51,7 @@ def login():
         if user_details is None or 'security_level' not in user_details:
              logging.warning(f"User '{username}' authenticated via DMS but has no security level assigned in middleware DB.")
              return jsonify({"error": "User not authorized for this application"}), 401
-        
+
         # Store full user details in session
         session['user'] = user_details
         # session['dst'] = dst
@@ -94,12 +62,11 @@ def login():
     else:
         logging.warning(f"DMS login failed for user '{username}'.")
         return jsonify({"error": "Invalid DMS credentials"}), 401
-    
+
 @app.route('/api/auth/logout', methods=['POST'])
 def logout():
     username = session.get('user', {}).get('username', 'Unknown user')
     session.pop('user', None)
-    # session.pop('dst', None)
     logging.info(f"User '{username}' logged out.")
     return jsonify({"message": "Logout successful"}), 200
 
@@ -117,15 +84,6 @@ def get_user():
             session.pop('user', None)
             # session.pop('dst', None)
             return jsonify({'error': 'User not found'}), 401
-    else:
-        return jsonify({'error': 'Not authenticated'}), 401
-   
-@app.route('/api/auth/pta-user', methods=['GET'])
-def get_pta_user():
-    user_session = session.get('user')
-    if user_session:
-        user_details = db_connector.get_pta_user_details(user_session['username'])
-        return jsonify({'user': user_details}), 200
     else:
         return jsonify({'error': 'Not authenticated'}), 401
 
@@ -170,14 +128,13 @@ def api_update_user_theme():
         user_session = session['user']
         user_session['theme'] = theme
         session['user'] = user_session
-        logging.info(f"User '{username}' updated theme to '{theme}'.")
+        # logging.info(f"User '{username}' updated theme to '{theme}'.")
         return jsonify({"message": "Theme updated"}), 200
     else:
         logging.error(f"Failed to update theme for user '{username}'.")
         return jsonify({"error": "Failed to update theme"}), 500
 
 # --- AI Processing Routes ---
-
 def process_document(doc, dms_session_token):
     """
     Processes a single document, handling its own errors and returning a dictionary
@@ -1038,140 +995,6 @@ def api_delete_tag(doc_id, tag):
         # Don't return 500 for "not found", just inform the user
         status_code = 404 if "not found" in message.lower() else 500
         return jsonify({'error': message}), status_code
-
-# --- Archiving API Routes (from Archiving Backend) ---
-@app.route('/api/dashboard_counts', methods=['GET'])
-def get_dashboard_counts():
-    if 'user' not in session:
-        return jsonify({"error": "Unauthorized"}), 401
-    counts = db_connector.get_dashboard_counts()
-    return jsonify(counts)
-
-@app.route('/api/employees', methods=['GET'])
-def get_employees():
-    if 'user' not in session: return jsonify({"error": "Unauthorized"}), 401
-    employees, total_rows = db_connector.fetch_archived_employees(
-        page=request.args.get('page', 1, type=int), # Added pagination
-        page_size=request.args.get('page_size', 20, type=int), # Added page_size
-        search_term=request.args.get('search'),
-        status=request.args.get('status'),
-        filter_type=request.args.get('filter_type')
-    )
-    total_pages = math.ceil(total_rows / request.args.get('page_size', 20, type=int))
-    return jsonify({"employees": employees, "total_employees": total_rows, "total_pages": total_pages})
-
-@app.route('/api/employees', methods=['POST'])
-@editor_required
-def add_employee_archive():
-    if 'user' not in session:
-        return jsonify({"error": "Unauthorized"}), 401
-
-    try:
-        dst = wsdl_client.dms_system_login()
-        if not dst:
-            return jsonify({"error": "Failed to get system-level DMS token"}), 500
-
-        dms_user = session['user']['username']
-        employee_data = json.loads(request.form.get('employee_data'))
-
-        documents = []
-        i = 0
-        while f'new_documents[{i}][file]' in request.files:
-            doc_data = {
-                "file": request.files[f'new_documents[{i}][file]'],
-                "doc_type_id": request.form.get(f'new_documents[{i}][doc_type_id]'),
-                "doc_type_name": request.form.get(f'new_documents[{i}][doc_type_name]'),
-                "expiry": request.form.get(f'new_documents[{i}][expiry]'),
-                "legislation_ids": request.form.getlist(f'new_documents[{i}][legislation_ids][]')
-            }
-            documents.append(doc_data)
-            i += 1
-
-        success, message = db_connector.add_employee_archive_with_docs(session['dst'], dms_user, employee_data,
-                                                                         documents)
-        return (jsonify({"message": message}), 201) if success else (jsonify({"error": message}), 500)
-
-    except Exception as e:
-         logging.error(f"Error adding employee archive: {e}", exc_info=True)
-         return jsonify({"error": str(e)}), 500
-
-@app.route('/api/employees/<int:archive_id>', methods=['GET'])
-def get_employee_details(archive_id):
-    if 'user' not in session: return jsonify({"error": "Unauthorized"}), 401
-    details = db_connector.fetch_single_archived_employee(archive_id)
-    return jsonify(details) if details else (jsonify({"error": "Not found"}), 404)
-
-@app.route('/api/employees/<int:archive_id>', methods=['PUT'])
-@editor_required
-def update_employee_archive(archive_id):
-    if 'user' not in session: 
-        return jsonify({"error": "Unauthorized"}), 401
-
-    try:
-        dst = wsdl_client.dms_system_login()
-        if not dst:
-            return jsonify({"error": "Failed to get system-level DMS token"}), 500
-        dms_user = session['user']['username']
-        employee_data = json.loads(request.form.get('employee_data'))
-
-        new_documents = []
-        i = 0
-        while f'new_documents[{i}][file]' in request.files:
-            doc_data = {
-                "file": request.files[f'new_documents[{i}][file]'],
-                "doc_type_id": request.form.get(f'new_documents[{i}][doc_type_id]'),
-                "doc_type_name": request.form.get(f'new_documents[{i}][doc_type_name]'),
-                "expiry": request.form.get(f'new_documents[{i}][expiry]'),
-                "legislation_ids": request.form.getlist(f'new_documents[{i}][legislation_ids][]')
-            }
-            new_documents.append(doc_data)
-            i += 1
-
-        deleted_doc_ids = json.loads(request.form.get('deleted_documents', '[]'))
-        updated_documents = json.loads(request.form.get('updated_documents', '[]'))
-
-        success, message = db_connector.update_archived_employee(
-            session['dst'], dms_user, archive_id, employee_data,
-            new_documents, deleted_doc_ids, updated_documents
-        )
-
-        return (jsonify({"message": message}), 200) if success else (jsonify({"error": message}), 500)
-    except Exception as e:
-        logging.error(f"Error updating employee archive {archive_id}: {e}", exc_info=True)
-        return jsonify({"error": str(e)}), 500
-
-@app.route('/api/hr_employees', methods=['GET'])
-def get_hr_employees():
-    if 'user' not in session: return jsonify({"error": "Unauthorized"}), 401
-    search = request.args.get('search', "", type=str)
-    page = request.args.get('page', 1, type=int)
-    employees, total_rows = db_connector.fetch_hr_employees_paginated(search_term=search, page=page)
-    has_more = (page * 10) < total_rows
-    return jsonify({"employees": employees, "hasMore": has_more})
-
-@app.route('/api/hr_employees/<int:employee_id>', methods=['GET'])
-def get_hr_employee_details(employee_id):
-    if 'user' not in session: return jsonify({"error": "Unauthorized"}), 401
-    details = db_connector.fetch_hr_employee_details(employee_id)
-    return jsonify(details) if details else (jsonify({"error": "Not found"}), 404)
-
-@app.route('/api/statuses', methods=['GET'])
-def get_statuses():
-    if 'user' not in session: return jsonify({"error": "Unauthorized"}), 401
-    statuses = db_connector.fetch_statuses()
-    return jsonify(statuses)
-
-@app.route('/api/document_types', methods=['GET'])
-def get_document_types():
-    if 'user' not in session: return jsonify({"error": "Unauthorized"}), 401
-    doc_types = db_connector.fetch_document_types()
-    return jsonify(doc_types)
-
-@app.route('/api/legislations', methods=['GET'])
-def get_legislations():
-    if 'user' not in session: return jsonify({"error": "Unauthorized"}), 401
-    legislations = db_connector.fetch_legislations()
-    return jsonify(legislations)
 
 @app.route('/api/document/<int:docnumber>', methods=['GET'])
 def get_document_file(docnumber):
