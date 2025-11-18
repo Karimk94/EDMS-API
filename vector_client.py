@@ -3,6 +3,7 @@ import os
 import logging
 import api_client
 from chromadb.utils import embedding_functions
+from chromadb.config import Settings
 
 # --- Logging Setup ---
 # Set up logging for this module
@@ -14,7 +15,7 @@ COLLECTION_NAME = os.getenv('CHROMA_COLLECTION_NAME', 'edms_documents')
 
 logging.info(f"Initializing ChromaDB PersistentClient at path: {CHROMA_DB_PATH}")
 # Use a persistent client to save data to disk
-client = chromadb.PersistentClient(path=CHROMA_DB_PATH)
+client = chromadb.PersistentClient(path=CHROMA_DB_PATH,settings=Settings(anonymized_telemetry=False))
 
 # Use your separate embedding service
 # We create a wrapper class that matches what ChromaDB expects
