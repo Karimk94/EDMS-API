@@ -12,6 +12,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 # --- ChromaDB Setup ---
 CHROMA_DB_PATH = os.getenv('CHROMA_DB_PATH', './chroma_db')
 COLLECTION_NAME = os.getenv('CHROMA_COLLECTION_NAME', 'edms_documents')
+DISTANCE_THRESHOLD = 0.9
 
 logging.info(f"Initializing ChromaDB PersistentClient at path: {CHROMA_DB_PATH}")
 # Use a persistent client to save data to disk
@@ -79,34 +80,51 @@ def add_or_update_document(doc_id: int, text_content: str):
     except Exception as e:
         logging.error(f"VectorClient: Failed to upsert vector for doc_id {doc_id}: {e}", exc_info=True)
 
+
 def query_documents(search_term: str, n_results: int = 40) -> list[int] | None:
     """
     Queries the vector store for a search term.
-    Returns a list of document IDs, or None if the query fails.
+    Returns a list of document IDs, or None if the query fails or results are irrelevant.
     """
-    logging.info(f"VectorClient: Querying for term: '{search_term}' (n_results={n_results})...")
+    # logging.info(f"VectorClient: Querying for term: '{search_term}' (n_results={n_results})...")
     try:
-        # The collection.query method will automatically use the 
-        # external_embed_fn to turn `search_term` into a vector.
         results = collection.query(
             query_texts=[search_term],
-            n_results=n_results
+            n_results=n_results,
+            include=['documents', 'distances', 'metadatas']
         )
-        
+
         doc_ids = results.get('ids', [[]])[0]
+        distances = results.get('distances', [[]])[0]
+
         if not doc_ids:
-            logging.info(f"VectorClient: Vector search for '{search_term}' returned 0 results.")
+            # logging.info(f"VectorClient: Vector search for '{search_term}' returned 0 results.")
             return []
-            
-        # Convert string IDs back to integers
-        int_doc_ids = [int(doc_id) for doc_id in doc_ids]
-        logging.info(f"VectorClient: Vector search for '{search_term}' found {len(int_doc_ids)} results (Doc IDs: {int_doc_ids}).")
-        return int_doc_ids
+
+        # --- Filter Results by Threshold ---
+        valid_doc_ids = []
+
+        # logging.info(f"--- DEBUG: Vector Results for '{search_term}' ---")
+        for i in range(len(doc_ids)):
+            doc_id = doc_ids[i]
+            dist = distances[i]
+
+            # Only keep results that are "close enough"
+            if dist <= DISTANCE_THRESHOLD:
+                valid_doc_ids.append(int(doc_id))
+                # logging.info(f"   [KEEP] Match #{i + 1}: DocID {doc_id} | Distance: {dist}")
+            else:
+                # Log what we are dropping so you can tune the threshold
+                logging.info(f"   [DROP] Match #{i + 1}: DocID {doc_id} | Distance: {dist} (Too far)")
+
+        # logging.info(f"-----------------------------------------------")
+
+        # logging.info(f"VectorClient: Returning {len(valid_doc_ids)} valid matches out of {len(doc_ids)} found.")
+        return valid_doc_ids
 
     except Exception as e:
-        # If the embedding service is down or ChromaDB fails
         logging.error(f"VectorClient: Vector search query failed for term '{search_term}': {e}", exc_info=True)
-        return None # Return None to signal a failure (for fallback)
+        return None
 
 def delete_document(doc_id: int):
     """

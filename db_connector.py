@@ -469,15 +469,14 @@ def fetch_documents_from_oracle(page=1, page_size=20, search_term=None, date_fro
     shortlist_sql = "AND k.SHORTLISTED = '1'" if security_level == 'Viewer' else ""
 
     vector_doc_ids = None
+
     use_vector_search = (
             vector_client is not None and
             search_term and
-            not memory_month and
-            sort is None
+            not memory_month
     )
 
     if use_vector_search:
-        logging.info(f"Attempting vector search for: {search_term}")
         vector_doc_ids = vector_client.query_documents(search_term, n_results=page_size)
 
     if memory_month is not None:
@@ -523,27 +522,28 @@ def fetch_documents_from_oracle(page=1, page_size=20, search_term=None, date_fro
                         params[key_upper] = f"%{word.upper()}%"
 
                         word_condition = f"""
-                        (
-                            p.ABSTRACT LIKE :{key} OR UPPER(p.ABSTRACT) LIKE :{key_upper} OR
-                            p.DOCNAME LIKE :{key} OR UPPER(p.DOCNAME) LIKE :{key_upper} OR
-                            EXISTS (
-                                SELECT 1 FROM LKP_DOCUMENT_TAGS ldt
-                                JOIN KEYWORD k ON ldt.TAG_ID = k.SYSTEM_ID
-                                WHERE ldt.DOCNUMBER = p.DOCNUMBER 
-                                AND (k.DESCRIPTION LIKE :{key} OR UPPER(k.KEYWORD_ID) LIKE :{key_upper}) 
-                                AND ldt.DISABLED = '0'
-                                {shortlist_sql}
-                            ) OR
-                            EXISTS (
-                                SELECT 1 FROM LKP_PERSON p_filter
-                                WHERE (p_filter.NAME_ARABIC LIKE :{key} OR UPPER(p_filter.NAME_ENGLISH) LIKE :{key_upper})
-                                AND (
-                                     UPPER(p.ABSTRACT) LIKE '%' || UPPER(p_filter.NAME_ENGLISH) || '%'
-                                     OR (p_filter.NAME_ARABIC IS NOT NULL AND p.ABSTRACT LIKE '%' || p_filter.NAME_ARABIC || '%')
-                                )
-                            )
-                        )
-                        """
+                                                (
+                                                    p.ABSTRACT LIKE :{key} OR UPPER(p.ABSTRACT) LIKE :{key_upper} OR
+                                                    p.DOCNAME LIKE :{key} OR UPPER(p.DOCNAME) LIKE :{key_upper} OR
+                                                    TO_CHAR(p.RTADOCDATE, 'YYYY-MM-DD') LIKE :{key} OR
+                                                    EXISTS (
+                                                        SELECT 1 FROM LKP_DOCUMENT_TAGS ldt
+                                                        JOIN KEYWORD k ON ldt.TAG_ID = k.SYSTEM_ID
+                                                        WHERE ldt.DOCNUMBER = p.DOCNUMBER 
+                                                        AND (k.DESCRIPTION LIKE :{key} OR UPPER(k.KEYWORD_ID) LIKE :{key_upper}) 
+                                                        AND ldt.DISABLED = '0'
+                                                        {shortlist_sql}
+                                                    ) OR
+                                                    EXISTS (
+                                                        SELECT 1 FROM LKP_PERSON p_filter
+                                                        WHERE (p_filter.NAME_ARABIC LIKE :{key} OR UPPER(p_filter.NAME_ENGLISH) LIKE :{key_upper})
+                                                        AND (
+                                                             UPPER(p.ABSTRACT) LIKE '%' || UPPER(p_filter.NAME_ENGLISH) || '%'
+                                                             OR (p_filter.NAME_ARABIC IS NOT NULL AND p.ABSTRACT LIKE '%' || p_filter.NAME_ARABIC || '%')
+                                                        )
+                                                    )
+                                                )
+                                                """
                         word_conditions.append(word_condition)
                     where_clauses.append(f"({' AND '.join(word_conditions)})")
 
