@@ -152,11 +152,12 @@ def apply_watermark_to_image(image_bytes, username):
         txt_layer = Image.new('RGBA', base_image.size, (255, 255, 255, 0))
         draw = ImageDraw.Draw(txt_layer)
 
-        text = f"Downloaded by: {username}"
+        # Added date and time to text
+        current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        text = f"Downloaded by: {username} | {current_time}"
 
-        # Calculate font size relative to image width (e.g., 3% of width)
-        # Minimum size of 15 to be readable
-        font_size = max(15, int(width * 0.03))
+        # Calculate font size relative to image width
+        font_size = max(10, int(width * 0.015))
 
         # Attempt to load a font, fallback to default if not found
         try:
@@ -165,7 +166,6 @@ def apply_watermark_to_image(image_bytes, username):
             font = ImageFont.load_default()
 
         # Get text size
-        # Pillow < 10 use textsize, >= 10 use textbbox
         if hasattr(draw, 'textbbox'):
             bbox = draw.textbbox((0, 0), text, font=font)
             text_width = bbox[2] - bbox[0]
@@ -179,9 +179,11 @@ def apply_watermark_to_image(image_bytes, username):
         x = width - text_width - padding_x
         y = height - text_height - padding_y
 
-        # Draw text with semi-transparent white color
-        # (255, 255, 255, 128) -> White with ~50% opacity
-        draw.text((x, y), text, font=font, fill=(255, 255, 255, 150))
+        # Draw Shadow (Black) - Offset by 1 pixel
+        draw.text((x + 1, y + 1), text, font=font, fill=(0, 0, 0, 160))
+
+        # Draw Main Text (White)
+        draw.text((x, y), text, font=font, fill=(255, 255, 255, 200))
 
         # Composite
         watermarked = Image.alpha_composite(base_image, txt_layer)
@@ -198,26 +200,26 @@ def apply_watermark_to_pdf(pdf_bytes, username):
     try:
         # Open PDF from bytes
         doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-        text = f"Downloaded by: {username}"
+
+        current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        text = f"Downloaded by: {username} | {current_time}"
 
         for page in doc:
             rect = page.rect
-            # Insert text at bottom right
-            # We use insert_text with a point.
-            # To align right, we need to guess width or use a text box.
-            # A simple way is to place it relative to the bottom-right corner.
+            fontsize = 8
 
-            # Font size 12
-            fontsize = 12
-
-            # Estimate text width (approximate)
+            # Estimate text width
             text_width = fitz.get_text_length(text, fontname="helv", fontsize=fontsize)
 
             x = rect.width - text_width - 20
             y = rect.height - 20
 
-            # Insert text with 50% opacity (fill_opacity)
-            page.insert_text((x, y), text, fontsize=fontsize, fontname="helv", color=(0.5, 0.5, 0.5), fill_opacity=0.5)
+            # Insert Shadow (Black)
+            page.insert_text((x + 0.5, y + 0.5), text, fontsize=fontsize, fontname="helv", color=(0, 0, 0),
+                             fill_opacity=0.5)
+
+            # Insert Main Text (White) - using color=(1,1,1) for white
+            page.insert_text((x, y), text, fontsize=fontsize, fontname="helv", color=(1, 1, 1), fill_opacity=0.8)
 
         output_buffer = io.BytesIO()
         doc.save(output_buffer)
@@ -239,19 +241,19 @@ def apply_watermark_to_video(video_bytes, username, filename):
 
             video = VideoFileClip(temp_video_path)
 
-            text = f"Downloaded by: {username}"
+            current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            text = f"Downloaded by: {username} | {current_time}"
 
-            # Create text clip
-            # Ensure ImageMagick is installed for TextClip to work perfectly,
-            # otherwise this might fail or fallback.
-            # font size relative to height
-            fontsize = max(20, int(video.h * 0.03))
+            # Font size
+            fontsize = max(12, int(video.h * 0.015))
 
-            txt_clip = (TextClip(text, fontsize=fontsize, color='white', font='Arial')
-                        .set_position(('right', 'bottom'))
-                        .set_duration(video.duration)
-                        .set_opacity(0.5)  # 50% opacity
-                        .margin(right=20, bottom=20, opacity=0))
+            # Create text clip with a black stroke (outline) for visibility
+            txt_clip = (
+                TextClip(text, fontsize=fontsize, color='white', font='Arial', stroke_color='black', stroke_width=1)
+                .set_position(('right', 'bottom'))
+                .set_duration(video.duration)
+                .set_opacity(0.6)
+                .margin(right=20, bottom=20, opacity=0))
 
             final = CompositeVideoClip([video, txt_clip])
 
