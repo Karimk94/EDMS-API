@@ -6,7 +6,7 @@ python-dotenv
 zeep
 flask-cors
 Pillow
-moviepy
+moviepy==1.0.3
 PyMuPDF
 waitress
 flask-gssapi

@@ -15,6 +15,10 @@ import mimetypes
 from functools import wraps
 import io
 from datetime import datetime, timedelta
+from moviepy.editor import VideoFileClip, TextClip, CompositeVideoClip
+from PIL import Image, ImageDraw, ImageFont
+import fitz
+import tempfile
 
 # --- Logging Setup ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -29,8 +33,9 @@ def editor_required(f):
     @wraps(f)
     def decorated_function(*args, **kwargs):
         if 'user' not in session or session['user'].get('security_level') != 'Editor':
-            abort(403) # Forbidden
+            abort(403)  # Forbidden
         return f(*args, **kwargs)
+
     return decorated_function
 
 @app.route('/api/auth/login', methods=['POST'])
@@ -49,15 +54,17 @@ def login():
         user_details = db_connector.get_user_details(username)
 
         if user_details is None or 'security_level' not in user_details:
-             logging.warning(f"User '{username}' authenticated via DMS but has no security level assigned in middleware DB.")
-             return jsonify({"error": "User not authorized for this application"}), 401
+            logging.warning(
+                f"User '{username}' authenticated via DMS but has no security level assigned in middleware DB.")
+            return jsonify({"error": "User not authorized for this application"}), 401
 
         # Store full user details in session
         session['user'] = user_details
         # session['dst'] = dst
         session.permanent = True
 
-        logging.info(f"User '{username}' logged in successfully with security level '{user_details.get('security_level')}' and theme '{user_details.get('theme')}'.")
+        logging.info(
+            f"User '{username}' logged in successfully with security level '{user_details.get('security_level')}' and theme '{user_details.get('theme')}'.")
         return jsonify({"message": "Login successful", "user": user_details}), 200
     else:
         logging.warning(f"DMS login failed for user '{username}'.")
@@ -77,7 +84,7 @@ def get_user():
         # Re-fetch from DB to ensure details are fresh
         user_details = db_connector.get_user_details(user_session['username'])
         if user_details:
-            session['user'] = user_details # Update session
+            session['user'] = user_details  # Update session
             return jsonify({'user': user_details}), 200
         else:
             # User was in session but not in DB? Log them out.
@@ -134,8 +141,142 @@ def api_update_user_theme():
         logging.error(f"Failed to update theme for user '{username}'.")
         return jsonify({"error": "Failed to update theme"}), 500
 
+# --- Watermarking Functions ---
+def apply_watermark_to_image(image_bytes, username):
+    """Applies a text watermark to the bottom-right of an image."""
+    try:
+        base_image = Image.open(io.BytesIO(image_bytes)).convert("RGBA")
+        width, height = base_image.size
+
+        # Create a transparent layer for text
+        txt_layer = Image.new('RGBA', base_image.size, (255, 255, 255, 0))
+        draw = ImageDraw.Draw(txt_layer)
+
+        text = f"Downloaded by: {username}"
+
+        # Calculate font size relative to image width (e.g., 3% of width)
+        # Minimum size of 15 to be readable
+        font_size = max(15, int(width * 0.03))
+
+        # Attempt to load a font, fallback to default if not found
+        try:
+            font = ImageFont.truetype("arial.ttf", font_size)
+        except IOError:
+            font = ImageFont.load_default()
+
+        # Get text size
+        # Pillow < 10 use textsize, >= 10 use textbbox
+        if hasattr(draw, 'textbbox'):
+            bbox = draw.textbbox((0, 0), text, font=font)
+            text_width = bbox[2] - bbox[0]
+            text_height = bbox[3] - bbox[1]
+        else:
+            text_width, text_height = draw.textsize(text, font=font)
+
+        # Position: Bottom Right with padding
+        padding_x = 20
+        padding_y = 20
+        x = width - text_width - padding_x
+        y = height - text_height - padding_y
+
+        # Draw text with semi-transparent white color
+        # (255, 255, 255, 128) -> White with ~50% opacity
+        draw.text((x, y), text, font=font, fill=(255, 255, 255, 150))
+
+        # Composite
+        watermarked = Image.alpha_composite(base_image, txt_layer)
+
+        output_buffer = io.BytesIO()
+        watermarked.convert("RGB").save(output_buffer, format="JPEG", quality=95)
+        return output_buffer.getvalue(), "image/jpeg"
+    except Exception as e:
+        logging.error(f"Error watermarking image: {e}", exc_info=True)
+        return image_bytes, "image/jpeg"
+
+def apply_watermark_to_pdf(pdf_bytes, username):
+    """Applies a text watermark to the bottom-right of every PDF page."""
+    try:
+        # Open PDF from bytes
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        text = f"Downloaded by: {username}"
+
+        for page in doc:
+            rect = page.rect
+            # Insert text at bottom right
+            # We use insert_text with a point.
+            # To align right, we need to guess width or use a text box.
+            # A simple way is to place it relative to the bottom-right corner.
+
+            # Font size 12
+            fontsize = 12
+
+            # Estimate text width (approximate)
+            text_width = fitz.get_text_length(text, fontname="helv", fontsize=fontsize)
+
+            x = rect.width - text_width - 20
+            y = rect.height - 20
+
+            # Insert text with 50% opacity (fill_opacity)
+            page.insert_text((x, y), text, fontsize=fontsize, fontname="helv", color=(0.5, 0.5, 0.5), fill_opacity=0.5)
+
+        output_buffer = io.BytesIO()
+        doc.save(output_buffer)
+        return output_buffer.getvalue(), "application/pdf"
+    except Exception as e:
+        logging.error(f"Error watermarking PDF: {e}", exc_info=True)
+        return pdf_bytes, "application/pdf"
+
+def apply_watermark_to_video(video_bytes, username, filename):
+    """Applies a text watermark to a video using MoviePy."""
+    try:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_video_path = os.path.join(temp_dir, filename)
+            output_video_path = os.path.join(temp_dir, f"watermarked_{filename}")
+
+            # Write original video to temp file
+            with open(temp_video_path, 'wb') as f:
+                f.write(video_bytes)
+
+            video = VideoFileClip(temp_video_path)
+
+            text = f"Downloaded by: {username}"
+
+            # Create text clip
+            # Ensure ImageMagick is installed for TextClip to work perfectly,
+            # otherwise this might fail or fallback.
+            # font size relative to height
+            fontsize = max(20, int(video.h * 0.03))
+
+            txt_clip = (TextClip(text, fontsize=fontsize, color='white', font='Arial')
+                        .set_position(('right', 'bottom'))
+                        .set_duration(video.duration)
+                        .set_opacity(0.5)  # 50% opacity
+                        .margin(right=20, bottom=20, opacity=0))
+
+            final = CompositeVideoClip([video, txt_clip])
+
+            # Write to a file (temp) using ultrafast preset
+            final.write_videofile(
+                output_video_path,
+                codec='libx264',
+                audio_codec='aac',
+                temp_audiofile=os.path.join(temp_dir, 'temp-audio.m4a'),
+                remove_temp=True,
+                verbose=False,
+                logger=None,
+                preset='ultrafast'
+            )
+
+            with open(output_video_path, 'rb') as f:
+                return f.read(), "video/mp4"
+
+    except Exception as e:
+        logging.error(f"Error watermarking video: {e}", exc_info=True)
+        return video_bytes, "video/mp4"
+
 # --- AI Processing Routes ---
 def process_document(doc, dms_session_token):
+    # ... (Existing process_document logic unchanged)
     """
     Processes a single document, handling its own errors and returning a dictionary
     ready for database update.
@@ -154,7 +295,7 @@ def process_document(doc, dms_session_token):
         "o_detected": doc.get('o_detected', 0),
         "ocr": doc.get('ocr', 0),
         "face": doc.get('face', 0),
-        "transcript": '', # Assuming transcript is not stored long-term in DB separately
+        "transcript": '',  # Assuming transcript is not stored long-term in DB separately
         "status": 1,  # Default status: In Progress
         "error": '',
         "attempts": doc.get('attempts', 0) + 1
@@ -162,7 +303,8 @@ def process_document(doc, dms_session_token):
 
     try:
         # Step 1: Fetch media and determine type from DMS
-        media_bytes, filename = wsdl_client.get_image_by_docnumber(dms_session_token, docnumber) # Reusing this function for all types
+        media_bytes, filename = wsdl_client.get_image_by_docnumber(dms_session_token,
+                                                                   docnumber)  # Reusing this function for all types
         if not media_bytes:
             raise Exception(f"Failed to retrieve media for docnumber {docnumber} from WSDL service.")
 
@@ -302,8 +444,8 @@ def process_document(doc, dms_session_token):
                     for tag in english_tags:
                         arabic_translation = api_client.translate_text(tag)
                         keywords_to_insert.append({'english': tag, 'arabic': arabic_translation})
-            else: # If no OCR text found in PDF
-                 results['ocr'] = 1 # Still mark as OCR processed
+            else:  # If no OCR text found in PDF
+                results['ocr'] = 1  # Still mark as OCR processed
 
             if keywords_to_insert:
                 db_connector.insert_keywords_and_tags(docnumber, keywords_to_insert)
@@ -329,28 +471,27 @@ def process_document(doc, dms_session_token):
                 for tag in tags:
                     arabic_translation = api_client.translate_text(tag)
                     keywords_to_insert.append({'english': tag, 'arabic': arabic_translation})
-            else: # No caption result
-                results['o_detected'] = 0 # Mark as not detected if service failed/returned empty
+            else:  # No caption result
+                results['o_detected'] = 0  # Mark as not detected if service failed/returned empty
 
             ocr_text = api_client.get_ocr_text(media_bytes, filename)
 
-            if ocr_text: # Check if OCR actually returned text
+            if ocr_text:  # Check if OCR actually returned text
                 results['ocr'] = 1
                 ai_abstract_parts['OCR'] = ocr_text
             else:
-                 results['ocr'] = 1 # Mark OCR as processed even if no text found
+                results['ocr'] = 1  # Mark OCR as processed even if no text found
 
             recognized_faces = api_client.recognize_faces(media_bytes, filename)
-            if recognized_faces is not None: # Check if recognition ran (even if no faces found)
+            if recognized_faces is not None:  # Check if recognition ran (even if no faces found)
                 results['face'] = 1
                 # Use a set to automatically handle duplicates
                 unique_known_faces = {f.get('name').replace('_', ' ').title() for f in recognized_faces if
                                       f.get('name') and f.get('name') != 'Unknown'}
                 if unique_known_faces:
                     ai_abstract_parts['VIPS'] = ", ".join(sorted(list(unique_known_faces)))
-            else: # Face recognition service failed
+            else:  # Face recognition service failed
                 results['face'] = 0
-
 
             if keywords_to_insert:
                 db_connector.insert_keywords_and_tags(docnumber, keywords_to_insert)
@@ -365,33 +506,33 @@ def process_document(doc, dms_session_token):
         if len(ai_abstract_parts) > 0:
             results['new_abstract'] = "\n\n".join(filter(None, final_abstract_parts)).strip()
         else:
-             results['new_abstract'] = base_abstract # Keep original if no AI data
-
+            results['new_abstract'] = base_abstract  # Keep original if no AI data
 
         # Step 4: Set success status based on media type and results
         if media_type == 'pdf':
-            results['status'] = 3 if results['ocr'] == 1 else results['status'] # Success for PDF is just OCR attempted
-        else: # Image or Video
+            results['status'] = 3 if results['ocr'] == 1 else results['status']  # Success for PDF is just OCR attempted
+        else:  # Image or Video
             # Success requires all *attempted* steps to have run (indicated by 1)
-             if results['o_detected'] == 1 and results['ocr'] == 1 and results['face'] == 1:
+            if results['o_detected'] == 1 and results['ocr'] == 1 and results['face'] == 1:
                 results['status'] = 3
-             else:
-                 # Check if any step failed (returned 0 after being attempted)
-                 if results['o_detected'] == 0 or results['ocr'] == 0 or results['face'] == 0:
-                      logging.warning(f"One or more AI steps failed for {docnumber}. Status not set to Success.")
-                      # Keep status as 1 (In Progress) or let error handling set it to 2
+            else:
+                # Check if any step failed (returned 0 after being attempted)
+                if results['o_detected'] == 0 or results['ocr'] == 0 or results['face'] == 0:
+                    logging.warning(f"One or more AI steps failed for {docnumber}. Status not set to Success.")
+                    # Keep status as 1 (In Progress) or let error handling set it to 2
 
     except Exception as e:
         # If any error occurs during the main processing, log it and set the error status
         logging.error(f"Error processing document {docnumber}: {e}", exc_info=True)
         results['status'] = 2  # Error status
-        results['error'] = str(e)[:2000] # Truncate error message if needed
+        results['error'] = str(e)[:2000]  # Truncate error message if needed
 
     # Final check before returning results
     if results['status'] != 3 and results['status'] != 2:
         # If it's not Success or Error, but attempts are high, mark as Error
         if results['attempts'] >= 3:
-            logging.warning(f"Document {docnumber} reached max attempts ({results['attempts']}) without full success. Marking as Error.")
+            logging.warning(
+                f"Document {docnumber} reached max attempts ({results['attempts']}) without full success. Marking as Error.")
             results['status'] = 2
             results['error'] = results['error'] or "Max processing attempts reached without full success."
         else:
@@ -427,7 +568,7 @@ def process_batch():
             kwargs=result_data
         )
         db_thread.start()
-        db_thread.join(timeout=30.0) # Increased timeout
+        db_thread.join(timeout=30.0)  # Increased timeout
 
         if db_thread.is_alive():
             # If the thread is still running after 30 seconds, it's hung.
@@ -438,16 +579,16 @@ def process_batch():
             if result_data['status'] == 3:  # Success
                 processed_count += 1
                 logging.info(f"Successfully processed and updated DB for document {doc['docnumber']}.")
-            elif result_data['status'] == 2: # Error
-                 logging.error(f"Failed to process document {doc['docnumber']}. Error logged: {result_data['error']}")
-            else: # Still In Progress (status 1)
+            elif result_data['status'] == 2:  # Error
+                logging.error(f"Failed to process document {doc['docnumber']}. Error logged: {result_data['error']}")
+            else:  # Still In Progress (status 1)
                 logging.warning(
                     f"Processing for document {doc['docnumber']} not fully complete in this run (Status: {result_data['status']}). Will retry on next batch if attempts < 3.")
 
-
     logging.info(f"Batch finished. Successfully processed {processed_count} out of {len(documents)} documents.")
     return jsonify(
-        {"status": "success", "message": f"Processed {processed_count} documents.", "processed_count": processed_count}), 200
+        {"status": "success", "message": f"Processed {processed_count} documents.",
+         "processed_count": processed_count}), 200
 
 @app.route('/api/upload_document', methods=['POST'])
 def api_upload_document():
@@ -461,11 +602,11 @@ def api_upload_document():
     file_stream = file.stream
     # Read the content once to pass to EXIF and WSDL upload
     file_bytes = file_stream.read()
-    file_stream.seek(0) # Reset stream pointer for the actual upload
+    file_stream.seek(0)  # Reset stream pointer for the actual upload
 
     # --- Date Taken Logic ---
     doc_date_taken = None
-    date_taken_str = request.form.get('date_taken') # Expected format: YYYY-MM-DD HH:MM:SS
+    date_taken_str = request.form.get('date_taken')  # Expected format: YYYY-MM-DD HH:MM:SS
     if date_taken_str:
         try:
             doc_date_taken = datetime.strptime(date_taken_str, '%Y-%m-%d %H:%M:%S')
@@ -490,16 +631,16 @@ def api_upload_document():
     # --- Docname Logic ---
     docname = request.form.get('docname')
     if not docname or not docname.strip():
-        docname = os.path.splitext(original_filename)[0] # Fallback to original filename base
+        docname = os.path.splitext(original_filename)[0]  # Fallback to original filename base
     else:
-        docname = docname.strip() # Use stripped name from form
+        docname = docname.strip()  # Use stripped name from form
         name_base, name_ext = os.path.splitext(docname)
         if name_ext.lstrip('.').upper() == file_extension:
             docname = name_base
     logging.info(f"Using docname: {docname}")
     # --- End Docname Logic ---
 
-    abstract = request.form.get('abstract', 'Uploaded via EDMS Viewer') # Keep default if needed
+    abstract = request.form.get('abstract', 'Uploaded via EDMS Viewer')  # Keep default if needed
 
     # --- Event ID ---
     event_id_str = request.form.get('event_id')
@@ -524,7 +665,7 @@ def api_upload_document():
         "app_id": app_id,
         "filename": original_filename,
         "doc_date": doc_date_taken,
-        "event_id": event_id # Pass event_id to wsdl client
+        "event_id": event_id  # Pass event_id to wsdl client
     }
 
     # Pass the original file stream (reset pointer) for the actual upload
@@ -567,7 +708,7 @@ def api_process_uploaded_documents():
             kwargs=result_data
         )
         db_thread.start()
-        db_thread.join(timeout=30.0) # Increased timeout
+        db_thread.join(timeout=30.0)  # Increased timeout
 
         if db_thread.is_alive():
             logging.critical(f"DATABASE HANG: The update for doc {doc['docnumber']} timed out.")
@@ -576,13 +717,12 @@ def api_process_uploaded_documents():
             if result_data['status'] == 3:  # Success
                 results["processed"].append(doc['docnumber'])
                 logging.info(f"Successfully processed uploaded doc {doc['docnumber']}.")
-            elif result_data['status'] == 2: # Error
+            elif result_data['status'] == 2:  # Error
                 results["failed"].append(doc['docnumber'])
                 logging.error(f"Failed to process uploaded doc {doc['docnumber']}. Error: {result_data.get('error')}")
-            else: # Still In Progress (status 1)
+            else:  # Still In Progress (status 1)
                 results["in_progress"].append(doc['docnumber'])
                 logging.warning(f"Processing for uploaded doc {doc['docnumber']} not fully complete.")
-
 
     return jsonify(results), 200
 
@@ -667,8 +807,8 @@ def api_get_documents():
             "total_documents": total_rows
         })
     except Exception as e:
-         logging.error(f"Error in /api/documents endpoint: {e}", exc_info=True)
-         return jsonify({"error": "Failed to fetch documents due to server error."}), 500
+        logging.error(f"Error in /api/documents endpoint: {e}", exc_info=True)
+        return jsonify({"error": "Failed to fetch documents due to server error."}), 500
 
 @app.route('/api/document/<int:doc_id>/event', methods=['PUT'])
 def link_document_event(doc_id):
@@ -677,12 +817,12 @@ def link_document_event(doc_id):
     # -----------------------
     data = request.get_json()
     if data is None:
-         logging.error(f"Request for PUT /api/document/{doc_id}/event did not contain valid JSON data.")
-         return jsonify({"error": "Missing or invalid JSON data in request body."}), 400
-    logging.info(f"Received data: {data}") # Log the received data
+        logging.error(f"Request for PUT /api/document/{doc_id}/event did not contain valid JSON data.")
+        return jsonify({"error": "Missing or invalid JSON data in request body."}), 400
+    logging.info(f"Received data: {data}")  # Log the received data
     # --- END ADD ---
 
-    event_id = data.get('event_id') # Can be None to unlink
+    event_id = data.get('event_id')  # Can be None to unlink
 
     # Add extra logging around event_id processing
     logging.info(f"Extracted event_id: {event_id} (Type: {type(event_id)})")
@@ -719,9 +859,9 @@ def api_get_image(doc_id):
     dst = db_connector.dms_system_login()
     if not dst: return jsonify({'error': 'DMS login failed.'}), 500
 
-    image_data, _ = wsdl_client.get_image_by_docnumber(dst, doc_id) # Reusing this
+    image_data, _ = wsdl_client.get_image_by_docnumber(dst, doc_id)  # Reusing this
     if image_data:
-        return Response(bytes(image_data), mimetype='image/jpeg') # Assuming jpeg, might need dynamic type
+        return Response(bytes(image_data), mimetype='image/jpeg')  # Assuming jpeg, might need dynamic type
     logging.warning(f"Image not found in DMS for doc_id: {doc_id}")
     return jsonify({'error': 'Image not found in EDMS.'}), 404
 
@@ -731,7 +871,7 @@ def api_get_pdf(doc_id):
     dst = db_connector.dms_system_login()
     if not dst: return jsonify({'error': 'DMS login failed.'}), 500
 
-    pdf_data, _ = wsdl_client.get_image_by_docnumber(dst, doc_id) # Reusing this
+    pdf_data, _ = wsdl_client.get_image_by_docnumber(dst, doc_id)  # Reusing this
     if pdf_data:
         return Response(bytes(pdf_data), mimetype='application/pdf')
     logging.warning(f"PDF not found in DMS for doc_id: {doc_id}")
@@ -838,15 +978,16 @@ def api_add_person():
     try:
         name_english = ""
         name_arabic = ""
-        
+
         is_arabic = (lang == 'ar') or (not name.strip().isascii())
 
         if is_arabic:
             name_arabic = name.strip()
             name_english = api_client.translate_text(name_arabic)
             if not name_english:
-                 logging.error(f"Failed to add person: Could not get English translation for Arabic name '{name_arabic}'.")
-                 return jsonify({'error': 'Failed to get English translation for Arabic name.'}), 500
+                logging.error(
+                    f"Failed to add person: Could not get English translation for Arabic name '{name_arabic}'.")
+                return jsonify({'error': 'Failed to get English translation for Arabic name.'}), 500
         else:
             name_english = name.strip()
             name_arabic = api_client.translate_text(name_english)
@@ -870,9 +1011,9 @@ def api_get_persons():
     page = request.args.get('page', 1, type=int)
     search = request.args.get('search', '', type=str)
     lang = request.args.get('lang', 'en', type=str)
-    
+
     persons, total_rows = db_connector.fetch_lkp_persons(page=page, search=search, lang=lang)
-    
+
     return jsonify({
         'options': persons,
         'hasMore': (page * 20) < total_rows
@@ -944,7 +1085,7 @@ def api_add_tag(doc_id):
         # --- Language Detection & Translation ---
         # A simple check: if it contains non-ASCII, assume Arabic.
         is_arabic = not tag.isascii()
-        
+
         english_keyword = ""
         arabic_keyword = ""
 
@@ -952,14 +1093,14 @@ def api_add_tag(doc_id):
             arabic_keyword = tag
             english_keyword = api_client.translate_text(tag)
             if not english_keyword:
-                 logging.warning(f"Could not translate Arabic tag '{tag}' to English.")
-                 return jsonify({'error': 'Failed to get English translation for Arabic tag.'}), 500
+                logging.warning(f"Could not translate Arabic tag '{tag}' to English.")
+                return jsonify({'error': 'Failed to get English translation for Arabic tag.'}), 500
         else:
             english_keyword = tag
             arabic_keyword = api_client.translate_text(tag)
             if not arabic_keyword:
-                 logging.warning(f"Could not translate English tag '{tag}' to Arabic.")
-                 return jsonify({'error': 'Failed to get Arabic translation for English tag.'}), 500
+                logging.warning(f"Could not translate English tag '{tag}' to Arabic.")
+                return jsonify({'error': 'Failed to get Arabic translation for English tag.'}), 500
 
         # --- End Translation ---
 
@@ -968,7 +1109,7 @@ def api_add_tag(doc_id):
             'english': english_keyword,
             'arabic': arabic_keyword
         }
-        
+
         # This function is designed to handle duplicates and link the tag.
         db_connector.insert_keywords_and_tags(doc_id, [keyword_to_insert])
 
@@ -1007,7 +1148,7 @@ def get_document_file(docnumber):
     dst = wsdl_client.dms_system_login()
     if not dst:
         return jsonify({"error": "Failed to get system-level DMS token"}), 500
-    
+
     file_bytes, filename = wsdl_client.get_document_from_dms(dst, docnumber)
 
     if file_bytes and filename:
@@ -1031,15 +1172,14 @@ def api_get_memories():
         day_str = request.args.get('day')
         day = int(day_str) if day_str and day_str.isdigit() else None
 
-        limit_str = request.args.get('limit', '5') # Default limit for stack view
+        limit_str = request.args.get('limit', '5')  # Default limit for stack view
         limit = int(limit_str) if limit_str.isdigit() else 5
-        limit = max(1, min(limit, 10)) # Ensure limit is reasonable (1-10)
-
+        limit = max(1, min(limit, 10))  # Ensure limit is reasonable (1-10)
 
         if not 1 <= month <= 12:
             return jsonify({"error": "Invalid month provided."}), 400
         if day is not None and not 1 <= day <= 31:
-             return jsonify({"error": "Invalid day provided."}), 400
+            return jsonify({"error": "Invalid day provided."}), 400
 
         # logging.info(f"Fetching memories for Month: {month}, Day: {day}, Limit: {limit}")
         memories = db_connector.fetch_memories_from_oracle(month=month, day=day, limit=limit)
@@ -1060,8 +1200,8 @@ def api_update_metadata():
         return jsonify({'error': 'Document ID (doc_id) is required.'}), 400
 
     # Extract potential fields to update
-    new_abstract = data.get('abstract') # Can be None if only date is updated
-    date_taken_str = data.get('date_taken') # Expected format: YYYY-MM-DD HH:MM:SS or null
+    new_abstract = data.get('abstract')  # Can be None if only date is updated
+    date_taken_str = data.get('date_taken')  # Expected format: YYYY-MM-DD HH:MM:SS or null
 
     # --- Validation ---
     # Check if at least one field is provided for update
@@ -1070,31 +1210,33 @@ def api_update_metadata():
 
     # --- Parse Date Taken String ---
     new_date_taken = None
-    update_date = False # Flag to indicate if date needs updating
-    if date_taken_str is not None: # Check if the key exists (even if value is null)
-        update_date = True # Intent to update the date is present
-        if date_taken_str: # If the string is not empty or null
-             try:
-                 # Attempt to parse the date string from the form
-                 new_date_taken = datetime.strptime(date_taken_str, '%Y-%m-%d %H:%M:%S')
-                 logging.info(f"Parsed date_taken from request: {new_date_taken}")
-             except (ValueError, TypeError):
-                 logging.warning(f"Could not parse date_taken '{date_taken_str}' from request. Date will not be updated.")
-                 # Return an error if parsing fails for a non-null string
-                 return jsonify({'error': f"Invalid date_taken format provided: '{date_taken_str}'. Expected YYYY-MM-DD HH:MM:SS."}), 400
+    update_date = False  # Flag to indicate if date needs updating
+    if date_taken_str is not None:  # Check if the key exists (even if value is null)
+        update_date = True  # Intent to update the date is present
+        if date_taken_str:  # If the string is not empty or null
+            try:
+                # Attempt to parse the date string from the form
+                new_date_taken = datetime.strptime(date_taken_str, '%Y-%m-%d %H:%M:%S')
+                logging.info(f"Parsed date_taken from request: {new_date_taken}")
+            except (ValueError, TypeError):
+                logging.warning(
+                    f"Could not parse date_taken '{date_taken_str}' from request. Date will not be updated.")
+                # Return an error if parsing fails for a non-null string
+                return jsonify({
+                                   'error': f"Invalid date_taken format provided: '{date_taken_str}'. Expected YYYY-MM-DD HH:MM:SS."}), 400
         # If date_taken_str is explicitly null or empty string, new_date_taken remains None, indicating clear/set to null
         else:
-             logging.info(f"Received request to set date_taken to NULL for doc_id {doc_id}.")
-
+            logging.info(f"Received request to set date_taken to NULL for doc_id {doc_id}.")
 
     username = session.get('user', {}).get('username', 'Unknown user')
-    logging.info(f"User '{username}' updating metadata for doc_id {doc_id}. Abstract provided: {new_abstract is not None}, Date provided: {date_taken_str is not None}")
+    logging.info(
+        f"User '{username}' updating metadata for doc_id {doc_id}. Abstract provided: {new_abstract is not None}, Date provided: {date_taken_str is not None}")
 
     # Call the updated database function, passing the parsed date or None
     success, message = db_connector.update_document_metadata(
         doc_id,
         new_abstract=new_abstract,
-        new_date_taken=new_date_taken if update_date else Ellipsis # Use Ellipsis to signal "don't update date"
+        new_date_taken=new_date_taken if update_date else Ellipsis  # Use Ellipsis to signal "don't update date"
     )
 
     if success:
@@ -1106,12 +1248,71 @@ def api_update_metadata():
         status_code = 404 if "not found" in message.lower() else 500
         return jsonify({'error': message}), status_code
 
+@app.route('/api/download_watermarked/<int:doc_id>', methods=['GET'])
+def api_download_watermarked(doc_id):
+    """Downloads a document with a watermark applied."""
+    if 'user' not in session:
+        return jsonify({"error": "Unauthorized"}), 401
+
+    # Get the username from session
+    username = session.get('user', {}).get('username', 'Unknown')
+
+    dst = wsdl_client.dms_system_login()
+    if not dst:
+        return jsonify({"error": "Failed to get system-level DMS token"}), 500
+
+    # Get original info
+    filename, media_type, file_ext = db_connector.get_media_info_from_dms(dst, doc_id)
+    if not filename:
+        return jsonify({"error": "Document not found"}), 404
+
+    # Get docname from DB for filename
+    download_filename = filename
+    try:
+        conn = db_connector.get_connection()
+        if conn:
+            with conn.cursor() as cursor:
+                cursor.execute("SELECT DOCNAME FROM PROFILE WHERE DOCNUMBER = :1", [doc_id])
+                result = cursor.fetchone()
+                if result and result[0]:
+                    # Sanitize filename
+                    safe_docname = "".join(
+                        [c for c in result[0] if c.isalpha() or c.isdigit() or c in (' ', '-', '_')]).rstrip()
+                    if safe_docname:
+                        download_filename = f"{safe_docname}{file_ext}"
+            conn.close()
+    except Exception as e:
+        logging.error(f"Error getting docname for download: {e}")
+
+    # Get content
+    file_bytes = db_connector.get_media_content_from_dms(dst, doc_id)
+    if not file_bytes:
+        return jsonify({"error": "Failed to retrieve document content"}), 500
+
+    processed_bytes = file_bytes
+    mimetype = 'application/octet-stream'
+
+    # Apply text watermark using the username
+    if media_type == 'image':
+        processed_bytes, mimetype = apply_watermark_to_image(file_bytes, username)
+    elif media_type == 'pdf':
+        processed_bytes, mimetype = apply_watermark_to_pdf(file_bytes, username)
+    elif media_type == 'video':
+        # WARNING: Video processing is slow.
+        processed_bytes, mimetype = apply_watermark_to_video(file_bytes, username, filename)
+
+    return Response(
+        processed_bytes,
+        mimetype=mimetype,
+        headers={"Content-Disposition": f"attachment; filename={download_filename}"}
+    )
+
 # --- Favorites API Routes ---
 @app.route('/api/favorites/<int:doc_id>', methods=['POST'])
 def add_favorite_route(doc_id):
     if 'user' not in session:
         return jsonify({"error": "Unauthorized"}), 401
-    user_id = session['user'].get('username') # Assuming username is the user ID from PEOPLE table
+    user_id = session['user'].get('username')  # Assuming username is the user ID from PEOPLE table
     success, message = db_connector.add_favorite(user_id, doc_id)
     if success:
         return jsonify({"message": message}), 201
@@ -1162,7 +1363,8 @@ def get_events_route():
 
     logging.debug(f"Fetching events - Page: {page}, PageSize: {page_size}, Search: '{search}', Fetch all: {fetch_all}")
 
-    events_list, total_rows = db_connector.get_events(page=page, page_size=page_size, search=search, fetch_all=fetch_all)
+    events_list, total_rows = db_connector.get_events(page=page, page_size=page_size, search=search,
+                                                      fetch_all=fetch_all)
 
     total_pages = math.ceil(total_rows / page_size) if total_rows > 0 else 1
     has_more = (page * page_size) < total_rows
@@ -1191,7 +1393,7 @@ def get_event_documents_route(event_id):
     """Fetches paginated documents associated with a specific event."""
     page = request.args.get('page', 1, type=int)
     # Use a page size of 1 for the slider modal
-    page_size = 1 # Fetch one document at a time for the modal slider
+    page_size = 1  # Fetch one document at a time for the modal slider
 
     if page < 1: page = 1
 
@@ -1205,9 +1407,9 @@ def get_event_documents_route(event_id):
 
     if error_message:
         # Determine appropriate status code based on error message if needed
-        status_code = 500 # Default to internal server error
+        status_code = 500  # Default to internal server error
         if "not found" in error_message.lower():
-             status_code = 404
+            status_code = 404
         return jsonify({"error": error_message}), status_code
 
     # The function now returns a list (usually with one item due to page_size=1)
@@ -1215,7 +1417,7 @@ def get_event_documents_route(event_id):
     current_doc = documents[0] if documents else None
 
     return jsonify({
-        "document": current_doc, # Send the single document object for the current page
+        "document": current_doc,  # Send the single document object for the current page
         "page": page,
         "total_pages": total_pages,
         # Optionally, include total_documents count if needed by frontend
@@ -1232,7 +1434,20 @@ def get_journey_data():
         logging.error(f"Error in /api/journey endpoint: {e}", exc_info=True)
         return jsonify({"error": "Failed to fetch journey data due to server error."}), 500
 
+@app.route('/api/media_counts', methods=['GET'])
+def get_media_counts():
+    try:
+        # Uses the existing function in db_connector.py
+        counts = db_connector.get_media_type_counts()
+        if counts:
+            return jsonify(counts), 200
+        else:
+            return jsonify({"images": 0, "videos": 0, "files": 0}), 200
+    except Exception as e:
+        print(f"Error fetching media counts: {e}")
+        return jsonify({"error": str(e)}), 500
+
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
-   # logging.info(f"Starting server on host 0.0.0.0 port {port}")
+    # logging.info(f"Starting server on host 0.0.0.0 port {port}")
     serve(app, host='0.0.0.0', port=port, threads=100)

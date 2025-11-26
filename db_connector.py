@@ -2409,3 +2409,61 @@ def update_user_theme(username, theme):
     finally:
         if conn:
             conn.close()
+
+def get_media_type_counts():
+    """
+    Counts documents by media type (image, video, pdf) based on file extensions in DOCNAME.
+    Matches the file type logic used in retrieval functions.
+    """
+    conn = get_connection()
+    if not conn:
+        logging.error("Failed to get DB connection in get_media_type_counts.")
+        return None
+
+    try:
+        with conn.cursor() as cursor:
+            sql = """
+                  SELECT SUM(CASE \
+                                 WHEN \
+                                     LOWER(DOCNAME) LIKE '%.jpg' OR \
+                                     LOWER(DOCNAME) LIKE '%.jpeg' OR \
+                                     LOWER(DOCNAME) LIKE '%.png' OR \
+                                     LOWER(DOCNAME) LIKE '%.gif' OR \
+                                     LOWER(DOCNAME) LIKE '%.bmp' \
+                                     THEN 1 \
+                                 ELSE 0 END) as image_count, \
+                         SUM(CASE \
+                                 WHEN \
+                                     LOWER(DOCNAME) LIKE '%.mp4' OR \
+                                     LOWER(DOCNAME) LIKE '%.mov' OR \
+                                     LOWER(DOCNAME) LIKE '%.avi' OR \
+                                     LOWER(DOCNAME) LIKE '%.mkv' \
+                                     THEN 1 \
+                                 ELSE 0 END) as video_count, \
+                         SUM(CASE \
+                                 WHEN \
+                                     LOWER(DOCNAME) LIKE '%.pdf' \
+                                     THEN 1 \
+                                 ELSE 0 END) as pdf_count
+                  FROM PROFILE
+                  WHERE FORM = 2740 \
+                    AND DOCNUMBER >= 19677386 \
+                  """
+            cursor.execute(sql)
+            result = cursor.fetchone()
+
+            if result:
+                return {
+                    "images": result[0] or 0,
+                    "videos": result[1] or 0,
+                    "files": result[2] or 0
+                }
+            else:
+                return {"images": 0, "videos": 0, "files": 0}
+
+    except oracledb.Error as e:
+        logging.error(f"Oracle error in get_media_type_counts: {e}", exc_info=True)
+        return None
+    finally:
+        if conn:
+            conn.close()
