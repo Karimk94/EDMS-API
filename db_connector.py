@@ -470,7 +470,7 @@ def fetch_documents_from_oracle(page=1, page_size=20, search_term=None, date_fro
     # Default filter (fallback)
     doc_filter_sql = f"AND p.DOCNUMBER >= {range_start}"
 
-    if app_source == 'media-frontend':
+    if app_source == 'edms-media':
         doc_filter_sql = f"AND p.DOCNUMBER BETWEEN {range_start} AND {range_end}"
         logging.info("Applying Media Frontend filter: Restricted to range.")
 
