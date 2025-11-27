@@ -762,6 +762,8 @@ def api_get_documents():
         username = user.get('username') if user else None
         security_level = user.get('security_level', 'Viewer') if user else 'Viewer'
 
+        app_source = request.headers.get('X-App-Source', 'unknown')
+
         page = request.args.get('page', 1, type=int)
         page_size = request.args.get('pageSize', 20, type=int)
         search_term = request.args.get('search', None, type=str)
@@ -797,7 +799,8 @@ def api_get_documents():
             memory_day=memory_day,
             user_id=username,
             lang=lang,
-            security_level=security_level
+            security_level=security_level,
+            app_source=app_source
         )
 
         total_pages = math.ceil(total_rows / page_size) if total_rows > 0 else 1

@@ -437,7 +437,8 @@ def check_processing_status(docnumbers):
 
 def fetch_documents_from_oracle(page=1, page_size=20, search_term=None, date_from=None, date_to=None,
                                 persons=None, person_condition='any', tags=None, years=None, sort=None,
-                                memory_month=None, memory_day=None, user_id=None, lang='en', security_level='Editor'):
+                                memory_month=None, memory_day=None, user_id=None, lang='en',
+                                security_level='Editor', app_source='unknown'):
     """Fetches a paginated list of documents, applying visibility rules for Viewers."""
     conn = get_connection()
     if not conn: return [], 0
@@ -462,7 +463,25 @@ def fetch_documents_from_oracle(page=1, page_size=20, search_term=None, date_fro
     documents = []
     total_rows = 0
 
-    base_where = "WHERE p.docnumber >= 19677386 AND p.FORM = 2740 "
+    # --- Dynamic Filtering Logic ---
+    range_start = 19677386
+    range_end = 19679115
+
+    # Default filter (fallback)
+    doc_filter_sql = f"AND p.DOCNUMBER >= {range_start}"
+
+    if app_source == 'media-frontend':
+        doc_filter_sql = f"AND p.DOCNUMBER BETWEEN {range_start} AND {range_end}"
+        logging.info("Applying Media Frontend filter: Restricted to range.")
+
+    elif app_source == 'smart-edms':
+        smart_edms_floor = 19662092
+        doc_filter_sql = f"AND p.DOCNUMBER >= {smart_edms_floor} AND (p.DOCNUMBER < {range_start} OR p.DOCNUMBER > {range_end})"
+        logging.info(f"Applying Smart EDMS filter: Start >= {smart_edms_floor}, Excluding {range_start}-{range_end}.")
+
+    base_where = f"WHERE p.FORM = 2740 {doc_filter_sql} "
+    # -------------------------------
+
     params = {}
     where_clauses = []
 
@@ -592,9 +611,11 @@ def fetch_documents_from_oracle(page=1, page_size=20, search_term=None, date_fro
                     if 1900 < year_int < 2100:
                         year_list_int.append(year_int)
                     else:
-                        valid_years = False; break
+                        valid_years = False;
+                        break
                 except ValueError:
-                    valid_years = False; break
+                    valid_years = False;
+                    break
             if valid_years and year_list_int:
                 year_placeholders = ', '.join([f":year_{i}" for i in range(len(year_list_int))])
                 where_clauses.append(f"EXTRACT(YEAR FROM p.RTADOCDATE) IN ({year_placeholders})")
