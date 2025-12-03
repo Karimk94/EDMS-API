@@ -112,7 +112,7 @@ def summarize_video(video_data, filename):
 def tokenize_transcript(transcript):
     """Calls the translator/rephraser API to tokenize the transcript."""
     api_url = os.getenv("TRANSLATOR_REPHRASER_API_URL")
-    payload = {"text": transcript, "task": "rephrase"}
+    payload = {"text": transcript, "task": "tokenize"}
     response = requests.post(f"{api_url}/generate", json=payload, timeout=300, stream=True)
     response.raise_for_status()
     

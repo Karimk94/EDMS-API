@@ -15,7 +15,7 @@ import mimetypes
 from functools import wraps
 import io
 from datetime import datetime, timedelta
-from moviepy.editor import VideoFileClip, TextClip, CompositeVideoClip
+from moviepy.editor import VideoFileClip, ImageClip, CompositeVideoClip
 from PIL import Image, ImageDraw, ImageFont
 import fitz
 import tempfile
@@ -142,8 +142,8 @@ def api_update_user_theme():
         return jsonify({"error": "Failed to update theme"}), 500
 
 # --- Watermarking Functions ---
-def apply_watermark_to_image(image_bytes, username):
-    """Applies a text watermark to the bottom-right of an image."""
+def apply_watermark_to_image(image_bytes, watermark_text):
+    """Applies the provided text watermark to the bottom-right of an image."""
     try:
         base_image = Image.open(io.BytesIO(image_bytes)).convert("RGBA")
         width, height = base_image.size
@@ -152,14 +152,9 @@ def apply_watermark_to_image(image_bytes, username):
         txt_layer = Image.new('RGBA', base_image.size, (255, 255, 255, 0))
         draw = ImageDraw.Draw(txt_layer)
 
-        # Added date and time to text
-        current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        text = f"Downloaded by: {username} | {current_time}"
-
         # Calculate font size relative to image width
         font_size = max(10, int(width * 0.015))
 
-        # Attempt to load a font, fallback to default if not found
         try:
             font = ImageFont.truetype("arial.ttf", font_size)
         except IOError:
@@ -167,11 +162,11 @@ def apply_watermark_to_image(image_bytes, username):
 
         # Get text size
         if hasattr(draw, 'textbbox'):
-            bbox = draw.textbbox((0, 0), text, font=font)
+            bbox = draw.textbbox((0, 0), watermark_text, font=font)
             text_width = bbox[2] - bbox[0]
             text_height = bbox[3] - bbox[1]
         else:
-            text_width, text_height = draw.textsize(text, font=font)
+            text_width, text_height = draw.textsize(watermark_text, font=font)
 
         # Position: Bottom Right with padding
         padding_x = 20
@@ -179,11 +174,10 @@ def apply_watermark_to_image(image_bytes, username):
         x = width - text_width - padding_x
         y = height - text_height - padding_y
 
-        # Draw Shadow (Black) - Offset by 1 pixel
-        draw.text((x + 1, y + 1), text, font=font, fill=(0, 0, 0, 160))
-
+        # Draw Shadow (Black)
+        draw.text((x + 1, y + 1), watermark_text, font=font, fill=(0, 0, 0, 160))
         # Draw Main Text (White)
-        draw.text((x, y), text, font=font, fill=(255, 255, 255, 200))
+        draw.text((x, y), watermark_text, font=font, fill=(255, 255, 255, 200))
 
         # Composite
         watermarked = Image.alpha_composite(base_image, txt_layer)
@@ -195,31 +189,28 @@ def apply_watermark_to_image(image_bytes, username):
         logging.error(f"Error watermarking image: {e}", exc_info=True)
         return image_bytes, "image/jpeg"
 
-def apply_watermark_to_pdf(pdf_bytes, username):
-    """Applies a text watermark to the bottom-right of every PDF page."""
+def apply_watermark_to_pdf(pdf_bytes, watermark_text):
+    """Applies the provided text watermark to the bottom-right of every PDF page."""
     try:
-        # Open PDF from bytes
         doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-
-        current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        text = f"Downloaded by: {username} | {current_time}"
 
         for page in doc:
             rect = page.rect
             fontsize = 8
 
             # Estimate text width
-            text_width = fitz.get_text_length(text, fontname="helv", fontsize=fontsize)
+            text_width = fitz.get_text_length(watermark_text, fontname="helv", fontsize=fontsize)
 
             x = rect.width - text_width - 20
             y = rect.height - 20
 
             # Insert Shadow (Black)
-            page.insert_text((x + 0.5, y + 0.5), text, fontsize=fontsize, fontname="helv", color=(0, 0, 0),
+            page.insert_text((x + 0.5, y + 0.5), watermark_text, fontsize=fontsize, fontname="helv", color=(0, 0, 0),
                              fill_opacity=0.5)
 
-            # Insert Main Text (White) - using color=(1,1,1) for white
-            page.insert_text((x, y), text, fontsize=fontsize, fontname="helv", color=(1, 1, 1), fill_opacity=0.8)
+            # Insert Main Text (White)
+            page.insert_text((x, y), watermark_text, fontsize=fontsize, fontname="helv", color=(1, 1, 1),
+                             fill_opacity=0.8)
 
         output_buffer = io.BytesIO()
         doc.save(output_buffer)
@@ -228,49 +219,93 @@ def apply_watermark_to_pdf(pdf_bytes, username):
         logging.error(f"Error watermarking PDF: {e}", exc_info=True)
         return pdf_bytes, "application/pdf"
 
-def apply_watermark_to_video(video_bytes, username, filename):
-    """Applies a text watermark to a video using MoviePy."""
+def apply_watermark_to_video(video_bytes, watermark_text, filename):
+    """
+    Applies text watermark to the ENTIRE duration of the video.
+    Uses Pillow to generate the text image to avoid ImageMagick dependencies.
+    """
     try:
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_video_path = os.path.join(temp_dir, filename)
             output_video_path = os.path.join(temp_dir, f"watermarked_{filename}")
+            watermark_img_path = os.path.join(temp_dir, "watermark.png")
 
             # Write original video to temp file
             with open(temp_video_path, 'wb') as f:
                 f.write(video_bytes)
 
-            video = VideoFileClip(temp_video_path)
+            video_clip = None
+            watermark_clip = None
+            final_clip = None
 
-            current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            text = f"Downloaded by: {username} | {current_time}"
+            try:
+                video_clip = VideoFileClip(temp_video_path)
 
-            # Font size
-            fontsize = max(12, int(video.h * 0.015))
+                # --- Generate Watermark Image using Pillow (Avoids ImageMagick) ---
+                font_size = max(20, int(video_clip.w * 0.025))
 
-            # Create text clip with a black stroke (outline) for visibility
-            txt_clip = (
-                TextClip(text, fontsize=fontsize, color='white', font='Arial', stroke_color='black', stroke_width=1)
-                .set_position(('right', 'bottom'))
-                .set_duration(video.duration)
-                .set_opacity(0.6)
-                .margin(right=20, bottom=20, opacity=0))
+                try:
+                    font = ImageFont.truetype("arial.ttf", font_size)
+                except IOError:
+                    font = ImageFont.load_default()
 
-            final = CompositeVideoClip([video, txt_clip])
+                # Measure text size
+                dummy_draw = ImageDraw.Draw(Image.new("RGBA", (1, 1)))
+                if hasattr(dummy_draw, 'textbbox'):
+                    bbox = dummy_draw.textbbox((0, 0), watermark_text, font=font)
+                    text_width, text_height = bbox[2] - bbox[0], bbox[3] - bbox[1]
+                else:
+                    text_width, text_height = dummy_draw.textsize(watermark_text, font=font)
 
-            # Write to a file (temp) using ultrafast preset
-            final.write_videofile(
-                output_video_path,
-                codec='libx264',
-                audio_codec='aac',
-                temp_audiofile=os.path.join(temp_dir, 'temp-audio.m4a'),
-                remove_temp=True,
-                verbose=False,
-                logger=None,
-                preset='ultrafast'
-            )
+                # Create transparent image for text
+                img_width = text_width + 20
+                img_height = text_height + 20
+                txt_img = Image.new('RGBA', (img_width, img_height), (255, 255, 255, 0))
+                draw = ImageDraw.Draw(txt_img)
 
-            with open(output_video_path, 'rb') as f:
-                return f.read(), "video/mp4"
+                # Draw Text (White with Black Outline/Shadow)
+                draw.text((2, 2), watermark_text, font=font, fill=(0, 0, 0, 160))
+                draw.text((0, 0), watermark_text, font=font, fill=(255, 255, 255, 200))
+
+                # Save text image
+                txt_img.save(watermark_img_path, "PNG")
+
+                # --- Create MoviePy Clips ---
+                # Set duration to match video duration (Full Video Watermark)
+                watermark_clip = (
+                    ImageClip(watermark_img_path)
+                    .set_duration(video_clip.duration)
+                    .set_position(('right', 'bottom'))
+                    .set_opacity(0.8)
+                    .margin(right=20, bottom=20, opacity=0)
+                )
+
+                final_clip = CompositeVideoClip([video_clip, watermark_clip])
+
+                # Write to a file (temp) using ultrafast preset
+                final_clip.write_videofile(
+                    output_video_path,
+                    codec='libx264',
+                    audio_codec='aac',
+                    temp_audiofile=os.path.join(temp_dir, 'temp-audio.m4a'),
+                    remove_temp=True,
+                    verbose=False,
+                    logger=None,
+                    preset='ultrafast'
+                )
+
+                # Read the result back into memory
+                with open(output_video_path, 'rb') as f:
+                    return f.read(), "video/mp4"
+
+            finally:
+                # CRITICAL: Close clips explicitly to release file handles
+                if final_clip:
+                    final_clip.close()
+                if watermark_clip:
+                    watermark_clip.close()
+                if video_clip:
+                    video_clip.close()
 
     except Exception as e:
         logging.error(f"Error watermarking video: {e}", exc_info=True)
@@ -776,7 +811,8 @@ def api_get_documents():
         sort = request.args.get('sort', None, type=str)
         lang = request.args.get('lang', 'en', type=str)
 
-        # Check for memory-specific parameters
+        media_type = request.args.get('media_type', None, type=str)
+
         memory_month = request.args.get('memoryMonth', None, type=str)
         memory_day = request.args.get('memoryDay', None, type=str)
 
@@ -800,7 +836,8 @@ def api_get_documents():
             user_id=username,
             lang=lang,
             security_level=security_level,
-            app_source=app_source
+            app_source=app_source,
+            media_type=media_type
         )
 
         total_pages = math.ceil(total_rows / page_size) if total_rows > 0 else 1
@@ -1030,8 +1067,9 @@ def api_get_tags():
     lang = request.args.get('lang', 'en', type=str)
     user = session.get('user')
     security_level = user.get('security_level', 'Viewer') if user else 'Viewer'
+    app_source = request.headers.get('X-App-Source', 'unknown')
 
-    tags = db_connector.fetch_all_tags(lang=lang, security_level=security_level)
+    tags = db_connector.fetch_all_tags(lang=lang, security_level=security_level, app_source=app_source)
     return jsonify(tags)
 
 @app.route('/api/tags/<int:doc_id>')
@@ -1259,8 +1297,13 @@ def api_download_watermarked(doc_id):
     if 'user' not in session:
         return jsonify({"error": "Unauthorized"}), 401
 
-    # Get the username from session
+    # Get username from session
     username = session.get('user', {}).get('username', 'Unknown')
+
+    # 1. Fetch System ID for the user
+    system_id = db_connector.get_user_system_id(username)
+    if not system_id:
+        system_id = "UNKNOWN"  # Fallback
 
     dst = wsdl_client.dms_system_login()
     if not dst:
@@ -1280,7 +1323,6 @@ def api_download_watermarked(doc_id):
                 cursor.execute("SELECT DOCNAME FROM PROFILE WHERE DOCNUMBER = :1", [doc_id])
                 result = cursor.fetchone()
                 if result and result[0]:
-                    # Sanitize filename
                     safe_docname = "".join(
                         [c for c in result[0] if c.isalpha() or c.isdigit() or c in (' ', '-', '_')]).rstrip()
                     if safe_docname:
@@ -1297,14 +1339,18 @@ def api_download_watermarked(doc_id):
     processed_bytes = file_bytes
     mimetype = 'application/octet-stream'
 
-    # Apply text watermark using the username
+    # 2. Construct the watermark text: system_id - docnumber | date
+    current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    watermark_text = f"{system_id} - {doc_id} | {current_time}"
+
+    # 3. Apply watermark using new format
     if media_type == 'image':
-        processed_bytes, mimetype = apply_watermark_to_image(file_bytes, username)
+        processed_bytes, mimetype = apply_watermark_to_image(file_bytes, watermark_text)
     elif media_type == 'pdf':
-        processed_bytes, mimetype = apply_watermark_to_pdf(file_bytes, username)
+        processed_bytes, mimetype = apply_watermark_to_pdf(file_bytes, watermark_text)
     elif media_type == 'video':
         # WARNING: Video processing is slow.
-        processed_bytes, mimetype = apply_watermark_to_video(file_bytes, username, filename)
+        processed_bytes, mimetype = apply_watermark_to_video(file_bytes, watermark_text, filename)
 
     return Response(
         processed_bytes,
@@ -1439,17 +1485,20 @@ def get_journey_data():
         logging.error(f"Error in /api/journey endpoint: {e}", exc_info=True)
         return jsonify({"error": "Failed to fetch journey data due to server error."}), 500
 
+
 @app.route('/api/media_counts', methods=['GET'])
 def get_media_counts():
     try:
-        # Uses the existing function in db_connector.py
-        counts = db_connector.get_media_type_counts()
+        app_source = request.headers.get('X-App-Source', 'unknown')
+
+        counts = db_connector.get_media_type_counts(app_source=app_source)
+
         if counts:
             return jsonify(counts), 200
         else:
             return jsonify({"images": 0, "videos": 0, "files": 0}), 200
     except Exception as e:
-        print(f"Error fetching media counts: {e}")
+        logging.error(f"Error fetching media counts: {e}", exc_info=True)
         return jsonify({"error": str(e)}), 500
 
 if __name__ == '__main__':

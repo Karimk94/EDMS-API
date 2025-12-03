@@ -12,7 +12,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 # --- ChromaDB Setup ---
 CHROMA_DB_PATH = os.getenv('CHROMA_DB_PATH', './chroma_db')
 COLLECTION_NAME = os.getenv('CHROMA_COLLECTION_NAME', 'edms_documents')
-DISTANCE_THRESHOLD = 0.9
+DISTANCE_THRESHOLD = 1.3
 
 logging.info(f"Initializing ChromaDB PersistentClient at path: {CHROMA_DB_PATH}")
 # Use a persistent client to save data to disk

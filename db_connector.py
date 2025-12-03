@@ -120,12 +120,23 @@ def get_media_info_from_dms(dst, doc_number):
             except Exception as e:
                 print(f"Could not get filename for {doc_number}, using default. Error: {e}")
 
-        video_extensions = ['.mp4', '.mov', '.avi', '.mkv']
-        pdf_extensions = ['.pdf']
+        video_extensions = [
+            '.mp4', '.mov', '.avi', '.mkv', '.wmv', '.flv', '.webm',
+            '.m4v', '.3gp', '.mts', '.ts', '.3g2'
+        ]
+        pdf_extensions = [
+            '.pdf', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx',
+            '.txt', '.rtf', '.csv', '.zip', '.rar', '.7z'
+        ]
+
         file_ext = os.path.splitext(filename)[1].lower()
-        media_type = 'video' if file_ext in video_extensions else 'image'
-        if file_ext in pdf_extensions:
+
+        if file_ext in video_extensions:
+            media_type = 'video'
+        elif file_ext in pdf_extensions:
             media_type = 'pdf'
+        else:
+            media_type = 'image'
 
         return filename, media_type, file_ext
 
@@ -146,7 +157,8 @@ def get_media_content_from_dms(dst, doc_number):
 
         get_doc_call = {
             'call': {'dstIn': dst,
-                     'criteria': {'criteriaCount': 2, 'criteriaNames': {'string': ['%TARGET_LIBRARY', '%DOCUMENT_NUMBER']},
+                     'criteria': {'criteriaCount': 2,
+                                  'criteriaNames': {'string': ['%TARGET_LIBRARY', '%DOCUMENT_NUMBER']},
                                   'criteriaValues': {'string': ['RTA_MAIN', str(doc_number)]}}}
         }
         doc_reply = svc_client.service.GetDocSvr3(**get_doc_call)
@@ -438,8 +450,8 @@ def check_processing_status(docnumbers):
 def fetch_documents_from_oracle(page=1, page_size=20, search_term=None, date_from=None, date_to=None,
                                 persons=None, person_condition='any', tags=None, years=None, sort=None,
                                 memory_month=None, memory_day=None, user_id=None, lang='en',
-                                security_level='Editor', app_source='unknown'):
-    """Fetches a paginated list of documents, applying visibility rules for Viewers."""
+                                security_level='Editor', app_source='unknown', media_type=None):
+    """Fetches a paginated list of documents, applying filters including media_type."""
     conn = get_connection()
     if not conn: return [], 0
 
@@ -486,6 +498,53 @@ def fetch_documents_from_oracle(page=1, page_size=20, search_term=None, date_fro
     where_clauses = []
 
     shortlist_sql = "AND k.SHORTLISTED = '1'" if security_level == 'Viewer' else ""
+
+    if media_type:
+        try:
+            with conn.cursor() as app_cursor:
+                # Step 1: Try to fetch SYSTEM_ID (Numeric) from APPS
+                id_column = "SYSTEM_ID"
+                try:
+                    app_cursor.execute(f"SELECT {id_column}, DEFAULT_EXTENSION FROM APPS")
+                    apps_rows = app_cursor.fetchall()
+                except oracledb.DatabaseError:
+                    # Fallback if SYSTEM_ID column doesn't exist
+                    logging.warning("SYSTEM_ID column not found in APPS, falling back to APPLICATION column.")
+                    id_column = "APPLICATION"
+                    app_cursor.execute(f"SELECT {id_column}, DEFAULT_EXTENSION FROM APPS")
+                    apps_rows = app_cursor.fetchall()
+
+            # Using the same extended lists as the working reference
+            image_exts = {'jpg', 'jpeg', 'png', 'gif', 'bmp', 'tif', 'tiff', 'webp', 'heic', 'ico', 'jfif'}
+            video_exts = {'mp4', 'mov', 'avi', 'mkv', 'wmv', 'flv', 'webm', 'm4v', '3gp', 'ts', 'mts', '3g2'}
+            pdf_exts = {'pdf', 'doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx', 'txt', 'rtf', 'csv', 'zip', 'rar', '7z'}
+
+            target_app_ids = []
+
+            for app_id, ext in apps_rows:
+                if not ext: continue
+                clean_ext = str(ext).lower().replace('.', '').strip()
+                str_id = str(app_id).strip()
+
+                if media_type == 'image' and clean_ext in image_exts:
+                    target_app_ids.append(str_id)
+                elif media_type == 'video' and clean_ext in video_exts:
+                    target_app_ids.append(str_id)
+                elif media_type == 'pdf' and clean_ext in pdf_exts:
+                    target_app_ids.append(str_id)
+
+            if target_app_ids:
+                # Use TRIM(TO_CHAR(...)) to safely compare against string IDs
+                id_list = ",".join(f"'{x}'" for x in target_app_ids)
+                where_clauses.append(f"TRIM(TO_CHAR(p.APPLICATION)) IN ({id_list})")
+            else:
+                # If no apps found for this type, return nothing
+                where_clauses.append("1=0")
+
+        except Exception as e:
+            logging.error(f"Error filtering by media_type: {e}")
+            # Fallback to failing safe if App ID lookup crashes
+            where_clauses.append("1=0")
 
     vector_doc_ids = None
 
@@ -953,10 +1012,25 @@ def fetch_lkp_persons(page=1, page_size=20, search='', lang='en'):
             conn.close()
     return persons, total_rows
 
-def fetch_all_tags(lang='en', security_level='Editor'):
-    """Fetches all unique tags (keywords and persons) considering security level."""
+def fetch_all_tags(lang='en', security_level='Editor', app_source='unknown'):
+    """Fetches all unique tags (keywords and persons) considering security level and app source visibility."""
     conn = get_connection()
     if not conn: return []
+
+    # --- Dynamic Filtering Logic (Same as fetch_documents) ---
+    range_start = 19677386
+    range_end = 19679115
+    smart_edms_floor = 19662092
+
+    # Default filter (fallback)
+    doc_filter_sql = f"p.DOCNUMBER >= {range_start}"
+
+    if app_source == 'edms-media':
+        doc_filter_sql = f"p.DOCNUMBER BETWEEN {range_start} AND {range_end}"
+    elif app_source == 'smart-edms':
+        doc_filter_sql = f"p.DOCNUMBER >= {smart_edms_floor} AND (p.DOCNUMBER < {range_start} OR p.DOCNUMBER > {range_end})"
+
+    # -------------------------------
 
     tags = set()
     try:
@@ -964,17 +1038,39 @@ def fetch_all_tags(lang='en', security_level='Editor'):
             keyword_column = "k.DESCRIPTION" if lang == 'ar' else "k.KEYWORD_ID"
             person_column = "p.NAME_ARABIC" if lang == 'ar' else "p.NAME_ENGLISH"
 
-            # If Viewer, only fetch shortlisted tags
             shortlist_clause = "AND k.SHORTLISTED = '1'" if security_level == 'Viewer' else ""
 
-            cursor.execute(
-                f"SELECT {keyword_column} FROM KEYWORD k JOIN LKP_DOCUMENT_TAGS ldt ON ldt.TAG_ID = k.SYSTEM_ID WHERE {keyword_column} IS NOT NULL {shortlist_clause}"
-            )
+            keyword_query = f"""
+                SELECT DISTINCT {keyword_column} 
+                FROM KEYWORD k 
+                JOIN LKP_DOCUMENT_TAGS ldt ON ldt.TAG_ID = k.SYSTEM_ID 
+                JOIN PROFILE p ON ldt.DOCNUMBER = p.DOCNUMBER
+                WHERE {keyword_column} IS NOT NULL 
+                {shortlist_clause}
+                AND p.FORM = 2740
+                AND {doc_filter_sql}
+            """
+            cursor.execute(keyword_query)
             for row in cursor:
                 if row[0]:
                     tags.add(row[0].strip())
 
-            cursor.execute(f"SELECT {person_column} FROM LKP_PERSON p WHERE {person_column} IS NOT NULL")
+            person_query = f"""
+                SELECT DISTINCT {person_column} 
+                FROM LKP_PERSON p 
+                WHERE {person_column} IS NOT NULL
+                AND EXISTS (
+                    SELECT 1 FROM PROFILE pr
+                    WHERE pr.FORM = 2740
+                    AND {doc_filter_sql.replace('p.', 'pr.')}
+                    AND (
+                        UPPER(pr.ABSTRACT) LIKE '%' || UPPER(p.NAME_ENGLISH) || '%'
+                        OR 
+                        (p.NAME_ARABIC IS NOT NULL AND pr.ABSTRACT LIKE '%' || p.NAME_ARABIC || '%')
+                    )
+                )
+            """
+            cursor.execute(person_query)
             for row in cursor:
                 if row[0]:
                     tags.add(row[0].strip())
@@ -1388,13 +1484,11 @@ def delete_tag_from_document(doc_id, tag):
                         cursor.execute("UPDATE PROFILE SET ABSTRACT = :1 WHERE DOCNUMBER = :2", [new_abstract, doc_id])
                         conn.commit()
 
-                        # --- NEW: VECTOR INDEXING HOOK ---
                         if vector_client:
                             try:
                                 vector_client.add_or_update_document(doc_id, new_abstract)
                             except Exception as e:
                                 logging.error(f"Failed to update vector index for doc_id {doc_id} after tag delete: {e}", exc_info=True)
-                        # --- END: VECTOR INDEXING HOOK ---
 
                         return True, "Person tag removed from abstract successfully."
 
@@ -1439,16 +1533,12 @@ def fetch_memories_from_oracle(month, day=None, limit=5):
          return []
     limit_int = max(1, min(limit_int, 10)) # Clamp limit between 1 and 10
 
-
     params = {'month': month_int, 'current_year': current_year, 'limit': limit_int}
     day_filter_sql = ""
     if day_int is not None:
         params['day'] = day_int
         day_filter_sql = "AND EXTRACT(DAY FROM p.RTADOCDATE) = :day"
 
-    # Use RTADOCDATE for filtering memories
-    # Rank documents within each past year for the given month/day and pick the latest one (rn=1)
-    # Filter for common image types in DOCNAME (case-insensitive)
     sql = f"""
     WITH RankedMemories AS (
         SELECT
@@ -1501,8 +1591,8 @@ def fetch_memories_from_oracle(month, day=None, limit=5):
             for row in rows:
                 doc_id, abstract, author, rtadocdate, docname = row
                 thumbnail_path = None
-                media_type = 'image' # Assume image based on query filter
-                file_ext = '.jpg'   # Default extension for thumbnail
+                media_type = 'image'
+                file_ext = '.jpg'
 
                 try:
                     # Check cache first
@@ -1528,7 +1618,6 @@ def fetch_memories_from_oracle(month, day=None, limit=5):
 
                 except Exception as thumb_e:
                      logging.error(f"Error processing thumbnail for memory doc {doc_id}: {thumb_e}", exc_info=True)
-
 
                 memories.append({
                     "doc_id": doc_id,
@@ -2431,45 +2520,109 @@ def update_user_theme(username, theme):
         if conn:
             conn.close()
 
-def get_media_type_counts():
+def get_user_system_id(username):
+    """Fetches the SYSTEM_ID from the PEOPLE table for a given username."""
+    conn = get_connection()
+    if not conn:
+        return None
+
+    system_id = None
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT SYSTEM_ID FROM PEOPLE WHERE UPPER(USER_ID) = UPPER(:username)", username=username)
+            result = cursor.fetchone()
+            if result:
+                system_id = result[0]
+            else:
+                logging.warning(f"No SYSTEM_ID found for user: {username}")
+    except oracledb.Error as e:
+        logging.error(f"Oracle Database error in get_user_system_id for {username}: {e}", exc_info=True)
+    finally:
+        if conn:
+            conn.close()
+    return system_id
+
+def get_media_type_counts(app_source='unknown'):
     """
-    Counts documents by media type (image, video, pdf) based on file extensions in DOCNAME.
-    Matches the file type logic used in retrieval functions.
+    Counts documents by media type using App IDs from the APPS table.
+    Attempts to fetch SYSTEM_ID (numeric) from APPS to match PROFILE.APPLICATION.
+    Falls back to APPLICATION column if SYSTEM_ID is missing.
+    Strictly relies on APPS table types (no filename extension checks).
     """
     conn = get_connection()
     if not conn:
         logging.error("Failed to get DB connection in get_media_type_counts.")
         return None
 
+    range_start = 19677386
+    range_end = 19679115
+
+    doc_filter_sql = f"AND p.DOCNUMBER >= {range_start}"
+
+    if app_source == 'edms-media':
+        doc_filter_sql = f"AND p.DOCNUMBER BETWEEN {range_start} AND {range_end}"
+    elif app_source == 'smart-edms':
+        smart_edms_floor = 19662092
+        doc_filter_sql = f"AND p.DOCNUMBER >= {smart_edms_floor} AND (p.DOCNUMBER < {range_start} OR p.DOCNUMBER > {range_end})"
+    # ---------------------------------------------------------------------
+
     try:
         with conn.cursor() as cursor:
-            sql = """
-                  SELECT SUM(CASE \
-                                 WHEN \
-                                     LOWER(DOCNAME) LIKE '%.jpg' OR \
-                                     LOWER(DOCNAME) LIKE '%.jpeg' OR \
-                                     LOWER(DOCNAME) LIKE '%.png' OR \
-                                     LOWER(DOCNAME) LIKE '%.gif' OR \
-                                     LOWER(DOCNAME) LIKE '%.bmp' \
-                                     THEN 1 \
-                                 ELSE 0 END) as image_count, \
-                         SUM(CASE \
-                                 WHEN \
-                                     LOWER(DOCNAME) LIKE '%.mp4' OR \
-                                     LOWER(DOCNAME) LIKE '%.mov' OR \
-                                     LOWER(DOCNAME) LIKE '%.avi' OR \
-                                     LOWER(DOCNAME) LIKE '%.mkv' \
-                                     THEN 1 \
-                                 ELSE 0 END) as video_count, \
-                         SUM(CASE \
-                                 WHEN \
-                                     LOWER(DOCNAME) LIKE '%.pdf' \
-                                     THEN 1 \
-                                 ELSE 0 END) as pdf_count
-                  FROM PROFILE
-                  WHERE FORM = 2740 \
-                    AND DOCNUMBER >= 19677386 \
+            # Step 1: Try to fetch SYSTEM_ID (Numeric) from APPS
+            id_column = "SYSTEM_ID"
+            try:
+                cursor.execute(f"SELECT {id_column}, DEFAULT_EXTENSION FROM APPS")
+                apps_rows = cursor.fetchall()
+            except oracledb.DatabaseError:
+                # Fallback if SYSTEM_ID column doesn't exist
+                logging.warning("SYSTEM_ID column not found in APPS, falling back to APPLICATION column.")
+                id_column = "APPLICATION"
+                cursor.execute(f"SELECT {id_column}, DEFAULT_EXTENSION FROM APPS")
+                apps_rows = cursor.fetchall()
+
+            image_exts = {'jpg', 'jpeg', 'png', 'gif', 'bmp', 'tif', 'tiff', 'webp', 'heic', 'ico', 'jfif'}
+            video_exts = {'mp4', 'mov', 'avi', 'mkv', 'wmv', 'flv', 'webm', 'm4v', '3gp', 'ts', 'mts', '3g2'}
+            pdf_exts = {'pdf', 'doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx', 'txt', 'rtf', 'csv', 'zip', 'rar', '7z'}
+
+            image_app_ids = []
+            video_app_ids = []
+            pdf_app_ids = []
+
+            for app_id, ext in apps_rows:
+                if not ext: continue
+                # Clean extension string for categorization
+                clean_ext = str(ext).lower().replace('.', '').strip()
+                # Treat ID as a string for safe SQL injection and comparison
+                str_id = str(app_id).strip()
+
+                if clean_ext in image_exts:
+                    image_app_ids.append(str_id)
+                elif clean_ext in video_exts:
+                    video_app_ids.append(str_id)
+                elif clean_ext in pdf_exts:
+                    pdf_app_ids.append(str_id)
+
+            # Helper to create SQL IN clauses
+            def build_app_id_clause(ids):
+                if not ids: return "1=0"
+                id_list = ",".join(f"'{x}'" for x in ids)
+                return f"TRIM(TO_CHAR(p.APPLICATION)) IN ({id_list})"
+
+            img_sql = build_app_id_clause(image_app_ids)
+            vid_sql = build_app_id_clause(video_app_ids)
+            pdf_sql = build_app_id_clause(pdf_app_ids)
+
+            # Step 2: Execute Count Query
+            sql = f"""
+                  SELECT 
+                      SUM(CASE WHEN {img_sql} THEN 1 ELSE 0 END) as image_count,
+                      SUM(CASE WHEN {vid_sql} THEN 1 ELSE 0 END) as video_count,
+                      SUM(CASE WHEN {pdf_sql} THEN 1 ELSE 0 END) as pdf_count
+                  FROM PROFILE p
+                  WHERE p.FORM = '2740' 
+                  {doc_filter_sql}
                   """
+
             cursor.execute(sql)
             result = cursor.fetchone()
 
