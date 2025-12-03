@@ -484,12 +484,12 @@ def fetch_documents_from_oracle(page=1, page_size=20, search_term=None, date_fro
 
     if app_source == 'edms-media':
         doc_filter_sql = f"AND p.DOCNUMBER BETWEEN {range_start} AND {range_end}"
-        logging.info("Applying Media Frontend filter: Restricted to range.")
+        # logging.info("Applying Media Frontend filter: Restricted to range.")
 
     elif app_source == 'smart-edms':
         smart_edms_floor = 19662092
         doc_filter_sql = f"AND p.DOCNUMBER >= {smart_edms_floor} AND (p.DOCNUMBER < {range_start} OR p.DOCNUMBER > {range_end})"
-        logging.info(f"Applying Smart EDMS filter: Start >= {smart_edms_floor}, Excluding {range_start}-{range_end}.")
+        # logging.info(f"Applying Smart EDMS filter: Start >= {smart_edms_floor}, Excluding {range_start}-{range_end}.")
 
     base_where = f"WHERE p.FORM = 2740 {doc_filter_sql} "
     # -------------------------------
@@ -1818,8 +1818,8 @@ def remove_favorite(user_id, doc_id):
         if conn:
             conn.close()
 
-def get_favorites(user_id, page=1, page_size=20):
-    """Fetches a paginated list of a user's favorited documents."""
+def get_favorites(user_id, page=1, page_size=20, app_source='unknown'):
+    """Fetches a paginated list of a user's favorited documents with app_source filtering."""
     conn = get_connection()
     if not conn:
         return [], 0
@@ -1827,6 +1827,18 @@ def get_favorites(user_id, page=1, page_size=20):
     offset = (page - 1) * page_size
     documents = []
     total_rows = 0
+
+    range_start = 19677386
+    range_end = 19679115
+
+    # Default filter
+    doc_filter_sql = f"AND p.DOCNUMBER >= {range_start}"
+
+    if app_source == 'edms-media':
+        doc_filter_sql = f"AND p.DOCNUMBER BETWEEN {range_start} AND {range_end}"
+    elif app_source == 'smart-edms':
+        smart_edms_floor = 19662092
+        doc_filter_sql = f"AND p.DOCNUMBER >= {smart_edms_floor} AND (p.DOCNUMBER < {range_start} OR p.DOCNUMBER > {range_end})"
 
     try:
         with conn.cursor() as cursor:
@@ -1837,26 +1849,34 @@ def get_favorites(user_id, page=1, page_size=20):
             if not user_result:
                 logging.error(f"Could not find user '{user_id}' in PEOPLE table for fetching favorites.")
                 return [], 0
-            
+
             db_user_id = user_result[0]
 
-            # Count total favorites
-            cursor.execute("SELECT COUNT(*) FROM LKP_FAVORITES_DOC WHERE USER_ID = :user_id", [db_user_id])
+            # Count total favorites (Updated to join PROFILE and apply filters)
+            count_query = f"""
+                SELECT COUNT(f.SYSTEM_ID) 
+                FROM LKP_FAVORITES_DOC f
+                JOIN PROFILE p ON f.DOCNUMBER = p.DOCNUMBER
+                WHERE f.USER_ID = :user_id
+                {doc_filter_sql}
+            """
+            cursor.execute(count_query, [db_user_id])
             total_rows = cursor.fetchone()[0]
 
             # Fetch paginated favorites
-            query = """
+            query = f"""
                 SELECT p.DOCNUMBER, p.ABSTRACT, p.AUTHOR, p.RTADOCDATE as DOC_DATE, p.DOCNAME
                 FROM PROFILE p
                 JOIN LKP_FAVORITES_DOC f ON p.DOCNUMBER = f.DOCNUMBER
                 WHERE f.USER_ID = :user_id
+                {doc_filter_sql}
                 ORDER BY p.DOCNUMBER DESC
                 OFFSET :offset ROWS FETCH NEXT :page_size ROWS ONLY
             """
             cursor.execute(query, user_id=db_user_id, offset=offset, page_size=page_size)
 
             rows = cursor.fetchall()
-            dst = dms_system_login() # Login to DMS to get thumbnails
+            dst = dms_system_login()  # Login to DMS to get thumbnails
 
             for row in rows:
                 doc_id, abstract, author, doc_date, docname = row
@@ -1878,7 +1898,6 @@ def get_favorites(user_id, page=1, page_size=20):
                     except Exception as e:
                         logging.error(f"Error getting media info for favorite {doc_id}: {e}")
 
-
                 documents.append({
                     "doc_id": doc_id,
                     "title": abstract or "",
@@ -1887,7 +1906,7 @@ def get_favorites(user_id, page=1, page_size=20):
                     "date": doc_date.strftime('%Y-%m-%d %H:%M:%S') if doc_date else "N/A",
                     "thumbnail_url": thumbnail_path or "",
                     "media_type": media_type,
-                    "is_favorite": True # Mark as favorite
+                    "is_favorite": True  # Mark as favorite
                 })
         return documents, total_rows
     except oracledb.Error as e:

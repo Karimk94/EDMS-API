@@ -1385,11 +1385,16 @@ def remove_favorite_route(doc_id):
 def get_favorites_route():
     if 'user' not in session:
         return jsonify({"error": "Unauthorized"}), 401
+
     user_id = session['user'].get('username')
+
+    app_source = request.headers.get('X-App-Source', 'unknown')
+
     page = request.args.get('page', 1, type=int)
     page_size = request.args.get('pageSize', 20, type=int)
 
-    documents, total_rows = db_connector.get_favorites(user_id, page, page_size)
+    documents, total_rows = db_connector.get_favorites(user_id, page, page_size, app_source=app_source)
+
     total_pages = math.ceil(total_rows / page_size) if total_rows > 0 else 1
 
     return jsonify({
@@ -1484,7 +1489,6 @@ def get_journey_data():
     except Exception as e:
         logging.error(f"Error in /api/journey endpoint: {e}", exc_info=True)
         return jsonify({"error": "Failed to fetch journey data due to server error."}), 500
-
 
 @app.route('/api/media_counts', methods=['GET'])
 def get_media_counts():
