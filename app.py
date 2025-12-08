@@ -63,8 +63,7 @@ def login():
         # session['dst'] = dst
         session.permanent = True
 
-        logging.info(
-            f"User '{username}' logged in successfully with security level '{user_details.get('security_level')}' and theme '{user_details.get('theme')}'.")
+        # logging.info(f"User '{username}' logged in successfully with security level '{user_details.get('security_level')}' and theme '{user_details.get('theme')}'.")
         return jsonify({"message": "Login successful", "user": user_details}), 200
     else:
         logging.warning(f"DMS login failed for user '{username}'.")

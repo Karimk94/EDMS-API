@@ -152,14 +152,13 @@ def parse_binary_result_buffer(buffer):
         i = 0
         while i < len(tokens):
             token = tokens[i]
-            # MODIFIED: Aggressively accept ANY integer sequence as a potential ID
-            if token.isdigit():
+            if token.isdigit() and len(token) >= 5:
                 if i + 1 < len(tokens):
-                    potential_name = tokens[i + 1]
-                    # Accept even if name is short or number, just grab it
-                    items.append(
-                        {'id': token, 'name': potential_name, 'type': 'folder', 'node_type': 'N', 'is_standard': False})
-                    # Don't skip next token, it might be the start of another ID if name was empty/short
+                    name = tokens[i + 1]
+                    if len(name) > 1:
+                        items.append(
+                            {'id': token, 'name': name, 'type': 'folder', 'node_type': 'N', 'is_standard': False})
+                        i += 1
             i += 1
     except Exception:
         pass
@@ -168,154 +167,149 @@ def parse_binary_result_buffer(buffer):
 
 def delete_document(dst, doc_number, force=False):
     """
-    Deletes a document or folder.
-    Phase 1: Unlink from all parents using 'Where Used' collection.
-    Phase 2: Delete the Profile.
+    Deletes a document/folder.
+    If force=True, finds references using 'Where Used' collection and deletes them first.
+    Matches the user's manual trace for finding and removing ContentItem links.
     """
     try:
         svc_client = get_soap_client('BasicHttpBinding_IDMSvc')
-
-        # Check for DeleteObject client
         del_client = find_client_with_operation('DeleteObject')
         if not del_client: return False, "DeleteObject not found"
 
-        string_type = svc_client.get_type('{http://www.w3.org/2001/XMLSchema}string')
-        string_array_type = svc_client.get_type(
+        string_type = del_client.get_type('{http://www.w3.org/2001/XMLSchema}string')
+        string_array_type = del_client.get_type(
             '{http://schemas.microsoft.com/2003/10/Serialization/Arrays}ArrayOfstring')
-        int_type = svc_client.get_type('{http://www.w3.org/2001/XMLSchema}int')
+        int_type = del_client.get_type('{http://www.w3.org/2001/XMLSchema}int')
 
-        # --- STEP 1: Unlink (Force) ---
+        # --- PRE-STEP: If Force is enabled, run Unlink logic FIRST ---
         if force:
-            logging.info(f"Force Delete: performing 'Where Used' check for {doc_number}...")
-            link_ids = []
+            # logging.info(f"Force Delete: performing 'Where Used' check for {doc_number}...")
+            links_to_remove = []
 
-            # 1. Create a "Where Used" Collection to find parents
-            coll_prop_names = string_array_type(['%TARGET_LIBRARY', 'DOCNUMBER', '%CONTENTS_DIRECTIVE'])
-            coll_prop_values = {'anyType': [
+            # Create WhereUsed Collection
+            coll_names = string_array_type(['%TARGET_LIBRARY', 'DOCNUMBER', '%CONTENTS_DIRECTIVE'])
+            coll_values = {'anyType': [
                 xsd.AnyObject(string_type, 'RTA_MAIN'),
                 xsd.AnyObject(string_type, str(doc_number)),
-                xsd.AnyObject(string_type, '%CONTENTS_WHERE_USED')  # Specific directive from trace
+                xsd.AnyObject(string_type, '%CONTENTS_WHERE_USED')
             ]}
 
-            coll_call = {
-                'call': {
-                    'dstIn': dst,
-                    'objectType': 'ContentsCollection',
-                    'properties': {
-                        'propertyCount': 3,
-                        'propertyNames': coll_prop_names,
-                        'propertyValues': coll_prop_values
-                    }
-                }
-            }
+            coll_call = {'call': {'dstIn': dst, 'objectType': 'ContentsCollection',
+                                  'properties': {'propertyCount': 3, 'propertyNames': coll_names,
+                                                 'propertyValues': coll_values}}}
 
             try:
-                # Need client with CreateObject (IDMSvc)
                 coll_reply = svc_client.service.CreateObject(**coll_call)
-
-                # Check for IUNKNOWN_INTERFACE (Collection ID)
-                collection_id = None
+                col_id = None
                 if coll_reply.resultCode == 0 and coll_reply.retProperties:
-                    props = coll_reply.retProperties
-                    if props.propertyValues and props.propertyValues.anyType:
-                        collection_id = props.propertyValues.anyType[0]  # Usually first prop is the ID
+                    col_id = coll_reply.retProperties.propertyValues.anyType[0]
 
-                if collection_id:
-                    logging.info(f"Created WhereUsed Collection: {collection_id}")
-
-                    # 2. Iterate using NewEnum / NextData
-                    # Note: Need client with NewEnum (usually IDMSvc or IDMNav)
-                    # Try finding one
+                if col_id:
+                    # Iterate Collection
                     enum_client = find_client_with_operation('NewEnum') or svc_client
-
-                    enum_call = {'call': {'dstIn': dst, 'collectionID': collection_id}}
-                    enum_reply = enum_client.service.NewEnum(**enum_call)
+                    enum_reply = enum_client.service.NewEnum(call={'dstIn': dst, 'collectionID': col_id})
 
                     if enum_reply.resultCode == 0 and enum_reply.enumID:
-                        enum_id = enum_reply.enumID
+                        next_reply = enum_client.service.NextData(
+                            call={'dstIn': dst, 'enumID': enum_reply.enumID, 'elementCount': 100})
 
-                        # Fetch Data
-                        next_call = {'call': {'dstIn': dst, 'enumID': enum_id, 'elementCount': 100}}
-                        data_reply = enum_client.service.NextData(**next_call)
-
-                        if data_reply.resultCode in [0, 1] and data_reply.genericItemsData:
-                            # Parse genericItemsData
-                            g_data = data_reply.genericItemsData
+                        if next_reply.resultCode in [0, 1] and next_reply.genericItemsData:
+                            g_data = next_reply.genericItemsData
                             prop_names = g_data.propertyNames.string
                             rows = g_data.propertyRows.ArrayOfanyType
 
-                            sys_id_idx = -1
-                            if 'SYSTEM_ID' in prop_names:
-                                sys_id_idx = prop_names.index('SYSTEM_ID')
+                            idx_sys = prop_names.index('SYSTEM_ID') if 'SYSTEM_ID' in prop_names else -1
+                            idx_par = prop_names.index('PARENT') if 'PARENT' in prop_names else -1
+                            idx_pver = prop_names.index('PARENT_VERSION') if 'PARENT_VERSION' in prop_names else -1
 
-                            if sys_id_idx != -1 and rows:
+                            if idx_sys != -1 and rows:
                                 for row in rows:
                                     try:
-                                        sys_val = row.anyType[sys_id_idx]
-                                        link_ids.append(sys_val)
+                                        link_data = {
+                                            'SYSTEM_ID': row.anyType[idx_sys],
+                                            'PARENT': row.anyType[idx_par] if idx_par != -1 else None,
+                                            'PARENT_VERSION': row.anyType[idx_pver] if idx_pver != -1 else None
+                                        }
+                                        links_to_remove.append(link_data)
                                     except:
                                         pass
 
-                        # Cleanup Enum
                         try:
-                            enum_client.service.ReleaseObject(call={'objectID': enum_id})
+                            enum_client.service.ReleaseObject(call={'objectID': enum_reply.enumID})
                         except:
                             pass
-
-                    # Cleanup Collection
                     try:
-                        svc_client.service.ReleaseObject(call={'objectID': collection_id})
+                        svc_client.service.ReleaseObject(call={'objectID': col_id})
                     except:
                         pass
-
             except Exception as e:
-                logging.warning(f"Where Used check failed: {e}")
+                logging.warning(f"WhereUsed failed: {e}")
 
-            if link_ids:
-                logging.info(f"Unlinking {len(link_ids)} parents. Link IDs (SYSTEM_ID): {link_ids}")
-                for link_id in link_ids:
+            if links_to_remove:
+                # logging.info(f"Unlinking {len(links_to_remove)} parents...")
+                for link in links_to_remove:
+                    prop_n_list = ['%TARGET_LIBRARY', 'SYSTEM_ID']
+                    prop_v_list = [xsd.AnyObject(string_type, 'RTA_MAIN'),
+                                   xsd.AnyObject(int_type, int(link['SYSTEM_ID']))]
+
+                    if link['PARENT']:
+                        prop_n_list.append('PARENT')
+                        prop_v_list.append(xsd.AnyObject(string_type, str(link['PARENT'])))
+                    if link['PARENT_VERSION']:
+                        prop_n_list.append('PARENT_VERSION')
+                        prop_v_list.append(xsd.AnyObject(string_type, str(link['PARENT_VERSION'])))
+
                     del_link_call = {
                         'call': {
                             'dstIn': dst,
                             'objectType': 'ContentItem',
                             'properties': {
-                                'propertyCount': 2,
-                                'propertyNames': string_array_type(['%TARGET_LIBRARY', '%OBJECT_IDENTIFIER']),
-                                'propertyValues': {'anyType': [
-                                    xsd.AnyObject(string_type, 'RTA_MAIN'),
-                                    xsd.AnyObject(string_type, str(link_id))
-                                ]}
+                                'propertyCount': len(prop_n_list),
+                                'propertyNames': string_array_type(prop_n_list),
+                                'propertyValues': {'anyType': prop_v_list}
                             }
                         }
                     }
                     try:
-                        del_client.service.DeleteObject(**del_link_call)
-                        logging.info(f"Unlinked reference {link_id}")
+                        res = del_client.service.DeleteObject(**del_link_call)
+                        if res.resultCode == 0:
+                            logging.info(f"Unlinked {link['SYSTEM_ID']}")
+                        else:
+                            logging.warning(f"Failed unlink {link['SYSTEM_ID']}: {getattr(res, 'errorDoc', '')}")
                     except Exception as e:
-                        logging.warning(f"Unlink fail {link_id}: {e}")
+                        logging.warning(f"Exception unlink {link['SYSTEM_ID']}: {e}")
             else:
-                logging.warning("Force delete: No links found via Where Used.")
+                logging.warning("Force requested but no links found via WhereUsed.")
 
-        # --- STEP 2: Delete Profile ---
-        logging.info(f"Deleting profile {doc_number}...")
+        # --- Step 2: Delete Profile ---
+        # logging.info(f"Deleting profile {doc_number}...")
         del_props = {'propertyCount': 2, 'propertyNames': string_array_type(['%TARGET_LIBRARY', '%OBJECT_IDENTIFIER']),
                      'propertyValues': {
                          'anyType': [xsd.AnyObject(string_type, 'RTA_MAIN'), xsd.AnyObject(int_type, int(doc_number))]}}
 
-        resp = del_client.service.DeleteObject(call={'dstIn': dst, 'objectType': 'DEF_PROF', 'properties': del_props})
+        try:
+            resp = del_client.service.DeleteObject(
+                call={'dstIn': dst, 'objectType': 'DEF_PROF', 'properties': del_props})
+            if resp.resultCode == 0:
+                # logging.info("Deleted successfully.")
+                return True, "Success"
 
-        if resp.resultCode == 0:
-            logging.info(f"Deleted {doc_number}.")
-            return True, "Success"
-        else:
-            err = getattr(resp, 'errorDoc', 'Unknown Error')
-            logging.error(f"Delete failed: {err}")
-            return False, str(err)
+            err_doc = getattr(resp, 'errorDoc', '')
+            logging.error(f"Delete failed: {err_doc}")
+            return False, str(err_doc)
+
+        except Fault as f:
+            # Standard Zeep fault handling
+            err_msg = f.message or str(f)
+            # logging.error(f"Delete SOAP Fault: {err_msg}")
+            return False, err_msg
 
     except Exception as e:
         logging.error(f"Delete exception: {e}")
         return False, str(e)
 
+
+# ... (Rest of file unchanged) ...
 def list_folder_contents(dst, parent_id=None, app_source=None):
     """
     Lists contents of a folder.
@@ -331,6 +325,7 @@ def list_folder_contents(dst, parent_id=None, app_source=None):
         target_id = SMART_EDMS_ROOT_ID
         is_root_view = True
 
+    # 1. Add Standard Folders (Root Only)
     if is_root_view:
         try:
             counts = db_connector.get_media_type_counts(app_source)
@@ -347,6 +342,7 @@ def list_folder_contents(dst, parent_id=None, app_source=None):
         except Exception:
             pass
 
+    # 2. Fetch DMS Contents
     try:
         search_client = get_soap_client('BasicHttpBinding_IDMSvc')
         criteria_name = '%ITEM'
@@ -387,14 +383,18 @@ def list_folder_contents(dst, parent_id=None, app_source=None):
         get_data_call = {'call': {'resultSetID': result_set_id, 'requestedRows': 500, 'startingRow': 0}}
         data_reply = getattr(data_client.service, method_name)(**get_data_call)
 
+        # --- PARSING LOGIC ---
         row_nodes = None
 
+        # Check for binary buffer first (based on logs)
         if hasattr(data_reply, 'resultSetData') and data_reply.resultSetData:
             container = data_reply.resultSetData
             if hasattr(container, 'resultBuffer') and container.resultBuffer:
+                #  logging.info("Detected binary resultBuffer. Attempting custom parse.")
                 parsed_items = parse_binary_result_buffer(container.resultBuffer)
                 if parsed_items:
                     items.extend(parsed_items)
+                    # Cleanup and return if successful
                     try:
                         search_client.service.ReleaseData(call={'resultSetID': result_set_id})
                         search_client.service.ReleaseObject(call={'objectID': result_set_id})
@@ -402,6 +402,7 @@ def list_folder_contents(dst, parent_id=None, app_source=None):
                         pass
                     return items
 
+        # Fallback to XML parsing
         if hasattr(data_reply, 'rowNode'):
             row_nodes = data_reply.rowNode
         elif hasattr(data_reply, 'RowNode'):
@@ -439,7 +440,11 @@ def list_folder_contents(dst, parent_id=None, app_source=None):
         logging.error(f"Error listing folder contents: {e}", exc_info=True)
         return items
 
+
 def rename_document(dst, doc_number, new_name):
+    """
+    Renames a document or folder by updating its DOCNAME in the profile.
+    """
     try:
         svc_client = get_soap_client('BasicHttpBinding_IDMSvc')
         string_type = svc_client.get_type('{http://www.w3.org/2001/XMLSchema}string')
@@ -449,9 +454,10 @@ def rename_document(dst, doc_number, new_name):
 
         logging.info(f"Renaming document {doc_number} to '{new_name}'...")
 
+        # Prepare UpdateObject call
         prop_names = string_array_type(['%OBJECT_TYPE_ID', '%OBJECT_IDENTIFIER', '%TARGET_LIBRARY', 'DOCNAME'])
         prop_values = [
-            xsd.AnyObject(string_type, 'DEF_PROF'),
+            xsd.AnyObject(string_type, 'DEF_PROF'),  # Profile object
             xsd.AnyObject(int_type, int(doc_number)),
             xsd.AnyObject(string_type, 'RTA_MAIN'),
             xsd.AnyObject(string_type, new_name)
@@ -483,7 +489,9 @@ def rename_document(dst, doc_number, new_name):
         logging.error(f"Error renaming document: {e}", exc_info=True)
         return False
 
+
 def get_image_by_docnumber(dst, doc_number):
+    """Retrieves a single document's image bytes from the DMS using the multi-step process."""
     svc_client, obj_client, content_id, stream_id = None, None, None, None
     try:
         svc_client = get_soap_client('BasicHttpBinding_IDMSvc')
@@ -549,7 +557,9 @@ def get_image_by_docnumber(dst, doc_number):
                 except Exception:
                     pass
 
+
 def get_dms_stream_details(dst, doc_number):
+    """Opens a stream to a DMS document and returns the client and stream ID for reading."""
     try:
         svc_client = get_soap_client('BasicHttpBinding_IDMSvc')
         obj_client = get_soap_client('BasicHttpBinding_IDMObj')
@@ -576,11 +586,14 @@ def get_dms_stream_details(dst, doc_number):
     except Exception as e:
         return None
 
+
 def dms_user_login(username, password):
+    """Logs into the DMS SOAP service with user-provided credentials."""
     try:
         if not WSDL_URL: raise ValueError("WSDL_URL is not set.")
         client = get_soap_client()
 
+        # If default client doesn't have LoginSvr5, search for it
         if not hasattr(client.service, 'LoginSvr5'):
             client = find_client_with_operation('LoginSvr5')
             if not client:
@@ -602,7 +615,11 @@ def dms_user_login(username, password):
     except Exception:
         return None
 
+
 def upload_document_to_dms(dst, file_stream, metadata):
+    """
+    Uploads a document to the DMS.
+    """
     import db_connector
 
     svc_client, obj_client = None, None
