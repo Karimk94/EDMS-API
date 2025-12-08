@@ -1,7 +1,5 @@
-import zeep
 import os
 import logging
-import struct
 import re
 from zeep import Client, Settings, xsd
 from zeep.exceptions import Fault
@@ -471,7 +469,9 @@ def list_folder_contents(dst, parent_id=None, app_source=None):
 
 def rename_document(dst, doc_number, new_name):
     """
-    Renames a document or folder by updating its DOCNAME in the profile.
+    Renames a folder/document by:
+    1. Finding the ContentItem SYSTEM_ID associated with the DOCNUMBER.
+    2. Updating the DISPLAYNAME of that ContentItem.
     """
     try:
         svc_client = get_soap_client('BasicHttpBinding_IDMSvc')
@@ -480,23 +480,79 @@ def rename_document(dst, doc_number, new_name):
         string_array_type = svc_client.get_type(
             '{http://schemas.microsoft.com/2003/10/Serialization/Arrays}ArrayOfstring')
 
-        # logging.info(f"Renaming document {doc_number} to '{new_name}'...")
+        # logging.info(f"Step 1: Resolving DOCNUMBER {doc_number} to ContentItem SYSTEM_ID...")
 
-        # Prepare UpdateObject call
-        prop_names = string_array_type(['%OBJECT_TYPE_ID', '%OBJECT_IDENTIFIER', '%TARGET_LIBRARY', 'DOCNAME'])
-        prop_values = [
-            xsd.AnyObject(string_type, 'DEF_PROF'),  # Profile object
-            xsd.AnyObject(int_type, int(doc_number)),
+        # --- Step 1: Find the ContentItem SYSTEM_ID using 'Where Used' ---
+        # We create a 'Where Used' collection to find where this DOCNUMBER is filed.
+        coll_names = string_array_type(['%TARGET_LIBRARY', 'DOCNUMBER', '%CONTENTS_DIRECTIVE'])
+        coll_values = {'anyType': [
             xsd.AnyObject(string_type, 'RTA_MAIN'),
+            xsd.AnyObject(string_type, str(doc_number)),
+            xsd.AnyObject(string_type, '%CONTENTS_WHERE_USED')
+        ]}
+
+        coll_call = {'call': {'dstIn': dst, 'objectType': 'ContentsCollection',
+                              'properties': {'propertyCount': 3, 'propertyNames': coll_names,
+                                             'propertyValues': coll_values}}}
+
+        coll_reply = svc_client.service.CreateObject(**coll_call)
+
+        system_id = None
+
+        # If collection created, enumerate it to get the ContentItem ID
+        if coll_reply.resultCode == 0 and coll_reply.retProperties:
+            col_id = coll_reply.retProperties.propertyValues.anyType[0]
+
+            enum_client = find_client_with_operation('NewEnum') or svc_client
+            enum_reply = enum_client.service.NewEnum(call={'dstIn': dst, 'collectionID': col_id})
+
+            if enum_reply.resultCode == 0 and enum_reply.enumID:
+                # Fetch the first item (assuming the folder is filed in one place)
+                next_reply = enum_client.service.NextData(
+                    call={'dstIn': dst, 'enumID': enum_reply.enumID, 'elementCount': 1})
+
+                if next_reply.resultCode in [0, 1] and next_reply.genericItemsData:
+                    g_data = next_reply.genericItemsData
+                    prop_names_found = g_data.propertyNames.string
+                    rows = g_data.propertyRows.ArrayOfanyType
+
+                    idx_sys = prop_names_found.index('SYSTEM_ID') if 'SYSTEM_ID' in prop_names_found else -1
+
+                    if idx_sys != -1 and rows:
+                        # We found the SYSTEM_ID of the ContentItem
+                        system_id = rows[0].anyType[idx_sys]
+                        # logging.info(f"Resolved DOCNUMBER {doc_number} to ContentItem SYSTEM_ID: {system_id}")
+
+                # Cleanup
+                try:
+                    enum_client.service.ReleaseObject(call={'objectID': enum_reply.enumID})
+                except:
+                    pass
+            try:
+                svc_client.service.ReleaseObject(call={'objectID': col_id})
+            except:
+                pass
+
+        if not system_id:
+            logging.error(f"Could not find ContentItem SYSTEM_ID for DOCNUMBER {doc_number}. Rename aborted.")
+            return False
+
+        # --- Step 2: Update the ContentItem using the resolved SYSTEM_ID ---
+        # logging.info(f"Renaming ContentItem {system_id} to '{new_name}'...")
+
+        prop_names = string_array_type(['%TARGET_LIBRARY', 'SYSTEM_ID', 'DISPLAYNAME'])
+        prop_values = [
+            xsd.AnyObject(string_type, 'RTA_MAIN'),
+            xsd.AnyObject(int_type, int(system_id)),  # Pass the resolved SYSTEM_ID
             xsd.AnyObject(string_type, new_name)
         ]
 
         update_call = {
             'call': {
                 'dstIn': dst,
-                'objectType': 'Profile',
+                'objectType': 'ContentItem',
                 'properties': {
-                    'propertyCount': len(prop_names.string),
+                    'propertyCount': 3,
                     'propertyNames': prop_names,
                     'propertyValues': {'anyType': prop_values}
                 }
@@ -506,7 +562,7 @@ def rename_document(dst, doc_number, new_name):
         response = svc_client.service.UpdateObject(**update_call)
 
         if response.resultCode == 0:
-            # logging.info(f"Successfully renamed document {doc_number}.")
+            # logging.info(f"Successfully renamed item {doc_number} (SystemID {system_id}).")
             return True
         else:
             err = getattr(response, 'errorDoc', 'Unknown Error')
@@ -514,7 +570,7 @@ def rename_document(dst, doc_number, new_name):
             return False
 
     except Exception as e:
-        logging.error(f"Error renaming document: {e}", exc_info=True)
+        logging.error(f"Error renaming item: {e}", exc_info=True)
         return False
 
 def get_image_by_docnumber(dst, doc_number):
