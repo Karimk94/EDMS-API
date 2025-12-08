@@ -10,5 +10,6 @@ moviepy==1.0.3
 PyMuPDF
 waitress
 flask-gssapi
+numpy<2.0.0
 chromadb==0.4.24
 marshmallow==3.20.1

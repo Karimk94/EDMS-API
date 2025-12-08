@@ -1505,6 +1505,122 @@ def get_media_counts():
         logging.error(f"Error fetching media counts: {e}", exc_info=True)
         return jsonify({"error": str(e)}), 500
 
+@app.route('/api/folders', methods=['GET'])
+def api_list_folders():
+    """
+    Lists the contents of a specific folder or the root.
+    Query Param: parent_id (optional)
+    """
+    if 'user' not in session:
+        return jsonify({"error": "Unauthorized"}), 401
+
+    app_source = request.headers.get('X-App-Source', 'unknown')
+
+    parent_id = request.args.get('parent_id')
+    # Treat string "null" or empty as None
+    if parent_id in ['null', 'undefined', '']:
+        parent_id = None
+
+    dst = wsdl_client.dms_system_login()
+    if not dst:
+        return jsonify({"error": "Failed to authenticate with DMS"}), 500
+
+    try:
+        contents = wsdl_client.list_folder_contents(dst, parent_id, app_source)
+
+        return jsonify({"contents": contents}), 200
+    except Exception as e:
+        logging.error(f"API Error listing folders: {e}", exc_info=True)
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/folders', methods=['POST'])
+def api_create_folder():
+    if 'user' not in session:
+        return jsonify({"error": "Unauthorized"}), 401
+
+    data = request.get_json()
+    folder_name = data.get('name')
+    description = data.get('description', '')
+
+    # Extract parent_id. If it's an empty string or 0, treat as None (Root folder)
+    parent_id = data.get('parent_id')
+    if not parent_id or str(parent_id).strip() == "":
+        parent_id = None
+
+    if not folder_name:
+        return jsonify({"error": "Folder name is required"}), 400
+
+    username = session['user'].get('username')
+    dst = wsdl_client.dms_system_login()
+    if not dst:
+        return jsonify({"error": "Failed to authenticate with DMS system"}), 500
+
+    try:
+        new_folder_id = wsdl_client.create_dms_folder(
+            dst=dst,
+            folder_name=folder_name,
+            description=description,
+            parent_id=parent_id,
+            user_id=username
+        )
+
+        if new_folder_id:
+            return jsonify({
+                "message": "Folder created successfully",
+                "folder_id": new_folder_id,
+                "name": folder_name,
+                "type": "subfolder" if parent_id else "root"
+            }), 201
+        else:
+            return jsonify({"error": "Failed to create folder in DMS"}), 500
+
+    except Exception as e:
+        logging.error(f"API Error creating folder: {e}", exc_info=True)
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/folders/<folder_id>', methods=['PUT'])
+def api_rename_folder(folder_id):
+    """
+    Renames a folder (or document).
+    JSON Body: { "name": "New Name" }
+    """
+    if 'user' not in session:
+        return jsonify({"error": "Unauthorized"}), 401
+
+    data = request.get_json()
+    new_name = data.get('name')
+
+    if not new_name:
+        return jsonify({"error": "New name is required"}), 400
+
+    dst = wsdl_client.dms_system_login()
+    if not dst:
+        return jsonify({"error": "Failed to authenticate with DMS"}), 500
+
+    success = wsdl_client.rename_document(dst, folder_id, new_name)
+
+    if success:
+        return jsonify({"message": "Folder renamed successfully", "id": folder_id, "new_name": new_name}), 200
+    else:
+        return jsonify({"error": "Failed to rename folder in DMS"}), 500
+
+@app.route('/api/folders/<folder_id>', methods=['DELETE'])
+def api_delete_folder(folder_id):
+    if 'user' not in session: return jsonify({"error": "Unauthorized"}), 401
+
+    force_delete = request.args.get('force', 'false').lower() == 'true'
+    dst = wsdl_client.dms_system_login()
+    if not dst: return jsonify({"error": "Failed to authenticate"}), 500
+
+    # Unpack tuple (success, message)
+    success, message = wsdl_client.delete_document(dst, folder_id, force=force_delete)
+
+    if success:
+        return jsonify({"message": "Folder deleted successfully", "id": folder_id}), 200
+    else:
+        # Return the actual SOAP error message so frontend can detect "referenced"
+        return jsonify({"error": message}), 500
+
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     # logging.info(f"Starting server on host 0.0.0.0 port {port}")

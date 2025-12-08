@@ -14,7 +14,7 @@ CHROMA_DB_PATH = os.getenv('CHROMA_DB_PATH', './chroma_db')
 COLLECTION_NAME = os.getenv('CHROMA_COLLECTION_NAME', 'edms_documents')
 DISTANCE_THRESHOLD = 1.3
 
-logging.info(f"Initializing ChromaDB PersistentClient at path: {CHROMA_DB_PATH}")
+# logging.info(f"Initializing ChromaDB PersistentClient at path: {CHROMA_DB_PATH}")
 # Use a persistent client to save data to disk
 client = chromadb.PersistentClient(path=CHROMA_DB_PATH,settings=Settings(anonymized_telemetry=False))
 
@@ -49,12 +49,12 @@ external_embed_fn = ExternalEmbeddingFunction()
 
 # Get or create the collection.
 # We must specify the embedding function so ChromaDB knows how to embed queries.
-logging.info(f"Getting or creating ChromaDB collection: '{COLLECTION_NAME}'")
+# logging.info(f"Getting or creating ChromaDB collection: '{COLLECTION_NAME}'")
 collection = client.get_or_create_collection(
     name=COLLECTION_NAME,
     embedding_function=external_embed_fn 
 )
-logging.info(f"ChromaDB collection '{COLLECTION_NAME}' loaded/created from {CHROMA_DB_PATH}.")
+# logging.info(f"ChromaDB collection '{COLLECTION_NAME}' loaded/created from {CHROMA_DB_PATH}.")
 
 def add_or_update_document(doc_id: int, text_content: str):
     """

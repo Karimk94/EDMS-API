@@ -1,10 +1,10 @@
 import zeep
 import os
 import logging
-import base64
+import struct
+import re
 from zeep import Client, Settings, xsd
 from zeep.exceptions import Fault
-import db_connector
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -13,48 +13,605 @@ WSDL_URL = os.getenv("WSDL_URL")
 DMS_USER = os.getenv("DMS_USER")
 DMS_PASSWORD = os.getenv("DMS_PASSWORD")
 
-def dms_system_login():
-    """Logs into the DMS SOAP service using system credentials from .env and returns a session token (DST)."""
+# --- CONSTANTS ---
+SMART_EDMS_ROOT_ID = '19685837'
+
+
+def get_soap_client(service_name=None):
+    settings = Settings(strict=False, xml_huge_tree=True)
+    if service_name:
+        return Client(WSDL_URL, port_name=service_name, settings=settings)
+    return Client(WSDL_URL, settings=settings)
+
+
+def find_client_with_operation(operation_name):
     try:
-        settings = Settings(strict=False, xml_huge_tree=True)
-        client = Client(WSDL_URL, settings=settings)
+        base_client = Client(WSDL_URL, settings=Settings(strict=False, xml_huge_tree=True))
+        for service in base_client.wsdl.services.values():
+            for port in service.ports.values():
+                try:
+                    if operation_name in port.binding.port_type.operations:
+                        return Client(WSDL_URL, port_name=port.name,
+                                      settings=Settings(strict=False, xml_huge_tree=True))
+                except Exception:
+                    continue
+        return None
+    except Exception:
+        return None
+
+
+def dms_system_login():
+    try:
+        client = get_soap_client()
+        if not hasattr(client.service, 'LoginSvr5'):
+            client = find_client_with_operation('LoginSvr5')
+        if not client: return None
 
         login_info_type = client.get_type(
             '{http://schemas.datacontract.org/2004/07/OpenText.DMSvr.Serializable}DMSvrLoginInfo')
         login_info_instance = login_info_type(network=0, loginContext='RTA_MAIN', username=DMS_USER,
                                               password=DMS_PASSWORD)
-
         array_type = client.get_type(
             '{http://schemas.datacontract.org/2004/07/OpenText.DMSvr.Serializable}ArrayOfDMSvrLoginInfo')
         login_info_array_instance = array_type(DMSvrLoginInfo=[login_info_instance])
 
-        call_data = {'call': {'loginInfo': login_info_array_instance, 'authen': 1, 'dstIn': ''}}
-
-        response = client.service.LoginSvr5(**call_data)
-
+        response = client.service.LoginSvr5(call={'loginInfo': login_info_array_instance, 'authen': 1, 'dstIn': ''})
         if response and response.resultCode == 0 and response.DSTOut:
             return response.DSTOut
-        else:
-            result_code = getattr(response, 'resultCode', 'N/A')
-            logging.error(f"DMS login failed. Result code: {result_code}")
-            return None
+        return None
     except Exception as e:
-        logging.error(f"An unexpected error occurred during DMS login: {e}", exc_info=True)
+        logging.error(f"Login failed: {e}")
+        return None
+
+
+def get_doc_version_info(dst, doc_number):
+    try:
+        svc_client = get_soap_client('BasicHttpBinding_IDMSvc')
+        get_doc_call = {
+            'call': {
+                'dstIn': dst,
+                'criteria': {
+                    'criteriaCount': 2,
+                    'criteriaNames': {'string': ['%TARGET_LIBRARY', '%DOCUMENT_NUMBER']},
+                    'criteriaValues': {'string': ['RTA_MAIN', str(doc_number)]}
+                }
+            }
+        }
+        doc_reply = svc_client.service.GetDocSvr3(**get_doc_call)
+        if doc_reply and doc_reply.resultCode == 0 and doc_reply.docProperties:
+            prop_names = doc_reply.docProperties.propertyNames.string
+            prop_values = doc_reply.docProperties.propertyValues.anyType
+            if '%VERSION_ID' in prop_names:
+                return prop_values[prop_names.index('%VERSION_ID')]
+            elif 'VERSION_ID' in prop_names:
+                return prop_values[prop_names.index('VERSION_ID')]
+    except Exception:
+        pass
+    return "0"
+
+
+def create_dms_folder(dst, folder_name, description="", parent_id=None, user_id=None):
+    target_parent_id = parent_id if parent_id and str(parent_id).strip() else SMART_EDMS_ROOT_ID
+    try:
+        svc_client = get_soap_client('BasicHttpBinding_IDMSvc')
+        string_type = svc_client.get_type('{http://www.w3.org/2001/XMLSchema}string')
+        string_array_type = svc_client.get_type(
+            '{http://schemas.microsoft.com/2003/10/Serialization/Arrays}ArrayOfstring')
+        effective_user = user_id if user_id else DMS_USER
+
+        prop_names = string_array_type(
+            ['%TARGET_LIBRARY', 'DOCNAME', 'TYPE_ID', 'APP_ID', 'AUTHOR_ID', 'TYPIST_ID', 'ABSTRACT', 'SECURITY'])
+        prop_values = {'anyType': [
+            xsd.AnyObject(string_type, 'RTA_MAIN'), xsd.AnyObject(string_type, folder_name),
+            xsd.AnyObject(string_type, 'FOLDER'), xsd.AnyObject(string_type, 'FOLDER'),
+            xsd.AnyObject(string_type, effective_user), xsd.AnyObject(string_type, effective_user),
+            xsd.AnyObject(string_type, description), xsd.AnyObject(string_type, '1')
+        ]}
+
+        create_reply = svc_client.service.CreateObject(call={'dstIn': dst, 'objectType': 'DEF_PROF',
+                                                             'properties': {'propertyCount': 8,
+                                                                            'propertyNames': prop_names,
+                                                                            'propertyValues': prop_values}})
+        if create_reply.resultCode != 0: raise Exception(f"Create error: {getattr(create_reply, 'errorDoc', '')}")
+
+        ret_names = create_reply.retProperties.propertyNames.string
+        new_id = create_reply.retProperties.propertyValues.anyType[ret_names.index('%OBJECT_IDENTIFIER')]
+
+        parent_ver = get_doc_version_info(dst, target_parent_id)
+        ci_names = string_array_type(
+            ['%TARGET_LIBRARY', 'PARENT', 'PARENT_VERSION', 'DOCNUMBER', '%FOLDERITEM_LIBRARY_NAME', 'DISPLAYNAME',
+             'VERSION_TYPE'])
+        ci_values = {'anyType': [
+            xsd.AnyObject(string_type, 'RTA_MAIN'), xsd.AnyObject(string_type, str(target_parent_id)),
+            xsd.AnyObject(string_type, str(parent_ver)), xsd.AnyObject(string_type, str(new_id)),
+            xsd.AnyObject(string_type, 'RTA_MAIN'), xsd.AnyObject(string_type, folder_name),
+            xsd.AnyObject(string_type, 'R')
+        ]}
+
+        link_reply = svc_client.service.CreateObject(call={'dstIn': dst, 'objectType': 'ContentItem',
+                                                           'properties': {'propertyCount': 7, 'propertyNames': ci_names,
+                                                                          'propertyValues': ci_values}})
+        if link_reply.resultCode != 0: raise Exception(f"Link error: {getattr(link_reply, 'errorDoc', '')}")
+
+        return new_id
+    except Exception as e:
+        logging.error(f"Create folder failed: {e}")
+        return None
+
+
+def parse_binary_result_buffer(buffer):
+    items = []
+    try:
+        try:
+            raw_text = buffer.decode('utf-16-le', errors='ignore')
+        except:
+            raw_text = buffer.decode('utf-8', errors='ignore')
+        clean_text = re.sub(r'[^\w\s\-\.]', ' ', raw_text)
+        tokens = clean_text.split()
+
+        i = 0
+        while i < len(tokens):
+            token = tokens[i]
+            # MODIFIED: Aggressively accept ANY integer sequence as a potential ID
+            if token.isdigit():
+                if i + 1 < len(tokens):
+                    potential_name = tokens[i + 1]
+                    # Accept even if name is short or number, just grab it
+                    items.append(
+                        {'id': token, 'name': potential_name, 'type': 'folder', 'node_type': 'N', 'is_standard': False})
+                    # Don't skip next token, it might be the start of another ID if name was empty/short
+            i += 1
+    except Exception:
+        pass
+    return items
+
+
+def delete_document(dst, doc_number, force=False):
+    """
+    Deletes a document or folder.
+    Phase 1: Unlink from all parents using 'Where Used' collection.
+    Phase 2: Delete the Profile.
+    """
+    try:
+        svc_client = get_soap_client('BasicHttpBinding_IDMSvc')
+
+        # Check for DeleteObject client
+        del_client = find_client_with_operation('DeleteObject')
+        if not del_client: return False, "DeleteObject not found"
+
+        string_type = svc_client.get_type('{http://www.w3.org/2001/XMLSchema}string')
+        string_array_type = svc_client.get_type(
+            '{http://schemas.microsoft.com/2003/10/Serialization/Arrays}ArrayOfstring')
+        int_type = svc_client.get_type('{http://www.w3.org/2001/XMLSchema}int')
+
+        # --- STEP 1: Unlink (Force) ---
+        if force:
+            logging.info(f"Force Delete: performing 'Where Used' check for {doc_number}...")
+            link_ids = []
+
+            # 1. Create a "Where Used" Collection to find parents
+            coll_prop_names = string_array_type(['%TARGET_LIBRARY', 'DOCNUMBER', '%CONTENTS_DIRECTIVE'])
+            coll_prop_values = {'anyType': [
+                xsd.AnyObject(string_type, 'RTA_MAIN'),
+                xsd.AnyObject(string_type, str(doc_number)),
+                xsd.AnyObject(string_type, '%CONTENTS_WHERE_USED')  # Specific directive from trace
+            ]}
+
+            coll_call = {
+                'call': {
+                    'dstIn': dst,
+                    'objectType': 'ContentsCollection',
+                    'properties': {
+                        'propertyCount': 3,
+                        'propertyNames': coll_prop_names,
+                        'propertyValues': coll_prop_values
+                    }
+                }
+            }
+
+            try:
+                # Need client with CreateObject (IDMSvc)
+                coll_reply = svc_client.service.CreateObject(**coll_call)
+
+                # Check for IUNKNOWN_INTERFACE (Collection ID)
+                collection_id = None
+                if coll_reply.resultCode == 0 and coll_reply.retProperties:
+                    props = coll_reply.retProperties
+                    if props.propertyValues and props.propertyValues.anyType:
+                        collection_id = props.propertyValues.anyType[0]  # Usually first prop is the ID
+
+                if collection_id:
+                    logging.info(f"Created WhereUsed Collection: {collection_id}")
+
+                    # 2. Iterate using NewEnum / NextData
+                    # Note: Need client with NewEnum (usually IDMSvc or IDMNav)
+                    # Try finding one
+                    enum_client = find_client_with_operation('NewEnum') or svc_client
+
+                    enum_call = {'call': {'dstIn': dst, 'collectionID': collection_id}}
+                    enum_reply = enum_client.service.NewEnum(**enum_call)
+
+                    if enum_reply.resultCode == 0 and enum_reply.enumID:
+                        enum_id = enum_reply.enumID
+
+                        # Fetch Data
+                        next_call = {'call': {'dstIn': dst, 'enumID': enum_id, 'elementCount': 100}}
+                        data_reply = enum_client.service.NextData(**next_call)
+
+                        if data_reply.resultCode in [0, 1] and data_reply.genericItemsData:
+                            # Parse genericItemsData
+                            g_data = data_reply.genericItemsData
+                            prop_names = g_data.propertyNames.string
+                            rows = g_data.propertyRows.ArrayOfanyType
+
+                            sys_id_idx = -1
+                            if 'SYSTEM_ID' in prop_names:
+                                sys_id_idx = prop_names.index('SYSTEM_ID')
+
+                            if sys_id_idx != -1 and rows:
+                                for row in rows:
+                                    try:
+                                        sys_val = row.anyType[sys_id_idx]
+                                        link_ids.append(sys_val)
+                                    except:
+                                        pass
+
+                        # Cleanup Enum
+                        try:
+                            enum_client.service.ReleaseObject(call={'objectID': enum_id})
+                        except:
+                            pass
+
+                    # Cleanup Collection
+                    try:
+                        svc_client.service.ReleaseObject(call={'objectID': collection_id})
+                    except:
+                        pass
+
+            except Exception as e:
+                logging.warning(f"Where Used check failed: {e}")
+
+            if link_ids:
+                logging.info(f"Unlinking {len(link_ids)} parents. Link IDs (SYSTEM_ID): {link_ids}")
+                for link_id in link_ids:
+                    del_link_call = {
+                        'call': {
+                            'dstIn': dst,
+                            'objectType': 'ContentItem',
+                            'properties': {
+                                'propertyCount': 2,
+                                'propertyNames': string_array_type(['%TARGET_LIBRARY', '%OBJECT_IDENTIFIER']),
+                                'propertyValues': {'anyType': [
+                                    xsd.AnyObject(string_type, 'RTA_MAIN'),
+                                    xsd.AnyObject(string_type, str(link_id))
+                                ]}
+                            }
+                        }
+                    }
+                    try:
+                        del_client.service.DeleteObject(**del_link_call)
+                        logging.info(f"Unlinked reference {link_id}")
+                    except Exception as e:
+                        logging.warning(f"Unlink fail {link_id}: {e}")
+            else:
+                logging.warning("Force delete: No links found via Where Used.")
+
+        # --- STEP 2: Delete Profile ---
+        logging.info(f"Deleting profile {doc_number}...")
+        del_props = {'propertyCount': 2, 'propertyNames': string_array_type(['%TARGET_LIBRARY', '%OBJECT_IDENTIFIER']),
+                     'propertyValues': {
+                         'anyType': [xsd.AnyObject(string_type, 'RTA_MAIN'), xsd.AnyObject(int_type, int(doc_number))]}}
+
+        resp = del_client.service.DeleteObject(call={'dstIn': dst, 'objectType': 'DEF_PROF', 'properties': del_props})
+
+        if resp.resultCode == 0:
+            logging.info(f"Deleted {doc_number}.")
+            return True, "Success"
+        else:
+            err = getattr(resp, 'errorDoc', 'Unknown Error')
+            logging.error(f"Delete failed: {err}")
+            return False, str(err)
+
+    except Exception as e:
+        logging.error(f"Delete exception: {e}")
+        return False, str(e)
+
+def list_folder_contents(dst, parent_id=None, app_source=None):
+    """
+    Lists contents of a folder.
+    """
+    import db_connector
+
+    items = []
+
+    target_id = parent_id
+    is_root_view = False
+
+    if not target_id or str(target_id).strip() == "" or str(target_id) == "null":
+        target_id = SMART_EDMS_ROOT_ID
+        is_root_view = True
+
+    if is_root_view:
+        try:
+            counts = db_connector.get_media_type_counts(app_source)
+
+            def get_cnt(k):
+                return counts.get(k, 0) if counts else 0
+
+            items.append(
+                {'id': 'images', 'name': 'Images', 'type': 'folder', 'is_standard': True, 'count': get_cnt('images')})
+            items.append(
+                {'id': 'videos', 'name': 'Videos', 'type': 'folder', 'is_standard': True, 'count': get_cnt('videos')})
+            items.append(
+                {'id': 'files', 'name': 'Files', 'type': 'folder', 'is_standard': True, 'count': get_cnt('files')})
+        except Exception:
+            pass
+
+    try:
+        search_client = get_soap_client('BasicHttpBinding_IDMSvc')
+        criteria_name = '%ITEM'
+        criteria_value = str(target_id)
+
+        search_call = {
+            'call': {
+                'dstIn': dst,
+                'objectType': 'ContentsCollection',
+                'signature': {
+                    'libraries': {'string': ['RTA_MAIN']},
+                    'criteria': {
+                        'criteriaCount': 1,
+                        'criteriaNames': {'string': [criteria_name]},
+                        'criteriaValues': {'string': [criteria_value]}
+                    },
+                    'retProperties': {'string': ['FI.DOCNUMBER', '%DISPLAY_NAME', 'FI.NODE_TYPE', 'DOCNAME']},
+                    'sortProps': {'propertyCount': 1, 'propertyNames': {'string': ['%DISPLAY_NAME']},
+                                  'propertyFlags': {'int': [1]}},
+                    'maxRows': 0
+                }
+            }
+        }
+
+        search_reply = search_client.service.Search(**search_call)
+
+        if not (search_reply and search_reply.resultCode == 0 and search_reply.resultSetID):
+            return items
+
+        result_set_id = search_reply.resultSetID
+        data_client = find_client_with_operation('GetDataW') or find_client_with_operation('GetData')
+        method_name = 'GetDataW' if hasattr(data_client.service, 'GetDataW') else 'GetData'
+
+        if not data_client:
+            logging.error("FATAL: Neither GetDataW nor GetData found.")
+            return items
+
+        get_data_call = {'call': {'resultSetID': result_set_id, 'requestedRows': 500, 'startingRow': 0}}
+        data_reply = getattr(data_client.service, method_name)(**get_data_call)
+
+        row_nodes = None
+
+        if hasattr(data_reply, 'resultSetData') and data_reply.resultSetData:
+            container = data_reply.resultSetData
+            if hasattr(container, 'resultBuffer') and container.resultBuffer:
+                parsed_items = parse_binary_result_buffer(container.resultBuffer)
+                if parsed_items:
+                    items.extend(parsed_items)
+                    try:
+                        search_client.service.ReleaseData(call={'resultSetID': result_set_id})
+                        search_client.service.ReleaseObject(call={'objectID': result_set_id})
+                    except:
+                        pass
+                    return items
+
+        if hasattr(data_reply, 'rowNode'):
+            row_nodes = data_reply.rowNode
+        elif hasattr(data_reply, 'RowNode'):
+            row_nodes = data_reply.RowNode
+        elif isinstance(data_reply, dict):
+            row_nodes = data_reply.get('rowNode') or data_reply.get('RowNode')
+
+        if row_nodes:
+            for row in row_nodes:
+                try:
+                    props = row.propValues.anyType
+                    doc_id = props[0]
+                    name_str = str(props[1] or props[3] or "Untitled")
+                    node_type = props[2]
+
+                    is_folder = (node_type == 'N') or (node_type == 'R' and not str(doc_id).isdigit())
+                    if '.' in name_str and len(name_str.split('.')[-1]) < 5: is_folder = False
+
+                    items.append({
+                        'id': str(doc_id), 'name': name_str, 'type': 'folder' if is_folder else 'file',
+                        'node_type': str(node_type), 'is_standard': False
+                    })
+                except Exception:
+                    pass
+
+        try:
+            search_client.service.ReleaseData(call={'resultSetID': result_set_id})
+            search_client.service.ReleaseObject(call={'objectID': result_set_id})
+        except Exception:
+            pass
+
+        return items
+
+    except Exception as e:
+        logging.error(f"Error listing folder contents: {e}", exc_info=True)
+        return items
+
+def rename_document(dst, doc_number, new_name):
+    try:
+        svc_client = get_soap_client('BasicHttpBinding_IDMSvc')
+        string_type = svc_client.get_type('{http://www.w3.org/2001/XMLSchema}string')
+        int_type = svc_client.get_type('{http://www.w3.org/2001/XMLSchema}int')
+        string_array_type = svc_client.get_type(
+            '{http://schemas.microsoft.com/2003/10/Serialization/Arrays}ArrayOfstring')
+
+        logging.info(f"Renaming document {doc_number} to '{new_name}'...")
+
+        prop_names = string_array_type(['%OBJECT_TYPE_ID', '%OBJECT_IDENTIFIER', '%TARGET_LIBRARY', 'DOCNAME'])
+        prop_values = [
+            xsd.AnyObject(string_type, 'DEF_PROF'),
+            xsd.AnyObject(int_type, int(doc_number)),
+            xsd.AnyObject(string_type, 'RTA_MAIN'),
+            xsd.AnyObject(string_type, new_name)
+        ]
+
+        update_call = {
+            'call': {
+                'dstIn': dst,
+                'objectType': 'Profile',
+                'properties': {
+                    'propertyCount': len(prop_names.string),
+                    'propertyNames': prop_names,
+                    'propertyValues': {'anyType': prop_values}
+                }
+            }
+        }
+
+        response = svc_client.service.UpdateObject(**update_call)
+
+        if response.resultCode == 0:
+            logging.info(f"Successfully renamed document {doc_number}.")
+            return True
+        else:
+            err = getattr(response, 'errorDoc', 'Unknown Error')
+            logging.error(f"Rename failed. Code: {response.resultCode} - {err}")
+            return False
+
+    except Exception as e:
+        logging.error(f"Error renaming document: {e}", exc_info=True)
+        return False
+
+def get_image_by_docnumber(dst, doc_number):
+    svc_client, obj_client, content_id, stream_id = None, None, None, None
+    try:
+        svc_client = get_soap_client('BasicHttpBinding_IDMSvc')
+        obj_client = get_soap_client('BasicHttpBinding_IDMObj')
+
+        get_doc_call = {
+            'call': {
+                'dstIn': dst,
+                'criteria': {
+                    'criteriaCount': 3,
+                    'criteriaNames': {'string': ['%TARGET_LIBRARY', '%DOCUMENT_NUMBER', '%VERSION_ID']},
+                    'criteriaValues': {'string': ['RTA_MAIN', str(doc_number), '%VERSION_TO_INDEX']}
+                }
+            }
+        }
+        doc_reply = svc_client.service.GetDocSvr3(**get_doc_call)
+
+        if not (doc_reply and doc_reply.resultCode == 0 and doc_reply.getDocID):
+            return None, None
+        content_id = doc_reply.getDocID
+
+        stream_reply = obj_client.service.GetReadStream(call={'dstIn': dst, 'contentID': content_id})
+        if not (stream_reply and stream_reply.resultCode == 0 and stream_reply.streamID):
+            raise Exception("Failed to get read stream.")
+        stream_id = stream_reply.streamID
+
+        doc_buffer = bytearray()
+        while True:
+            read_reply = obj_client.service.ReadStream(call={'streamID': stream_id, 'requestedBytes': 65536})
+            if not read_reply or read_reply.resultCode != 0: break
+            chunk_data = read_reply.streamData.streamBuffer if read_reply.streamData else None
+            if not chunk_data: break
+            doc_buffer.extend(chunk_data)
+
+        filename = f"{doc_number}.jpg"
+        if doc_reply.docProperties and doc_reply.docProperties.propertyValues:
+            try:
+                prop_names = doc_reply.docProperties.propertyNames.string
+                if '%VERSION_FILE_NAME' in prop_names:
+                    index = prop_names.index('%VERSION_FILE_NAME')
+                    version_file_name = doc_reply.docProperties.propertyValues.anyType[index]
+                    _, extension = os.path.splitext(str(version_file_name))
+                    if extension:
+                        filename = f"{doc_number}{extension}"
+            except Exception:
+                pass
+
+        return doc_buffer, filename
+
+    except Fault as e:
+        logging.error(f"DMS server fault during retrieval for doc: {doc_number}. Fault: {e}", exc_info=True)
+        return None, None
+    finally:
+        if obj_client:
+            if stream_id:
+                try:
+                    obj_client.service.ReleaseObject(call={'objectID': stream_id})
+                except Exception:
+                    pass
+            if content_id:
+                try:
+                    obj_client.service.ReleaseObject(call={'objectID': content_id})
+                except Exception:
+                    pass
+
+def get_dms_stream_details(dst, doc_number):
+    try:
+        svc_client = get_soap_client('BasicHttpBinding_IDMSvc')
+        obj_client = get_soap_client('BasicHttpBinding_IDMObj')
+
+        get_doc_call = {'call': {'dstIn': dst,
+                                 'criteria': {'criteriaCount': 2,
+                                              'criteriaNames': {'string': ['%TARGET_LIBRARY', '%DOCUMENT_NUMBER']},
+                                              'criteriaValues': {'string': ['RTA_MAIN', str(doc_number)]}}}}
+        doc_reply = svc_client.service.GetDocSvr3(**get_doc_call)
+        if not (doc_reply and doc_reply.resultCode == 0 and doc_reply.getDocID):
+            return None
+
+        content_id = doc_reply.getDocID
+        stream_reply = obj_client.service.GetReadStream(call={'dstIn': dst, 'contentID': content_id})
+        if not (stream_reply and stream_reply.resultCode == 0 and stream_reply.streamID):
+            obj_client.service.ReleaseObject(call={'objectID': content_id})
+            return None
+
+        return {
+            "obj_client": obj_client,
+            "stream_id": stream_reply.streamID,
+            "content_id": content_id
+        }
+    except Exception as e:
+        return None
+
+def dms_user_login(username, password):
+    try:
+        if not WSDL_URL: raise ValueError("WSDL_URL is not set.")
+        client = get_soap_client()
+
+        if not hasattr(client.service, 'LoginSvr5'):
+            client = find_client_with_operation('LoginSvr5')
+            if not client:
+                logging.error("LoginSvr5 not found during user login.")
+                return None
+
+        login_info_type = client.get_type(
+            '{http://schemas.datacontract.org/2004/07/OpenText.DMSvr.Serializable}DMSvrLoginInfo')
+        login_info_instance = login_info_type(network=0, loginContext='RTA_MAIN', username=username,
+                                              password=password)
+        array_type = client.get_type(
+            '{http://schemas.datacontract.org/2004/07/OpenText.DMSvr.Serializable}ArrayOfDMSvrLoginInfo')
+        login_info_array_instance = array_type(DMSvrLoginInfo=[login_info_instance])
+        call_data = {'call': {'loginInfo': login_info_array_instance, 'authen': 1, 'dstIn': ''}}
+        response = client.service.LoginSvr5(**call_data)
+        if response and response.resultCode == 0 and response.DSTOut:
+            return response.DSTOut
+        return None
+    except Exception:
         return None
 
 def upload_document_to_dms(dst, file_stream, metadata):
-    """
-    Uploads a document to the DMS following the 9-step sequence, for AI processing.
-    Also links the document to an event if event_id is provided in metadata.
-    """
+    import db_connector
+
     svc_client, obj_client = None, None
     created_doc_number, version_id, put_doc_id, stream_id = None, None, None, None
-    event_id = metadata.get('event_id') # Get event_id from metadata
+    event_id = metadata.get('event_id')
 
     try:
-        settings = Settings(strict=False, xml_huge_tree=True)
-        svc_client = Client(WSDL_URL, port_name='BasicHttpBinding_IDMSvc', settings=settings)
-        obj_client = Client(WSDL_URL, port_name='BasicHttpBinding_IDMObj', settings=settings)
+        svc_client = get_soap_client('BasicHttpBinding_IDMSvc')
+        obj_client = get_soap_client('BasicHttpBinding_IDMObj')
 
         string_type = svc_client.get_type('{http://www.w3.org/2001/XMLSchema}string')
         int_type = svc_client.get_type('{http://www.w3.org/2001/XMLSchema}int')
@@ -82,12 +639,10 @@ def upload_document_to_dms(dst, file_stream, metadata):
 
         doc_date = metadata.get('doc_date')
         if doc_date:
-            logging.info(f"doc_date is : {doc_date}")
             property_names_list.append('RTADOCDATE')
             property_values_list.append(xsd.AnyObject(string_type, doc_date.strftime('%m/%d/%y')))
 
         property_names = string_array_type(property_names_list)
-
 
         create_object_call = {
             'call': {
@@ -105,18 +660,15 @@ def upload_document_to_dms(dst, file_stream, metadata):
         create_reply = svc_client.service.CreateObject(**create_object_call)
 
         if not (create_reply and create_reply.resultCode == 0 and create_reply.retProperties):
-            error_message = f"CreateObject failed. Result code: {getattr(create_reply, 'resultCode', 'N/A')}"
-            if hasattr(create_reply, 'errorDoc') and create_reply.errorDoc:
-                error_message += f" Details: {create_reply.errorDoc}"
-            raise Exception(error_message)
+            raise Exception("CreateObject failed")
 
         ret_prop_names = create_reply.retProperties.propertyNames.string
         ret_prop_values = create_reply.retProperties.propertyValues.anyType
         created_doc_number = ret_prop_values[ret_prop_names.index('%OBJECT_IDENTIFIER')]
         version_id = ret_prop_values[ret_prop_names.index('%VERSION_ID')]
+
         logging.info(f"CreateObject successful. New docnumber: {created_doc_number}, VersionID: {version_id}")
 
-        logging.info("Step 3: PutDoc - Preparing document for writing.")
         put_doc_call = {
             'call': {
                 'dstIn': dst,
@@ -129,26 +681,19 @@ def upload_document_to_dms(dst, file_stream, metadata):
         if not (put_doc_reply and put_doc_reply.resultCode == 0 and put_doc_reply.putDocID):
             raise Exception(f"PutDoc failed. Result code: {getattr(put_doc_reply, 'resultCode', 'N/A')}")
         put_doc_id = put_doc_reply.putDocID
-        logging.info(f"PutDoc successful. PutDocID: {put_doc_id}")
 
-        logging.info("Step 4: GetWriteStream - Acquiring write stream.")
         get_stream_call = {'call': {'dstIn': dst, 'contentID': put_doc_id}}
         get_stream_reply = obj_client.service.GetWriteStream(**get_stream_call)
         if not (get_stream_reply and get_stream_reply.resultCode == 0 and get_stream_reply.streamID):
             raise Exception(f"GetWriteStream failed. Result code: {getattr(get_stream_reply, 'resultCode', 'N/A')}")
         stream_id = get_stream_reply.streamID
-        logging.info(f"GetWriteStream successful. StreamID: {stream_id}")
 
-        logging.info("Step 5: WriteStream - Writing file content in chunks.")
         chunk_size = 48 * 1024
-        total_bytes_written = 0
         while True:
-            # Ensure file_stream is readable and reset if necessary (though seek(0) was done before calling)
             try:
                 chunk = file_stream.read(chunk_size)
-            except Exception as read_err:
-                 logging.error(f"Error reading from file stream during upload: {read_err}")
-                 raise Exception(f"Failed to read file stream: {read_err}")
+            except Exception:
+                raise Exception(f"Failed to read file stream")
 
             if not chunk:
                 break
@@ -167,17 +712,11 @@ def upload_document_to_dms(dst, file_stream, metadata):
             if write_reply.resultCode != 0:
                 raise Exception(f"WriteStream chunk failed. Result code: {write_reply.resultCode}")
 
-            total_bytes_written += write_reply.bytesWritten
-        logging.info(f"WriteStream successful. Total bytes written: {total_bytes_written}")
-
-        logging.info("Step 6: CommitStream - Finalizing write.")
         commit_stream_call = {'call': {'streamID': stream_id, 'flags': 0}}
         commit_reply = obj_client.service.CommitStream(**commit_stream_call)
         if commit_reply.resultCode != 0:
             raise Exception(f"CommitStream failed. Result code: {commit_reply.resultCode}")
-        logging.info("CommitStream successful.")
 
-        logging.info("Step 6a: UpdateObject - Setting FORM ID to 2740.")
         form_prop_names = string_array_type(
             ['%OBJECT_TYPE_ID', '%OBJECT_IDENTIFIER', '%TARGET_LIBRARY', 'FORM'])
         form_prop_values_list = [
@@ -200,13 +739,7 @@ def upload_document_to_dms(dst, file_stream, metadata):
             }
         }
         update_form_reply = svc_client.service.UpdateObject(**update_form_call)
-        if update_form_reply.resultCode != 0:
-            logging.warning(
-                f"UpdateObject (Set FORM ID) failed. Result code: {update_form_reply.resultCode}.")
-        else:
-            logging.info("UpdateObject (Set FORM ID) successful.")
 
-        logging.info("Step 9: UpdateObject - Unlocking document profile.")
         unlock_prop_names = string_array_type(
             ['%OBJECT_TYPE_ID', '%OBJECT_IDENTIFIER', '%TARGET_LIBRARY', '%STATUS'])
 
@@ -231,18 +764,9 @@ def upload_document_to_dms(dst, file_stream, metadata):
             }
         }
         update_reply = svc_client.service.UpdateObject(**update_object_call)
-        if update_reply.resultCode != 0:
-            logging.warning(
-                f"UpdateObject (Unlock) failed. Result code: {update_reply.resultCode}. The object might remain locked.")
-        else:
-            logging.info("UpdateObject successful.")
 
-        if created_doc_number and event_id is not None: # Check explicitly for None
-            logging.info(f"Linking uploaded document {created_doc_number} to event {event_id}.")
-            success, message = db_connector.link_document_to_event(created_doc_number, event_id)
-            if not success:
-                # Log a warning but don't fail the whole upload
-                logging.warning(f"Failed to link document {created_doc_number} to event {event_id}: {message}")
+        if created_doc_number and event_id is not None:
+            db_connector.link_document_to_event(created_doc_number, event_id)
 
         return created_doc_number
 
@@ -250,328 +774,14 @@ def upload_document_to_dms(dst, file_stream, metadata):
         logging.error(f"DMS upload failed. Error: {e}", exc_info=True)
         return None
     finally:
-        # Cleanup DMS objects
         if obj_client:
-            if stream_id: # Release stream first
+            if stream_id:
                 try:
                     obj_client.service.ReleaseObject(call={'objectID': stream_id})
-                    logging.info("Step 8: Released streamID object.")
-                except Exception as e:
-                    logging.warning(f"Failed to release streamID object {stream_id}: {e}")
+                except Exception:
+                    pass
             if put_doc_id:
                 try:
                     obj_client.service.ReleaseObject(call={'objectID': put_doc_id})
-                    logging.info("Step 7: Released putDocID object.")
-                except Exception as e:
-                    logging.warning(f"Failed to release putDocID object {put_doc_id}: {e}")
-
-def get_image_by_docnumber(dst, doc_number):
-    """Retrieves a single document's image bytes from the DMS using the multi-step process."""
-    svc_client, obj_client, content_id, stream_id = None, None, None, None
-    try:
-        settings = Settings(strict=False, xml_huge_tree=True)
-        svc_client = Client(WSDL_URL, port_name='BasicHttpBinding_IDMSvc', settings=settings)
-        obj_client = Client(WSDL_URL, port_name='BasicHttpBinding_IDMObj', settings=settings)
-
-        get_doc_call = {
-            'call': {
-                'dstIn': dst,
-                'criteria': {
-                    'criteriaCount': 3,
-                    'criteriaNames': {'string': ['%TARGET_LIBRARY', '%DOCUMENT_NUMBER', '%VERSION_ID']},
-                    'criteriaValues': {'string': ['RTA_MAIN', str(doc_number), '%VERSION_TO_INDEX']}
-                }
-            }
-        }
-        doc_reply = svc_client.service.GetDocSvr3(**get_doc_call)
-
-        if not (doc_reply and doc_reply.resultCode == 0 and doc_reply.getDocID):
-            logging.warning(
-                f"Document not found in DMS for doc_number: {doc_number}. Result code: {getattr(doc_reply, 'resultCode', 'N/A')}")
-            return None, None
-        content_id = doc_reply.getDocID
-
-        stream_reply = obj_client.service.GetReadStream(call={'dstIn': dst, 'contentID': content_id})
-        if not (stream_reply and stream_reply.resultCode == 0 and stream_reply.streamID):
-            raise Exception(
-                f"Failed to get read stream. Result code: {getattr(stream_reply, 'resultCode', 'N/A')}")
-        stream_id = stream_reply.streamID
-
-        doc_buffer = bytearray()
-        while True:
-            read_reply = obj_client.service.ReadStream(call={'streamID': stream_id, 'requestedBytes': 65536})
-            if not read_reply or read_reply.resultCode != 0:
-                raise Exception(
-                    f"Stream read failed. Result code: {getattr(read_reply, 'resultCode', 'N/A')}")
-            chunk_data = read_reply.streamData.streamBuffer if read_reply.streamData else None
-            if not chunk_data: break
-            doc_buffer.extend(chunk_data)
-
-        filename = f"{doc_number}.jpg"  # Default
-        if doc_reply.docProperties and doc_reply.docProperties.propertyValues:
-            try:
-                prop_names = doc_reply.docProperties.propertyNames.string
-                if '%VERSION_FILE_NAME' in prop_names:
-                    index = prop_names.index('%VERSION_FILE_NAME')
-                    version_file_name = doc_reply.docProperties.propertyValues.anyType[index]
-                    _, extension = os.path.splitext(str(version_file_name))
-                    if extension:
-                        filename = f"{doc_number}{extension}"
-            except Exception as e:
-                logging.warning(f"Could not determine original filename, will use default. Error: {e}")
-
-        return doc_buffer, filename
-
-    except Fault as e:
-        logging.error(f"DMS server fault during retrieval for doc: {doc_number}. Fault: {e}", exc_info=True)
-        return None, None
-    finally:
-        if obj_client:
-            if stream_id:
-                try:
-                    obj_client.service.ReleaseObject(call={'objectID': stream_id})
-                except Exception:
-                    pass
-            if content_id:
-                try:
-                    obj_client.service.ReleaseObject(call={'objectID': content_id})
-                except Exception:
-                    pass
-
-def get_dms_stream_details(dst, doc_number):
-    """Opens a stream to a DMS document and returns the client and stream ID for reading."""
-    try:
-        settings = Settings(strict=False, xml_huge_tree=True)
-        wsdl_url = os.getenv("WSDL_URL")
-        svc_client = Client(wsdl_url, port_name='BasicHttpBinding_IDMSvc', settings=settings)
-        obj_client = Client(wsdl_url, port_name='BasicHttpBinding_IDMObj', settings=settings)
-
-        get_doc_call = {'call': {'dstIn': dst,
-                                 'criteria': {'criteriaCount': 2,
-                                              'criteriaNames': {'string': ['%TARGET_LIBRARY', '%DOCUMENT_NUMBER']},
-                                              'criteriaValues': {'string': ['RTA_MAIN', str(doc_number)]}}}}
-        doc_reply = svc_client.service.GetDocSvr3(**get_doc_call)
-        if not (doc_reply and doc_reply.resultCode == 0 and doc_reply.getDocID):
-            return None
-
-        content_id = doc_reply.getDocID
-        stream_reply = obj_client.service.GetReadStream(call={'dstIn': dst, 'contentID': content_id})
-        if not (stream_reply and stream_reply.resultCode == 0 and stream_reply.streamID):
-            obj_client.service.ReleaseObject(call={'objectID': content_id})
-            return None
-
-        return {
-            "obj_client": obj_client,
-            "stream_id": stream_reply.streamID,
-            "content_id": content_id
-        }
-    except Exception as e:
-        print(f"Error opening DMS stream for {doc_number}: {e}")
-        return None
-
-# --- Archiving/User Functions (Merged) ---
-
-def dms_user_login(username, password):
-    """Logs into the DMS SOAP service with user-provided credentials and returns a session token (DST)."""
-    try:
-        if not WSDL_URL:
-            raise ValueError("WSDL_URL is not set in the environment file.")
-        settings = Settings(strict=False, xml_huge_tree=True)
-        client = Client(WSDL_URL, settings=settings)
-        login_info_type = client.get_type(
-            '{http://schemas.datacontract.org/2004/07/OpenText.DMSvr.Serializable}DMSvrLoginInfo')
-        login_info_instance = login_info_type(network=0, loginContext='RTA_MAIN', username=username,
-                                              password=password)
-        array_type = client.get_type(
-            '{http://schemas.datacontract.org/2004/07/OpenText.DMSvr.Serializable}ArrayOfDMSvrLoginInfo')
-        login_info_array_instance = array_type(DMSvrLoginInfo=[login_info_instance])
-        call_data = {'call': {'loginInfo': login_info_array_instance, 'authen': 1, 'dstIn': ''}}
-        response = client.service.LoginSvr5(**call_data)
-        if response and response.resultCode == 0 and response.DSTOut:
-            return response.DSTOut
-        else:
-            logging.error(
-                f"DMS login failed for user '{username}'. Result code: {getattr(response, 'resultCode', 'N/A')}")
-            return None
-    except Exception as e:
-        logging.error(f"An unexpected error occurred during DMS login: {e}", exc_info=True)
-        return None
-
-def upload_archive_document_to_dms(dst, file_stream, metadata):
-    """
-    Uploads a document to the DMS for the archiving system.
-    """
-    svc_client, obj_client = None, None
-    created_doc_number, version_id, put_doc_id, stream_id = None, None, None, None
-    try:
-        settings = Settings(strict=False, xml_huge_tree=True)
-        svc_client = Client(WSDL_URL, port_name='BasicHttpBinding_IDMSvc', settings=settings)
-        obj_client = Client(WSDL_URL, port_name='BasicHttpBinding_IDMObj', settings=settings)
-        string_type = svc_client.get_type('{http://www.w3.org/2001/XMLSchema}string')
-        int_type = svc_client.get_type('{http://www.w3.org/2001/XMLSchema}int')
-        string_array_type = svc_client.get_type(
-            '{http://schemas.microsoft.com/2003/10/Serialization/Arrays}ArrayOfstring')
-
-        dms_user = metadata.get('dms_user', 'SYSTEM')
-        
-        # MODIFIED: app_id is now expected to be in the metadata dictionary, removing the direct call to the database.
-        app_id = metadata.get('app_id', 'UNKNOWN')
-
-        property_names = string_array_type([
-            '%TARGET_LIBRARY', '%RECENTLY_USED_LOCATION', 'DOCNAME', 'TYPE_ID',
-            'AUTHOR_ID', 'TYPIST_ID', 'ABSTRACT', 'APP_ID', 'SECURITY'
-        ])
-
-        property_values_list = [
-            xsd.AnyObject(string_type, 'RTA_MAIN'),
-            xsd.AnyObject(string_type, 'DOCSOPEN!L\\RTA_MAIN'),
-            xsd.AnyObject(string_type, metadata['docname']),
-            xsd.AnyObject(string_type, 'DEFAULT'),
-            xsd.AnyObject(string_type, dms_user),
-            xsd.AnyObject(string_type, dms_user),
-            xsd.AnyObject(string_type, metadata['abstract']),
-            xsd.AnyObject(string_type, app_id),
-            xsd.AnyObject(string_type, '1')
-        ]
-
-        create_object_call = {'call': {'dstIn': dst, 'objectType': 'DEF_PROF', 'properties': {
-            'propertyCount': len(property_names.string), 'propertyNames': property_names,
-            'propertyValues': {'anyType': property_values_list}}}}
-
-        create_reply = svc_client.service.CreateObject(**create_object_call)
-
-        if not (create_reply and create_reply.resultCode == 0 and create_reply.retProperties):
-            raise Exception(f"CreateObject failed. Details: {getattr(create_reply, 'errorDoc', 'No details')}")
-
-        ret_prop_names = create_reply.retProperties.propertyNames.string
-        ret_prop_values = create_reply.retProperties.propertyValues.anyType
-        created_doc_number = ret_prop_values[ret_prop_names.index('%OBJECT_IDENTIFIER')]
-        version_id = ret_prop_values[ret_prop_names.index('%VERSION_ID')]
-
-        put_doc_call = {'call': {'dstIn': dst, 'libraryName': 'RTA_MAIN', 'documentNumber': created_doc_number,
-                                 'versionID': version_id}}
-        put_doc_reply = svc_client.service.PutDoc(**put_doc_call)
-        if not (put_doc_reply and put_doc_reply.resultCode == 0 and put_doc_reply.putDocID):
-            raise Exception(f"PutDoc failed. Result: {getattr(put_doc_reply, 'resultCode', 'N/A')}")
-        put_doc_id = put_doc_reply.putDocID
-
-        get_stream_reply = obj_client.service.GetWriteStream(call={'dstIn': dst, 'contentID': put_doc_id})
-        if not (get_stream_reply and get_stream_reply.resultCode == 0 and get_stream_reply.streamID):
-            raise Exception(f"GetWriteStream failed. Result: {getattr(get_stream_reply, 'resultCode', 'N/A')}")
-        stream_id = get_stream_reply.streamID
-
-        chunk_size = 48 * 1024
-        while True:
-            chunk = file_stream.read(chunk_size)
-            if not chunk: break
-            stream_data_type = obj_client.get_type(
-                '{http://schemas.datacontract.org/2004/07/OpenText.DMSvr.Serializable}StreamData')
-            stream_data_instance = stream_data_type(bufferSize=len(chunk), streamBuffer=chunk)
-            write_reply = obj_client.service.WriteStream(
-                call={'streamID': stream_id, 'streamData': stream_data_instance})
-            if write_reply.resultCode != 0:
-                raise Exception(f"WriteStream chunk failed. Result: {write_reply.resultCode}")
-
-        commit_reply = obj_client.service.CommitStream(call={'streamID': stream_id, 'flags': 0})
-        if commit_reply.resultCode != 0:
-            raise Exception(f"CommitStream failed. Result: {commit_reply.resultCode}")
-
-        unlock_props = string_array_type(
-            ['%OBJECT_TYPE_ID', '%OBJECT_IDENTIFIER', '%TARGET_LIBRARY', '%STATUS'])
-        unlock_values = [xsd.AnyObject(string_type, 'def_prof'), xsd.AnyObject(int_type, created_doc_number),
-                         xsd.AnyObject(string_type, 'rta_main'), xsd.AnyObject(string_type, '%UNLOCK')]
-        update_call = {'call': {'dstIn': dst, 'objectType': 'Profile', 'properties': {
-            'propertyCount': len(unlock_props.string), 'propertyNames': unlock_props,
-            'propertyValues': {'anyType': unlock_values}}}}
-        update_reply = svc_client.service.UpdateObject(**update_call)
-        if update_reply.resultCode != 0:
-            logging.warning(
-                f"Unlock failed for doc {created_doc_number}. Result: {update_reply.resultCode}. May remain locked.")
-
-        return created_doc_number
-
-    except Exception as e:
-        logging.error(f"DMS archive upload process failed: {e}", exc_info=True)
-        return None
-    finally:
-        if obj_client:
-            if put_doc_id:
-                try:
-                    obj_client.service.ReleaseObject(call={'objectID': put_doc_id})
-                except Exception:
-                    pass
-            if stream_id:
-                try:
-                    obj_client.service.ReleaseObject(call={'objectID': stream_id})
-                except Exception:
-                    pass
-
-def get_document_from_dms(dst, doc_number):
-    """
-    Retrieves a document's content and filename from DMS for the archiving system.
-    """
-    svc_client, obj_client, content_id, stream_id = None, None, None, None
-    try:
-        settings = Settings(strict=False, xml_huge_tree=True)
-        svc_client = Client(WSDL_URL, port_name='BasicHttpBinding_IDMSvc', settings=settings)
-        obj_client = Client(WSDL_URL, port_name='BasicHttpBinding_IDMObj', settings=settings)
-
-        get_doc_call = {
-            'call': {
-                'dstIn': dst,
-                'criteria': {
-                    'criteriaCount': 2,
-                    'criteriaNames': {'string': ['%TARGET_LIBRARY', '%DOCUMENT_NUMBER']},
-                    'criteriaValues': {'string': ['RTA_MAIN', str(doc_number)]}
-                }
-            }
-        }
-        doc_reply = svc_client.service.GetDocSvr3(**get_doc_call)
-
-        if not (doc_reply and doc_reply.resultCode == 0 and doc_reply.getDocID):
-            logging.warning(f"Document not found in DMS for doc_number: {doc_number}.")
-            return None, None
-
-        filename = f"{doc_number}"  # Default
-        if doc_reply.docProperties and doc_reply.docProperties.propertyValues:
-            try:
-                prop_names = doc_reply.docProperties.propertyNames.string
-                if '%VERSION_FILE_NAME' in prop_names:
-                    index = prop_names.index('%VERSION_FILE_NAME')
-                    version_file_name = doc_reply.docProperties.propertyValues.anyType[index]
-                    if version_file_name:
-                        filename = str(version_file_name)
-            except Exception:
-                pass
-
-        content_id = doc_reply.getDocID
-        stream_reply = obj_client.service.GetReadStream(call={'dstIn': dst, 'contentID': content_id})
-        if not (stream_reply and stream_reply.resultCode == 0 and stream_reply.streamID):
-            raise Exception(f"Failed to get read stream for doc {doc_number}")
-
-        stream_id = stream_reply.streamID
-        doc_buffer = bytearray()
-        while True:
-            read_reply = obj_client.service.ReadStream(call={'streamID': stream_id, 'requestedBytes': 65536})
-            if not read_reply or read_reply.resultCode != 0: break
-            chunk_data = read_reply.streamData.streamBuffer if read_reply.streamData else None
-            if not chunk_data: break
-            doc_buffer.extend(chunk_data)
-
-        return bytes(doc_buffer), filename
-
-    except Exception as e:
-        logging.error(f"DMS document retrieval failed for doc {doc_number}: {e}", exc_info=True)
-        return None, None
-    finally:
-        if obj_client:
-            if stream_id:
-                try:
-                    obj_client.service.ReleaseObject(call={'objectID': stream_id})
-                except Exception:
-                    pass
-            if content_id:
-                try:
-                    obj_client.service.ReleaseObject(call={'objectID': content_id})
                 except Exception:
                     pass
