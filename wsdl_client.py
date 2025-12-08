@@ -16,13 +16,11 @@ DMS_PASSWORD = os.getenv("DMS_PASSWORD")
 # --- CONSTANTS ---
 SMART_EDMS_ROOT_ID = '19685837'
 
-
 def get_soap_client(service_name=None):
     settings = Settings(strict=False, xml_huge_tree=True)
     if service_name:
         return Client(WSDL_URL, port_name=service_name, settings=settings)
     return Client(WSDL_URL, settings=settings)
-
 
 def find_client_with_operation(operation_name):
     try:
@@ -38,7 +36,6 @@ def find_client_with_operation(operation_name):
         return None
     except Exception:
         return None
-
 
 def dms_system_login():
     try:
@@ -62,7 +59,6 @@ def dms_system_login():
     except Exception as e:
         logging.error(f"Login failed: {e}")
         return None
-
 
 def get_doc_version_info(dst, doc_number):
     try:
@@ -88,7 +84,6 @@ def get_doc_version_info(dst, doc_number):
     except Exception:
         pass
     return "0"
-
 
 def create_dms_folder(dst, folder_name, description="", parent_id=None, user_id=None):
     target_parent_id = parent_id if parent_id and str(parent_id).strip() else SMART_EDMS_ROOT_ID
@@ -138,32 +133,68 @@ def create_dms_folder(dst, folder_name, description="", parent_id=None, user_id=
         logging.error(f"Create folder failed: {e}")
         return None
 
-
 def parse_binary_result_buffer(buffer):
+    """
+    Parses the raw text buffer from DMS to extract folder/file items.
+    Improved to handle multi-word names by consuming tokens until the next likely ID.
+    """
     items = []
     try:
         try:
             raw_text = buffer.decode('utf-16-le', errors='ignore')
         except:
             raw_text = buffer.decode('utf-8', errors='ignore')
+
+        # Replace non-word chars with spaces, but keep hyphens and dots for names
         clean_text = re.sub(r'[^\w\s\-\.]', ' ', raw_text)
         tokens = clean_text.split()
 
         i = 0
         while i < len(tokens):
             token = tokens[i]
+
+            # Check if token is likely a Doc ID (numeric, 5+ digits)
             if token.isdigit() and len(token) >= 5:
+                # We found an ID, now look for the name following it
                 if i + 1 < len(tokens):
-                    name = tokens[i + 1]
-                    if len(name) > 1:
-                        items.append(
-                            {'id': token, 'name': name, 'type': 'folder', 'node_type': 'N', 'is_standard': False})
-                        i += 1
+                    name_parts = []
+                    j = i + 1
+
+                    # Consume subsequent tokens until we hit what looks like the NEXT ID
+                    # or the end of the list.
+                    while j < len(tokens):
+                        next_token = tokens[j]
+                        # If we encounter another 5+ digit number, it's likely the next item's ID
+                        if next_token.isdigit() and len(next_token) >= 5:
+                            break
+
+                        name_parts.append(next_token)
+                        j += 1
+
+                    if name_parts:
+                        # Heuristic fix: The raw buffer often contains a type flag (like 'F') immediately after the name.
+                        # If the last captured token is a single 'F', remove it.
+                        if len(name_parts) > 0 and name_parts[-1] == 'F':
+                            name_parts.pop()
+
+                        full_name = " ".join(name_parts)
+                        if len(full_name) > 1:
+                            items.append({
+                                'id': token,
+                                'name': full_name,
+                                'type': 'folder',
+                                'node_type': 'N',
+                                'is_standard': False
+                            })
+                            # Advance the main loop index 'i' to the end of the consumed name
+                            # j is currently at the next ID (or end), and the loop does i+=1
+                            # so we set i = j - 1
+                            i = j - 1
             i += 1
-    except Exception:
+    except Exception as e:
+        logging.error(f"Error parsing binary buffer: {e}")
         pass
     return items
-
 
 def delete_document(dst, doc_number, force=False):
     """
@@ -308,8 +339,6 @@ def delete_document(dst, doc_number, force=False):
         logging.error(f"Delete exception: {e}")
         return False, str(e)
 
-
-# ... (Rest of file unchanged) ...
 def list_folder_contents(dst, parent_id=None, app_source=None):
     """
     Lists contents of a folder.
@@ -440,7 +469,6 @@ def list_folder_contents(dst, parent_id=None, app_source=None):
         logging.error(f"Error listing folder contents: {e}", exc_info=True)
         return items
 
-
 def rename_document(dst, doc_number, new_name):
     """
     Renames a document or folder by updating its DOCNAME in the profile.
@@ -452,7 +480,7 @@ def rename_document(dst, doc_number, new_name):
         string_array_type = svc_client.get_type(
             '{http://schemas.microsoft.com/2003/10/Serialization/Arrays}ArrayOfstring')
 
-        logging.info(f"Renaming document {doc_number} to '{new_name}'...")
+        # logging.info(f"Renaming document {doc_number} to '{new_name}'...")
 
         # Prepare UpdateObject call
         prop_names = string_array_type(['%OBJECT_TYPE_ID', '%OBJECT_IDENTIFIER', '%TARGET_LIBRARY', 'DOCNAME'])
@@ -478,7 +506,7 @@ def rename_document(dst, doc_number, new_name):
         response = svc_client.service.UpdateObject(**update_call)
 
         if response.resultCode == 0:
-            logging.info(f"Successfully renamed document {doc_number}.")
+            # logging.info(f"Successfully renamed document {doc_number}.")
             return True
         else:
             err = getattr(response, 'errorDoc', 'Unknown Error')
@@ -488,7 +516,6 @@ def rename_document(dst, doc_number, new_name):
     except Exception as e:
         logging.error(f"Error renaming document: {e}", exc_info=True)
         return False
-
 
 def get_image_by_docnumber(dst, doc_number):
     """Retrieves a single document's image bytes from the DMS using the multi-step process."""
@@ -557,7 +584,6 @@ def get_image_by_docnumber(dst, doc_number):
                 except Exception:
                     pass
 
-
 def get_dms_stream_details(dst, doc_number):
     """Opens a stream to a DMS document and returns the client and stream ID for reading."""
     try:
@@ -586,7 +612,6 @@ def get_dms_stream_details(dst, doc_number):
     except Exception as e:
         return None
 
-
 def dms_user_login(username, password):
     """Logs into the DMS SOAP service with user-provided credentials."""
     try:
@@ -614,7 +639,6 @@ def dms_user_login(username, password):
         return None
     except Exception:
         return None
-
 
 def upload_document_to_dms(dst, file_stream, metadata):
     """
