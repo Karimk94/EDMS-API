@@ -1,6 +1,7 @@
 import os
 import logging
 import re
+import zlib
 from zeep import Client, Settings, xsd
 from zeep.exceptions import Fault
 from dotenv import load_dotenv
@@ -14,11 +15,13 @@ DMS_PASSWORD = os.getenv("DMS_PASSWORD")
 # --- CONSTANTS ---
 SMART_EDMS_ROOT_ID = '19685837'
 
+
 def get_soap_client(service_name=None):
     settings = Settings(strict=False, xml_huge_tree=True)
     if service_name:
         return Client(WSDL_URL, port_name=service_name, settings=settings)
     return Client(WSDL_URL, settings=settings)
+
 
 def find_client_with_operation(operation_name):
     try:
@@ -34,6 +37,7 @@ def find_client_with_operation(operation_name):
         return None
     except Exception:
         return None
+
 
 def dms_system_login():
     try:
@@ -57,6 +61,7 @@ def dms_system_login():
     except Exception as e:
         logging.error(f"Login failed: {e}")
         return None
+
 
 def get_doc_version_info(dst, doc_number):
     try:
@@ -82,6 +87,7 @@ def get_doc_version_info(dst, doc_number):
     except Exception:
         pass
     return "0"
+
 
 def create_dms_folder(dst, folder_name, description="", parent_id=None, user_id=None):
     target_parent_id = parent_id if parent_id and str(parent_id).strip() else SMART_EDMS_ROOT_ID
@@ -131,21 +137,63 @@ def create_dms_folder(dst, folder_name, description="", parent_id=None, user_id=
         logging.error(f"Create folder failed: {e}")
         return None
 
+
 def parse_binary_result_buffer(buffer):
     """
     Parses the raw text buffer from DMS to extract folder/file items.
-    Improved to handle multi-word names by consuming tokens until the next likely ID.
+    Handles zlib compression.
+    Identifies type based on APP_ID (e.g. ACROBAT, MSWORD) mapping.
     """
     items = []
     try:
+        # --- Step 1: Handle Decompression ---
+        try:
+            if len(buffer) > 8 and buffer[8:10] == b'\x78\x9c':
+                decompressed = zlib.decompress(buffer[8:])
+                buffer = decompressed
+        except Exception as e:
+            pass
+
+        # --- Step 2: Decode Text ---
         try:
             raw_text = buffer.decode('utf-16-le', errors='ignore')
         except:
             raw_text = buffer.decode('utf-8', errors='ignore')
 
-        # Replace non-word chars with spaces, but keep hyphens and dots for names
+        # Clean text but keep dots for extensions
         clean_text = re.sub(r'[^\w\s\-\.]', ' ', raw_text)
         tokens = clean_text.split()
+
+        # Mapping of Application IDs to Media Types
+        APP_TYPE_MAP = {
+            # PDF / Documents
+            'ACROBAT': 'pdf',
+            'PDF': 'pdf',
+            'EXCHANGE': 'pdf',
+            'MSWORD': 'pdf',
+            'EXCEL': 'pdf',
+            'POWERPNT': 'pdf',
+            'WP': 'pdf',
+            'ASCII': 'pdf',
+            'TXT': 'pdf',
+
+            # Images
+            'IMAGE': 'image',
+            'JPG': 'image',
+            'JPEG': 'image',
+            'PNG': 'image',
+            'BMP': 'image',
+            'GIF': 'image',
+
+            # Videos
+            'MP4': 'video',
+            'MOV': 'video',
+            'AVI': 'video',
+            'WMV': 'video'
+        }
+
+        # Known Folder Applications
+        FOLDER_APPS = {'FOLDER', 'DEF_PROF', 'SAVED_SEARCHES'}
 
         i = 0
         while i < len(tokens):
@@ -153,52 +201,115 @@ def parse_binary_result_buffer(buffer):
 
             # Check if token is likely a Doc ID (numeric, 5+ digits)
             if token.isdigit() and len(token) >= 5:
-                # We found an ID, now look for the name following it
+                # Look ahead until the NEXT ID
                 if i + 1 < len(tokens):
-                    name_parts = []
+                    chunk_tokens = []
                     j = i + 1
 
-                    # Consume subsequent tokens until we hit what looks like the NEXT ID
-                    # or the end of the list.
+                    # Consume until next ID
                     while j < len(tokens):
                         next_token = tokens[j]
-                        # If we encounter another 5+ digit number, it's likely the next item's ID
                         if next_token.isdigit() and len(next_token) >= 5:
                             break
-
-                        name_parts.append(next_token)
+                        chunk_tokens.append(next_token)
                         j += 1
 
-                    if name_parts:
-                        # Heuristic fix: The raw buffer often contains a type flag (like 'F') immediately after the name.
-                        # If the last captured token is a single 'F', remove it.
-                        if len(name_parts) > 0 and name_parts[-1] == 'F':
+                    # Advance main loop
+                    i = j - 1
+
+                    if chunk_tokens:
+                        item_type = 'folder'  # Default to folder if nothing matches
+                        media_type = 'folder'
+                        name_parts = []
+
+                        # --- Strategy: Scan for Application ID ---
+                        is_explicit_folder = False
+                        is_app_id_found = False
+
+                        # Check tokens in reverse order to find the App Type (it's usually at the end)
+                        for idx, t in enumerate(reversed(chunk_tokens)):
+                            t_upper = t.upper()
+
+                            # Check if it's a known folder app
+                            if t_upper in FOLDER_APPS:
+                                is_explicit_folder = True
+                                item_type = 'folder'
+                                media_type = 'folder'
+                                split_idx = len(chunk_tokens) - 1 - idx
+                                name_parts = chunk_tokens[:split_idx]
+                                is_app_id_found = True
+                                break
+
+                            # Check for known file app mapping
+                            if t_upper in APP_TYPE_MAP:
+                                item_type = 'file'
+                                media_type = APP_TYPE_MAP[t_upper]
+                                split_idx = len(chunk_tokens) - 1 - idx
+                                name_parts = chunk_tokens[:split_idx]
+                                is_app_id_found = True
+                                break
+
+                        # Fallback if no specific App ID found
+                        if not is_app_id_found:
+                            name_parts = chunk_tokens  # Take everything as name by default
+
+                            # Check for extension in name tokens
+                            for t in chunk_tokens:
+                                if '.' in t:
+                                    ext = t.split('.')[-1].lower()
+                                    if ext in ['pdf', 'doc', 'docx', 'txt']:
+                                        item_type = 'file'
+                                        media_type = 'pdf'
+                                    elif ext in ['mp4', 'mov', 'avi', 'wmv']:
+                                        item_type = 'file'
+                                        media_type = 'video'
+                                    elif ext in ['jpg', 'jpeg', 'png', 'gif']:
+                                        item_type = 'file'
+                                        media_type = 'image'
+                                    break
+
+                            # Check for 'F' token at end (folder indicator)
+                            if not is_app_id_found and 'F' in chunk_tokens[-1:]:
+                                item_type = 'folder'
+                                media_type = 'folder'
+
+                            # If we still think it's a file but media_type is generic 'folder' or unknown
+                            # Check for 'N' or 'D' which usually means file
+                            if not is_explicit_folder:
+                                for t in chunk_tokens[-2:]:  # Check last 2 tokens for node type
+                                    if t in ['N', 'D']:
+                                        item_type = 'file'
+                                        # IMPORTANT FIX: Default to PDF if we know it's a file but type is unknown
+                                        if media_type == 'folder':
+                                            media_type = 'pdf'
+                                        break
+
+                                        # --- CLEANUP NAME ---
+                        # Remove trailing 'N', 'D', 'F'
+                        while name_parts and name_parts[-1] in ['N', 'D', 'F']:
                             name_parts.pop()
 
-                        full_name = " ".join(name_parts)
-                        if len(full_name) > 1:
+                        full_name = " ".join(name_parts).strip()
+
+                        if len(full_name) > 0:
                             items.append({
                                 'id': token,
                                 'name': full_name,
-                                'type': 'folder',
-                                'node_type': 'N',
+                                'type': item_type,
+                                'media_type': media_type,
+                                'node_type': 'N' if item_type == 'file' else 'F',
                                 'is_standard': False
                             })
-                            # Advance the main loop index 'i' to the end of the consumed name
-                            # j is currently at the next ID (or end), and the loop does i+=1
-                            # so we set i = j - 1
-                            i = j - 1
             i += 1
     except Exception as e:
         logging.error(f"Error parsing binary buffer: {e}")
         pass
     return items
 
+
 def delete_document(dst, doc_number, force=False):
     """
     Deletes a document/folder.
-    If force=True, finds references using 'Where Used' collection and deletes them first.
-    Matches the user's manual trace for finding and removing ContentItem links.
     """
     try:
         svc_client = get_soap_client('BasicHttpBinding_IDMSvc')
@@ -210,12 +321,8 @@ def delete_document(dst, doc_number, force=False):
             '{http://schemas.microsoft.com/2003/10/Serialization/Arrays}ArrayOfstring')
         int_type = del_client.get_type('{http://www.w3.org/2001/XMLSchema}int')
 
-        # --- PRE-STEP: If Force is enabled, run Unlink logic FIRST ---
         if force:
-            # logging.info(f"Force Delete: performing 'Where Used' check for {doc_number}...")
             links_to_remove = []
-
-            # Create WhereUsed Collection
             coll_names = string_array_type(['%TARGET_LIBRARY', 'DOCNUMBER', '%CONTENTS_DIRECTIVE'])
             coll_values = {'anyType': [
                 xsd.AnyObject(string_type, 'RTA_MAIN'),
@@ -234,7 +341,6 @@ def delete_document(dst, doc_number, force=False):
                     col_id = coll_reply.retProperties.propertyValues.anyType[0]
 
                 if col_id:
-                    # Iterate Collection
                     enum_client = find_client_with_operation('NewEnum') or svc_client
                     enum_reply = enum_client.service.NewEnum(call={'dstIn': dst, 'collectionID': col_id})
 
@@ -275,7 +381,6 @@ def delete_document(dst, doc_number, force=False):
                 logging.warning(f"WhereUsed failed: {e}")
 
             if links_to_remove:
-                # logging.info(f"Unlinking {len(links_to_remove)} parents...")
                 for link in links_to_remove:
                     prop_n_list = ['%TARGET_LIBRARY', 'SYSTEM_ID']
                     prop_v_list = [xsd.AnyObject(string_type, 'RTA_MAIN'),
@@ -301,17 +406,11 @@ def delete_document(dst, doc_number, force=False):
                     }
                     try:
                         res = del_client.service.DeleteObject(**del_link_call)
-                        if res.resultCode == 0:
-                            logging.info(f"Unlinked {link['SYSTEM_ID']}")
-                        else:
+                        if res.resultCode != 0:
                             logging.warning(f"Failed unlink {link['SYSTEM_ID']}: {getattr(res, 'errorDoc', '')}")
                     except Exception as e:
                         logging.warning(f"Exception unlink {link['SYSTEM_ID']}: {e}")
-            else:
-                logging.warning("Force requested but no links found via WhereUsed.")
 
-        # --- Step 2: Delete Profile ---
-        # logging.info(f"Deleting profile {doc_number}...")
         del_props = {'propertyCount': 2, 'propertyNames': string_array_type(['%TARGET_LIBRARY', '%OBJECT_IDENTIFIER']),
                      'propertyValues': {
                          'anyType': [xsd.AnyObject(string_type, 'RTA_MAIN'), xsd.AnyObject(int_type, int(doc_number))]}}
@@ -320,7 +419,6 @@ def delete_document(dst, doc_number, force=False):
             resp = del_client.service.DeleteObject(
                 call={'dstIn': dst, 'objectType': 'DEF_PROF', 'properties': del_props})
             if resp.resultCode == 0:
-                # logging.info("Deleted successfully.")
                 return True, "Success"
 
             err_doc = getattr(resp, 'errorDoc', '')
@@ -328,14 +426,13 @@ def delete_document(dst, doc_number, force=False):
             return False, str(err_doc)
 
         except Fault as f:
-            # Standard Zeep fault handling
             err_msg = f.message or str(f)
-            # logging.error(f"Delete SOAP Fault: {err_msg}")
             return False, err_msg
 
     except Exception as e:
         logging.error(f"Delete exception: {e}")
         return False, str(e)
+
 
 def list_folder_contents(dst, parent_id=None, app_source=None):
     """
@@ -375,6 +472,7 @@ def list_folder_contents(dst, parent_id=None, app_source=None):
         criteria_name = '%ITEM'
         criteria_value = str(target_id)
 
+        # Added APP_ID and APPLICATION to retProperties
         search_call = {
             'call': {
                 'dstIn': dst,
@@ -386,7 +484,9 @@ def list_folder_contents(dst, parent_id=None, app_source=None):
                         'criteriaNames': {'string': [criteria_name]},
                         'criteriaValues': {'string': [criteria_value]}
                     },
-                    'retProperties': {'string': ['FI.DOCNUMBER', '%DISPLAY_NAME', 'FI.NODE_TYPE', 'DOCNAME']},
+                    'retProperties': {
+                        'string': ['FI.DOCNUMBER', '%DISPLAY_NAME', 'FI.NODE_TYPE', 'DOCNAME', 'APPLICATION',
+                                   'APP_ID']},
                     'sortProps': {'propertyCount': 1, 'propertyNames': {'string': ['%DISPLAY_NAME']},
                                   'propertyFlags': {'int': [1]}},
                     'maxRows': 0
@@ -413,7 +513,7 @@ def list_folder_contents(dst, parent_id=None, app_source=None):
         # --- PARSING LOGIC ---
         row_nodes = None
 
-        # Check for binary buffer first (based on logs)
+        # Check for binary buffer first
         if hasattr(data_reply, 'resultSetData') and data_reply.resultSetData:
             container = data_reply.resultSetData
             if hasattr(container, 'resultBuffer') and container.resultBuffer:
@@ -421,7 +521,6 @@ def list_folder_contents(dst, parent_id=None, app_source=None):
                 parsed_items = parse_binary_result_buffer(container.resultBuffer)
                 if parsed_items:
                     items.extend(parsed_items)
-                    # Cleanup and return if successful
                     try:
                         search_client.service.ReleaseData(call={'resultSetID': result_set_id})
                         search_client.service.ReleaseObject(call={'objectID': result_set_id})
@@ -445,11 +544,58 @@ def list_folder_contents(dst, parent_id=None, app_source=None):
                     name_str = str(props[1] or props[3] or "Untitled")
                     node_type = props[2]
 
-                    is_folder = (node_type == 'N') or (node_type == 'R' and not str(doc_id).isdigit())
-                    if '.' in name_str and len(name_str.split('.')[-1]) < 5: is_folder = False
+                    # Extract APP_ID if available (col 4 or 5)
+                    app_id = "UNKNOWN"
+                    if len(props) > 4 and props[4]:
+                        app_id = str(props[4]).upper()
+                    if len(props) > 5 and props[5] and app_id == "UNKNOWN":
+                        app_id = str(props[5]).upper()
+
+                    is_folder = False
+                    media_type = 'image'
+
+                    # APP_TYPE_MAP from parse_binary_result_buffer
+                    APP_TYPE_MAP_XML = {
+                        'ACROBAT': 'pdf', 'PDF': 'pdf', 'EXCHANGE': 'pdf', 'MSWORD': 'pdf',
+                        'EXCEL': 'pdf', 'POWERPNT': 'pdf', 'WP': 'pdf', 'ASCII': 'pdf', 'TXT': 'pdf',
+                        'IMAGE': 'image', 'JPG': 'image', 'JPEG': 'image', 'PNG': 'image', 'BMP': 'image',
+                        'GIF': 'image',
+                        'MP4': 'video', 'MOV': 'video', 'AVI': 'video', 'WMV': 'video'
+                    }
+
+                    if app_id in ['FOLDER', 'DEF_PROF', 'SAVED_SEARCHES']:
+                        is_folder = True
+                        media_type = 'folder'
+                    elif node_type == 'F':
+                        is_folder = True
+                        media_type = 'folder'
+                    elif app_id in APP_TYPE_MAP_XML:
+                        is_folder = False
+                        media_type = APP_TYPE_MAP_XML[app_id]
+                    else:
+                        # Fallback
+                        if node_type == 'N' or node_type == 'D':
+                            is_folder = False
+                            if media_type == 'image': media_type = 'pdf'  # Default to PDF
+                        elif '.' in name_str and len(name_str.split('.')[-1]) < 5:
+                            is_folder = False
+                            # Infer from extension
+                            ext = name_str.split('.')[-1].lower()
+                            if ext in ['pdf']:
+                                media_type = 'pdf'
+                            elif ext in ['mp4', 'mov', 'avi']:
+                                media_type = 'video'
+                        else:
+                            is_folder = True
+                            media_type = 'folder'
+
+                    # Remove trailing 'D', 'N', 'F' from name in XML results
+                    if name_str.endswith(' D') or name_str.endswith(' N') or name_str.endswith(' F'):
+                        name_str = name_str[:-2]
 
                     items.append({
                         'id': str(doc_id), 'name': name_str, 'type': 'folder' if is_folder else 'file',
+                        'media_type': media_type,
                         'node_type': str(node_type), 'is_standard': False
                     })
                 except Exception:
@@ -467,11 +613,10 @@ def list_folder_contents(dst, parent_id=None, app_source=None):
         logging.error(f"Error listing folder contents: {e}", exc_info=True)
         return items
 
+
 def rename_document(dst, doc_number, new_name):
     """
-    Renames a folder/document by:
-    1. Finding the ContentItem SYSTEM_ID associated with the DOCNUMBER.
-    2. Updating the DISPLAYNAME of that ContentItem.
+    Renames a folder/document.
     """
     try:
         svc_client = get_soap_client('BasicHttpBinding_IDMSvc')
@@ -480,10 +625,6 @@ def rename_document(dst, doc_number, new_name):
         string_array_type = svc_client.get_type(
             '{http://schemas.microsoft.com/2003/10/Serialization/Arrays}ArrayOfstring')
 
-        # logging.info(f"Step 1: Resolving DOCNUMBER {doc_number} to ContentItem SYSTEM_ID...")
-
-        # --- Step 1: Find the ContentItem SYSTEM_ID using 'Where Used' ---
-        # We create a 'Where Used' collection to find where this DOCNUMBER is filed.
         coll_names = string_array_type(['%TARGET_LIBRARY', 'DOCNUMBER', '%CONTENTS_DIRECTIVE'])
         coll_values = {'anyType': [
             xsd.AnyObject(string_type, 'RTA_MAIN'),
@@ -499,7 +640,6 @@ def rename_document(dst, doc_number, new_name):
 
         system_id = None
 
-        # If collection created, enumerate it to get the ContentItem ID
         if coll_reply.resultCode == 0 and coll_reply.retProperties:
             col_id = coll_reply.retProperties.propertyValues.anyType[0]
 
@@ -507,7 +647,6 @@ def rename_document(dst, doc_number, new_name):
             enum_reply = enum_client.service.NewEnum(call={'dstIn': dst, 'collectionID': col_id})
 
             if enum_reply.resultCode == 0 and enum_reply.enumID:
-                # Fetch the first item (assuming the folder is filed in one place)
                 next_reply = enum_client.service.NextData(
                     call={'dstIn': dst, 'enumID': enum_reply.enumID, 'elementCount': 1})
 
@@ -519,11 +658,8 @@ def rename_document(dst, doc_number, new_name):
                     idx_sys = prop_names_found.index('SYSTEM_ID') if 'SYSTEM_ID' in prop_names_found else -1
 
                     if idx_sys != -1 and rows:
-                        # We found the SYSTEM_ID of the ContentItem
                         system_id = rows[0].anyType[idx_sys]
-                        # logging.info(f"Resolved DOCNUMBER {doc_number} to ContentItem SYSTEM_ID: {system_id}")
 
-                # Cleanup
                 try:
                     enum_client.service.ReleaseObject(call={'objectID': enum_reply.enumID})
                 except:
@@ -537,13 +673,10 @@ def rename_document(dst, doc_number, new_name):
             logging.error(f"Could not find ContentItem SYSTEM_ID for DOCNUMBER {doc_number}. Rename aborted.")
             return False
 
-        # --- Step 2: Update the ContentItem using the resolved SYSTEM_ID ---
-        # logging.info(f"Renaming ContentItem {system_id} to '{new_name}'...")
-
         prop_names = string_array_type(['%TARGET_LIBRARY', 'SYSTEM_ID', 'DISPLAYNAME'])
         prop_values = [
             xsd.AnyObject(string_type, 'RTA_MAIN'),
-            xsd.AnyObject(int_type, int(system_id)),  # Pass the resolved SYSTEM_ID
+            xsd.AnyObject(int_type, int(system_id)),
             xsd.AnyObject(string_type, new_name)
         ]
 
@@ -562,7 +695,6 @@ def rename_document(dst, doc_number, new_name):
         response = svc_client.service.UpdateObject(**update_call)
 
         if response.resultCode == 0:
-            # logging.info(f"Successfully renamed item {doc_number} (SystemID {system_id}).")
             return True
         else:
             err = getattr(response, 'errorDoc', 'Unknown Error')
@@ -574,7 +706,7 @@ def rename_document(dst, doc_number, new_name):
         return False
 
 def get_image_by_docnumber(dst, doc_number):
-    """Retrieves a single document's image bytes from the DMS using the multi-step process."""
+    """Retrieves a single document's image bytes."""
     svc_client, obj_client, content_id, stream_id = None, None, None, None
     try:
         svc_client = get_soap_client('BasicHttpBinding_IDMSvc')
@@ -641,7 +773,7 @@ def get_image_by_docnumber(dst, doc_number):
                     pass
 
 def get_dms_stream_details(dst, doc_number):
-    """Opens a stream to a DMS document and returns the client and stream ID for reading."""
+    """Opens a stream to a DMS document."""
     try:
         svc_client = get_soap_client('BasicHttpBinding_IDMSvc')
         obj_client = get_soap_client('BasicHttpBinding_IDMObj')
