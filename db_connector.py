@@ -2661,7 +2661,6 @@ def get_media_type_counts(app_source='unknown'):
         if conn:
             conn.close()
 
-
 def resolve_media_types_from_db(doc_ids):
     """
     Queries the database to find the media type (image, video, pdf) for a list of document IDs
