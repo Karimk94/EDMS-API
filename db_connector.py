@@ -2660,3 +2660,59 @@ def get_media_type_counts(app_source='unknown'):
     finally:
         if conn:
             conn.close()
+
+
+def resolve_media_types_from_db(doc_ids):
+    """
+    Queries the database to find the media type (image, video, pdf) for a list of document IDs
+    by checking their Application ID and default extension.
+    """
+    if not doc_ids:
+        return {}
+
+    conn = get_connection()
+    if not conn:
+        return {}
+
+    resolved_map = {}
+
+    try:
+        with conn.cursor() as cursor:
+            # Prepare comma-separated string for IN clause (safe for ints)
+            ids_str = ",".join(str(int(did)) for did in doc_ids)
+
+            # Query PROFILE and APPS tables
+            # Logic: Get the extension associated with the document's Application ID
+            sql = f"""
+                SELECT p.DOCNUMBER, a.DEFAULT_EXTENSION
+                FROM PROFILE p
+                LEFT JOIN APPS a ON p.APPLICATION = a.SYSTEM_ID
+                WHERE p.DOCNUMBER IN ({ids_str})
+            """
+
+            cursor.execute(sql)
+            rows = cursor.fetchall()
+
+            image_exts = {'jpg', 'jpeg', 'png', 'gif', 'bmp', 'tif', 'tiff', 'webp'}
+            video_exts = {'mp4', 'mov', 'avi', 'wmv', 'mkv', 'flv', 'webm', '3gp'}
+
+            for doc_id, ext in rows:
+                media_type = 'pdf'  # Default
+
+                if ext:
+                    clean_ext = str(ext).lower().replace('.', '').strip()
+                    if clean_ext in image_exts:
+                        media_type = 'image'
+                    elif clean_ext in video_exts:
+                        media_type = 'video'
+                    # else stays pdf (for doc, docx, txt, pdf, etc.)
+
+                resolved_map[str(doc_id)] = media_type
+
+    except Exception as e:
+        logging.error(f"Error resolving media types: {e}")
+    finally:
+        if conn:
+            conn.close()
+
+    return resolved_map
