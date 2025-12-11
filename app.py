@@ -1511,7 +1511,7 @@ def get_media_counts():
 def api_list_folders():
     """
     Lists the contents of a specific folder or the root.
-    Query Param: parent_id (optional), scope (optional), media_type (optional)
+    Query Param: parent_id (optional), scope (optional), media_type (optional), search (optional)
     """
     if 'user' not in session:
         return jsonify({"error": "Unauthorized"}), 401
@@ -1521,6 +1521,9 @@ def api_list_folders():
 
     media_type = request.args.get('media_type')
     if media_type == '': media_type = None  # Ensure empty string is None
+
+    search_term = request.args.get('search')
+    if search_term == '': search_term = None
 
     parent_id = request.args.get('parent_id')
     # Treat string "null" or empty as None
@@ -1532,8 +1535,15 @@ def api_list_folders():
         return jsonify({"error": "Failed to authenticate with DMS"}), 500
 
     try:
-        # Pass media_type to wsdl_client
-        contents = wsdl_client.list_folder_contents(dst, parent_id, app_source, scope=scope, media_type=media_type)
+        # Pass media_type and search_term to wsdl_client
+        contents = wsdl_client.list_folder_contents(
+            dst,
+            parent_id,
+            app_source,
+            scope=scope,
+            media_type=media_type,
+            search_term=search_term
+        )
 
         return jsonify({"contents": contents}), 200
     except Exception as e:
