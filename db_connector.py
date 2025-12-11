@@ -450,7 +450,7 @@ def check_processing_status(docnumbers):
 def fetch_documents_from_oracle(page=1, page_size=20, search_term=None, date_from=None, date_to=None,
                                 persons=None, person_condition='any', tags=None, years=None, sort=None,
                                 memory_month=None, memory_day=None, user_id=None, lang='en',
-                                security_level='Editor', app_source='unknown', media_type=None):
+                                security_level='Editor', app_source='unknown', media_type=None, scope=None):
     """Fetches a paginated list of documents, applying filters including media_type."""
     conn = get_connection()
     if not conn: return [], 0
@@ -475,76 +475,103 @@ def fetch_documents_from_oracle(page=1, page_size=20, search_term=None, date_fro
     documents = []
     total_rows = 0
 
-    # --- Dynamic Filtering Logic ---
-    range_start = 19677386
-    range_end = 19679115
-
-    # Default filter (fallback)
-    doc_filter_sql = f"AND p.DOCNUMBER >= {range_start}"
-
-    if app_source == 'edms-media':
-        doc_filter_sql = f"AND p.DOCNUMBER BETWEEN {range_start} AND {range_end}"
-        # logging.info("Applying Media Frontend filter: Restricted to range.")
-
-    elif app_source == 'smart-edms':
-        smart_edms_floor = 19662092
-        doc_filter_sql = f"AND p.DOCNUMBER >= {smart_edms_floor} AND (p.DOCNUMBER < {range_start} OR p.DOCNUMBER > {range_end})"
-        # logging.info(f"Applying Smart EDMS filter: Start >= {smart_edms_floor}, Excluding {range_start}-{range_end}.")
-
-    base_where = f"WHERE p.FORM = 2740 {doc_filter_sql} "
-    # -------------------------------
-
     params = {}
     where_clauses = []
+    shortlist_clause = ""
 
-    shortlist_sql = "AND k.SHORTLISTED = '1'" if security_level == 'Viewer' else ""
+    # --- Scope Logic (New) ---
+    folder_doc_ids = None
+    if scope == 'folders':
+        # Retrieve all relevant DOCNUMBERS from WSDL first
+        folder_doc_ids = wsdl_client.get_recursive_doc_ids(dst, media_type)
+        if not folder_doc_ids:
+            return [], 0
 
-    if media_type:
-        try:
-            with conn.cursor() as app_cursor:
-                # Step 1: Try to fetch SYSTEM_ID (Numeric) from APPS
-                id_column = "SYSTEM_ID"
-                try:
-                    app_cursor.execute(f"SELECT {id_column}, DEFAULT_EXTENSION FROM APPS")
-                    apps_rows = app_cursor.fetchall()
-                except oracledb.DatabaseError:
-                    # Fallback if SYSTEM_ID column doesn't exist
-                    logging.warning("SYSTEM_ID column not found in APPS, falling back to APPLICATION column.")
-                    id_column = "APPLICATION"
-                    app_cursor.execute(f"SELECT {id_column}, DEFAULT_EXTENSION FROM APPS")
-                    apps_rows = app_cursor.fetchall()
+        # Paginate IDs *before* querying DB to handle large lists efficiently
+        total_rows = len(folder_doc_ids)
 
-            # Using the same extended lists as the working reference
-            image_exts = {'jpg', 'jpeg', 'png', 'gif', 'bmp', 'tif', 'tiff', 'webp', 'heic', 'ico', 'jfif'}
-            video_exts = {'mp4', 'mov', 'avi', 'mkv', 'wmv', 'flv', 'webm', 'm4v', '3gp', 'ts', 'mts', '3g2'}
-            pdf_exts = {'pdf', 'doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx', 'txt', 'rtf', 'csv', 'zip', 'rar', '7z'}
+        # If requested page is out of range, return empty
+        if offset >= total_rows:
+            return [], total_rows
 
-            target_app_ids = []
+        paginated_ids = folder_doc_ids[offset: offset + page_size]
 
-            for app_id, ext in apps_rows:
-                if not ext: continue
-                clean_ext = str(ext).lower().replace('.', '').strip()
-                str_id = str(app_id).strip()
+        # Use these IDs in the WHERE clause
+        placeholders = ','.join([f":fid_{i}" for i in range(len(paginated_ids))])
+        where_clauses.append(f"p.DOCNUMBER IN ({placeholders})")
+        for i, doc_id in enumerate(paginated_ids):
+            params[f'fid_{i}'] = doc_id
 
-                if media_type == 'image' and clean_ext in image_exts:
-                    target_app_ids.append(str_id)
-                elif media_type == 'video' and clean_ext in video_exts:
-                    target_app_ids.append(str_id)
-                elif media_type == 'pdf' and clean_ext in pdf_exts:
-                    target_app_ids.append(str_id)
+        # Clear media_type here because we already filtered by it in WSDL
+        # But we keep it in the function arg for other logic if needed
 
-            if target_app_ids:
-                # Use TRIM(TO_CHAR(...)) to safely compare against string IDs
-                id_list = ",".join(f"'{x}'" for x in target_app_ids)
-                where_clauses.append(f"TRIM(TO_CHAR(p.APPLICATION)) IN ({id_list})")
-            else:
-                # If no apps found for this type, return nothing
+    else:
+        # --- Existing Dynamic Filtering Logic ---
+        range_start = 19677386
+        range_end = 19679115
+
+        # Default filter (fallback)
+        doc_filter_sql = f"AND p.DOCNUMBER >= {range_start}"
+
+        if app_source == 'edms-media':
+            doc_filter_sql = f"AND p.DOCNUMBER BETWEEN {range_start} AND {range_end}"
+        elif app_source == 'smart-edms':
+            smart_edms_floor = 19662092
+            doc_filter_sql = f"AND p.DOCNUMBER >= {smart_edms_floor} AND (p.DOCNUMBER < {range_start} OR p.DOCNUMBER > {range_end})"
+
+        where_clauses.append(doc_filter_sql.replace('AND ', '', 1))  # Strip first AND if adding to list
+        # -------------------------------
+
+        if media_type:
+            try:
+                with conn.cursor() as app_cursor:
+                    # Step 1: Try to fetch SYSTEM_ID (Numeric) from APPS
+                    id_column = "SYSTEM_ID"
+                    try:
+                        app_cursor.execute(f"SELECT {id_column}, DEFAULT_EXTENSION FROM APPS")
+                        apps_rows = app_cursor.fetchall()
+                    except oracledb.DatabaseError:
+                        # Fallback if SYSTEM_ID column doesn't exist
+                        logging.warning("SYSTEM_ID column not found in APPS, falling back to APPLICATION column.")
+                        id_column = "APPLICATION"
+                        app_cursor.execute(f"SELECT {id_column}, DEFAULT_EXTENSION FROM APPS")
+                        apps_rows = app_cursor.fetchall()
+
+                # Using the same extended lists as the working reference
+                image_exts = {'jpg', 'jpeg', 'png', 'gif', 'bmp', 'tif', 'tiff', 'webp', 'heic', 'ico', 'jfif'}
+                video_exts = {'mp4', 'mov', 'avi', 'mkv', 'wmv', 'flv', 'webm', 'm4v', '3gp', 'ts', 'mts', '3g2'}
+                pdf_exts = {'pdf', 'doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx', 'txt', 'rtf', 'csv', 'zip', 'rar', '7z'}
+
+                target_app_ids = []
+
+                for app_id, ext in apps_rows:
+                    if not ext: continue
+                    clean_ext = str(ext).lower().replace('.', '').strip()
+                    str_id = str(app_id).strip()
+
+                    if media_type == 'image' and clean_ext in image_exts:
+                        target_app_ids.append(str_id)
+                    elif media_type == 'video' and clean_ext in video_exts:
+                        target_app_ids.append(str_id)
+                    elif media_type == 'pdf' and clean_ext in pdf_exts:
+                        target_app_ids.append(str_id)
+
+                if target_app_ids:
+                    # Use TRIM(TO_CHAR(...)) to safely compare against string IDs
+                    id_list = ",".join(f"'{x}'" for x in target_app_ids)
+                    where_clauses.append(f"TRIM(TO_CHAR(p.APPLICATION)) IN ({id_list})")
+                else:
+                    # If no apps found for this type, return nothing
+                    where_clauses.append("1=0")
+
+            except Exception as e:
+                logging.error(f"Error filtering by media_type: {e}")
+                # Fallback to failing safe if App ID lookup crashes
                 where_clauses.append("1=0")
 
-        except Exception as e:
-            logging.error(f"Error filtering by media_type: {e}")
-            # Fallback to failing safe if App ID lookup crashes
-            where_clauses.append("1=0")
+    base_where = f"WHERE p.FORM = 2740 "
+
+    shortlist_sql = "AND k.SHORTLISTED = '1'" if security_level == 'Viewer' else ""
 
     vector_doc_ids = None
 
@@ -709,7 +736,7 @@ def fetch_documents_from_oracle(page=1, page_size=20, search_term=None, date_fro
                         WHERE ldt.DOCNUMBER = p.DOCNUMBER 
                         AND {keyword_compare} 
                         AND ldt.DISABLED = '0'
-                        {shortlist_sql}
+                        {shortlist_clause}
                     )
                     """
 
@@ -746,9 +773,11 @@ def fetch_documents_from_oracle(page=1, page_size=20, search_term=None, date_fro
 
     try:
         with conn.cursor() as cursor:
-            count_query = f"SELECT COUNT(p.DOCNUMBER) FROM PROFILE p {final_where_clause}"
-            cursor.execute(count_query, params)
-            total_rows = cursor.fetchone()[0]
+            # If scope is folders, we already know the total rows from the recursive fetch
+            if scope != 'folders':
+                count_query = f"SELECT COUNT(p.DOCNUMBER) FROM PROFILE p {final_where_clause}"
+                cursor.execute(count_query, params)
+                total_rows = cursor.fetchone()[0]
 
             date_column = "p.RTADOCDATE"
             fetch_query = f"""
@@ -758,27 +787,31 @@ def fetch_documents_from_oracle(page=1, page_size=20, search_term=None, date_fro
             LEFT JOIN LKP_FAVORITES_DOC f ON p.DOCNUMBER = f.DOCNUMBER AND f.USER_ID = :db_user_id
             {final_where_clause}
             {order_by_clause}
-            OFFSET :offset ROWS FETCH NEXT :page_size ROWS ONLY
             """
-            params_paginated = params.copy()
-            params_paginated['db_user_id'] = db_user_id
-            params_paginated['offset'] = offset
-            params_paginated['page_size'] = page_size
 
-            cursor.execute(fetch_query, params_paginated)
+            # Add offset/fetch logic only if NOT folder scope (since we already paginated IDs)
+            if scope != 'folders':
+                fetch_query += " OFFSET :offset ROWS FETCH NEXT :page_size ROWS ONLY"
+                params['offset'] = offset
+                params['page_size'] = page_size
+
+            params['db_user_id'] = db_user_id
+
+            cursor.execute(fetch_query, params)
             rows = cursor.fetchall()
 
             for row in rows:
                 doc_id, abstract, author, doc_date, docname, is_favorite = row
                 thumbnail_path = None
+                # Default, will update below
                 media_type = 'image'
-                file_ext = '.jpg'
 
                 final_abstract = abstract or ""
                 if security_level == 'Viewer':
                     final_abstract = ""
 
                 try:
+                    # Optimization: If scope=folders, we already resolved media type in WSDL, but DB check is fine
                     original_filename, media_type, file_ext = get_media_info_from_dms(dst, doc_id)
                     cached_thumbnail_file = f"{doc_id}.jpg"
                     cached_path = os.path.join(thumbnail_cache_dir, cached_thumbnail_file)
@@ -2561,13 +2594,23 @@ def get_user_system_id(username):
             conn.close()
     return system_id
 
-def get_media_type_counts(app_source='unknown'):
+def get_media_type_counts(app_source='unknown', scope=None):
     """
-    Counts documents by media type using App IDs from the APPS table.
-    Attempts to fetch SYSTEM_ID (numeric) from APPS to match PROFILE.APPLICATION.
-    Falls back to APPLICATION column if SYSTEM_ID is missing.
-    Strictly relies on APPS table types (no filename extension checks).
+    Counts documents by media type.
+    If scope is 'folders', it counts items specifically in the root folder via DMS.
+    Otherwise, it counts from the Oracle database using App IDs from the APPS table.
     """
+
+    # --- Logic for Folders Scope ---
+    if scope == 'folders':
+        dst = dms_system_login()
+        if dst:
+            return wsdl_client.get_root_folder_counts(dst)
+        else:
+            logging.error("Failed to login to DMS for folder counts")
+            return {"images": 0, "videos": 0, "files": 0}
+    # -------------------------------
+
     conn = get_connection()
     if not conn:
         logging.error("Failed to get DB connection in get_media_type_counts.")
@@ -2583,7 +2626,6 @@ def get_media_type_counts(app_source='unknown'):
     elif app_source == 'smart-edms':
         smart_edms_floor = 19662092
         doc_filter_sql = f"AND p.DOCNUMBER >= {smart_edms_floor} AND (p.DOCNUMBER < {range_start} OR p.DOCNUMBER > {range_end})"
-    # ---------------------------------------------------------------------
 
     try:
         with conn.cursor() as cursor:

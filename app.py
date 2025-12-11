@@ -811,6 +811,7 @@ def api_get_documents():
         lang = request.args.get('lang', 'en', type=str)
 
         media_type = request.args.get('media_type', None, type=str)
+        scope = request.args.get('scope', None, type=str)  # Capture scope
 
         memory_month = request.args.get('memoryMonth', None, type=str)
         memory_day = request.args.get('memoryDay', None, type=str)
@@ -836,7 +837,8 @@ def api_get_documents():
             lang=lang,
             security_level=security_level,
             app_source=app_source,
-            media_type=media_type
+            media_type=media_type,
+            scope=scope  # Pass scope to db_connector
         )
 
         total_pages = math.ceil(total_rows / page_size) if total_rows > 0 else 1
@@ -1493,8 +1495,9 @@ def get_journey_data():
 def get_media_counts():
     try:
         app_source = request.headers.get('X-App-Source', 'unknown')
+        scope = request.args.get('scope')
 
-        counts = db_connector.get_media_type_counts(app_source=app_source)
+        counts = db_connector.get_media_type_counts(app_source=app_source, scope=scope)
 
         if counts:
             return jsonify(counts), 200
@@ -1508,12 +1511,16 @@ def get_media_counts():
 def api_list_folders():
     """
     Lists the contents of a specific folder or the root.
-    Query Param: parent_id (optional)
+    Query Param: parent_id (optional), scope (optional), media_type (optional)
     """
     if 'user' not in session:
         return jsonify({"error": "Unauthorized"}), 401
 
     app_source = request.headers.get('X-App-Source', 'unknown')
+    scope = request.args.get('scope')
+
+    media_type = request.args.get('media_type')
+    if media_type == '': media_type = None  # Ensure empty string is None
 
     parent_id = request.args.get('parent_id')
     # Treat string "null" or empty as None
@@ -1525,7 +1532,8 @@ def api_list_folders():
         return jsonify({"error": "Failed to authenticate with DMS"}), 500
 
     try:
-        contents = wsdl_client.list_folder_contents(dst, parent_id, app_source)
+        # Pass media_type to wsdl_client
+        contents = wsdl_client.list_folder_contents(dst, parent_id, app_source, scope=scope, media_type=media_type)
 
         return jsonify({"contents": contents}), 200
     except Exception as e:
