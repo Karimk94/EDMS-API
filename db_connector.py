@@ -86,7 +86,7 @@ def dms_system_login():
 def get_media_info_from_dms(dst, doc_number):
     """
     Efficiently retrieves only the metadata (like filename) for a document from the DMS
-    without downloading the full file content.
+    without downloading the full file content. Uses DB resolution for media type.
     """
     try:
         settings = Settings(strict=False, xml_huge_tree=True)
@@ -120,24 +120,36 @@ def get_media_info_from_dms(dst, doc_number):
             except Exception as e:
                 print(f"Could not get filename for {doc_number}, using default. Error: {e}")
 
-        video_extensions = [
-            '.mp4', '.mov', '.avi', '.mkv', '.wmv', '.flv', '.webm',
-            '.m4v', '.3gp', '.mts', '.ts', '.3g2'
-        ]
-        pdf_extensions = [
-            '.pdf', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx',
-            '.txt', '.rtf', '.csv', '.zip', '.rar', '.7z'
-        ]
+        # Resolve media type strictly from DB first
+        media_type = 'file'  # Default
+        try:
+            resolved_map = resolve_media_types_from_db([doc_number])
+            media_type = resolved_map.get(str(doc_number), 'file')
+        except Exception as e:
+            logging.error(f"Error resolving media type from DB for {doc_number}: {e}")
+            # Only fallback to extension if DB lookup failed entirely
+            video_extensions = [
+                '.mp4', '.mov', '.avi', '.mkv', '.wmv', '.flv', '.webm',
+                '.m4v', '.3gp', '.mts', '.ts', '.3g2'
+            ]
+            pdf_extensions = ['.pdf']
+            image_extensions = ['.jpg', '.jpeg', '.png', '.gif', '.bmp', '.tif', '.tiff', '.webp', '.heic']
+            text_extensions = ['.txt', '.csv', '.json', '.xml', '.log', '.md', '.yml', '.yaml', '.ini', '.conf']
+
+            file_ext = os.path.splitext(filename)[1].lower()
+
+            if file_ext in video_extensions:
+                media_type = 'video'
+            elif file_ext in pdf_extensions:
+                media_type = 'pdf'
+            elif file_ext in image_extensions:
+                media_type = 'image'
+            elif file_ext in text_extensions:
+                media_type = 'text'
+            else:
+                media_type = 'file'
 
         file_ext = os.path.splitext(filename)[1].lower()
-
-        if file_ext in video_extensions:
-            media_type = 'video'
-        elif file_ext in pdf_extensions:
-            media_type = 'pdf'
-        else:
-            media_type = 'image'
-
         return filename, media_type, file_ext
 
     except Fault as e:
@@ -2705,7 +2717,7 @@ def get_media_type_counts(app_source='unknown', scope=None):
 
 def resolve_media_types_from_db(doc_ids):
     """
-    Queries the database to find the media type (image, video, pdf) for a list of document IDs
+    Queries the database to find the media type (image, video, pdf, file, text) for a list of document IDs
     by checking their Application ID and default extension.
     """
     if not doc_ids:
@@ -2723,7 +2735,6 @@ def resolve_media_types_from_db(doc_ids):
             ids_str = ",".join(str(int(did)) for did in doc_ids)
 
             # Query PROFILE and APPS tables
-            # Logic: Get the extension associated with the document's Application ID
             sql = f"""
                 SELECT p.DOCNUMBER, a.DEFAULT_EXTENSION
                 FROM PROFILE p
@@ -2734,11 +2745,13 @@ def resolve_media_types_from_db(doc_ids):
             cursor.execute(sql)
             rows = cursor.fetchall()
 
-            image_exts = {'jpg', 'jpeg', 'png', 'gif', 'bmp', 'tif', 'tiff', 'webp'}
+            image_exts = {'jpg', 'jpeg', 'png', 'gif', 'bmp', 'tif', 'tiff', 'webp', 'heic'}
             video_exts = {'mp4', 'mov', 'avi', 'wmv', 'mkv', 'flv', 'webm', '3gp'}
+            pdf_exts = {'pdf'}
+            text_exts = {'txt', 'csv', 'json', 'xml', 'log', 'md', 'yml', 'yaml', 'ini', 'conf'}
 
             for doc_id, ext in rows:
-                media_type = 'pdf'  # Default
+                media_type = 'file'  # Default to generic file
 
                 if ext:
                     clean_ext = str(ext).lower().replace('.', '').strip()
@@ -2746,7 +2759,11 @@ def resolve_media_types_from_db(doc_ids):
                         media_type = 'image'
                     elif clean_ext in video_exts:
                         media_type = 'video'
-                    # else stays pdf (for doc, docx, txt, pdf, etc.)
+                    elif clean_ext in pdf_exts:
+                        media_type = 'pdf'
+                    elif clean_ext in text_exts:
+                        media_type = 'text'
+                    # else it remains 'file' (docx, xlsx, zip, etc.)
 
                 resolved_map[str(doc_id)] = media_type
 
