@@ -636,13 +636,11 @@ def api_upload_document():
         return jsonify({"success": False, "error": "No selected file"}), 400
 
     file_stream = file.stream
-    # Read the content once to pass to EXIF and WSDL upload
     file_bytes = file_stream.read()
-    file_stream.seek(0)  # Reset stream pointer for the actual upload
+    file_stream.seek(0)
 
-    # --- Date Taken Logic ---
     doc_date_taken = None
-    date_taken_str = request.form.get('date_taken')  # Expected format: YYYY-MM-DD HH:MM:SS
+    date_taken_str = request.form.get('date_taken')
     if date_taken_str:
         try:
             doc_date_taken = datetime.strptime(date_taken_str, '%Y-%m-%d %H:%M:%S')
@@ -650,12 +648,9 @@ def api_upload_document():
         except ValueError:
             logging.warning(f"Could not parse date_taken '{date_taken_str}' from form.")
     else:
-        # Try extracting from EXIF if not provided in form
         doc_date_taken = db_connector.get_exif_date(io.BytesIO(file_bytes))
         logging.info(f"Using extracted EXIF date: {doc_date_taken}")
-    # --- End Date Taken Logic ---
 
-    # Secure original filename, get extension
     original_filename = secure_filename(file.filename)
     file_extension = os.path.splitext(original_filename)[1].lstrip('.').upper()
 
@@ -664,21 +659,18 @@ def api_upload_document():
         logging.warning(f"Could not find APP_ID for extension: {file_extension}. Defaulting to 'UNKNOWN'.")
         app_id = 'UNKNOWN'
 
-    # --- Docname Logic ---
     docname = request.form.get('docname')
     if not docname or not docname.strip():
-        docname = os.path.splitext(original_filename)[0]  # Fallback to original filename base
+        docname = os.path.splitext(original_filename)[0]
     else:
-        docname = docname.strip()  # Use stripped name from form
+        docname = docname.strip()
         name_base, name_ext = os.path.splitext(docname)
         if name_ext.lstrip('.').upper() == file_extension:
             docname = name_base
     logging.info(f"Using docname: {docname}")
-    # --- End Docname Logic ---
 
-    abstract = request.form.get('abstract', 'Uploaded via EDMS Viewer')  # Keep default if needed
+    abstract = request.form.get('abstract', 'Uploaded via EDMS Viewer')
 
-    # --- Event ID ---
     event_id_str = request.form.get('event_id')
     event_id = None
     if event_id_str:
@@ -687,9 +679,12 @@ def api_upload_document():
             logging.info(f"Event ID from form: {event_id}")
         except ValueError:
             logging.warning(f"Invalid event_id '{event_id_str}' received from form.")
-    # --- End Event ID ---
 
-    logging.info(f"Upload request received for file: {original_filename}. Mapped to APP_ID: {app_id}")
+    parent_id = request.form.get('parent_id')
+    if parent_id and parent_id.lower() in ['null', 'undefined', '']:
+        parent_id = None
+
+    logging.info(f"Upload request received for file: {original_filename}. Mapped to APP_ID: {app_id}, Parent ID: {parent_id}")
 
     dst = wsdl_client.dms_system_login()
     if not dst:
@@ -701,16 +696,13 @@ def api_upload_document():
         "app_id": app_id,
         "filename": original_filename,
         "doc_date": doc_date_taken,
-        "event_id": event_id  # Pass event_id to wsdl client
+        "event_id": event_id
     }
 
-    # Pass the original file stream (reset pointer) for the actual upload
-    new_doc_number = wsdl_client.upload_document_to_dms(dst, file_stream, metadata)
+    new_doc_number = wsdl_client.upload_document_to_dms(dst, file_stream, metadata, parent_id=parent_id)
 
     if new_doc_number:
         logging.info(f"Successfully uploaded {original_filename} as docnumber {new_doc_number}.")
-        # Optionally trigger immediate processing for the uploaded doc
-        # process_single_doc_async(new_doc_number) # Needs implementation
         return jsonify({"success": True, "docnumber": new_doc_number, "filename": original_filename})
     else:
         logging.error(f"Failed to upload {original_filename} to DMS.")

@@ -484,8 +484,7 @@ def list_folder_contents(dst, parent_id=None, app_source=None, scope=None, media
                                                                                                           'files']:
         target_id = SMART_EDMS_ROOT_ID
 
-    print(
-        f"DEBUG: list_folder_contents. Parent: {parent_id} -> {target_id}, Scope: {scope}, Media: {media_type}, Search: {search_term}")
+    # print(f"DEBUG: list_folder_contents. Parent: {parent_id} -> {target_id}, Scope: {scope}, Media: {media_type}, Search: {search_term}")
 
     # --- 1. Recursive Fetch (Standard Folders OR Search) ---
     # We use recursive fetch if:
@@ -612,7 +611,7 @@ def list_folder_contents(dst, parent_id=None, app_source=None, scope=None, media
             pass
 
     except Exception as e:
-        print(f"Error listing folder contents: {e}")
+        # print(f"Error listing folder contents: {e}")
         return items
 
     # --- RESOLVE UNKNOWN TYPES ---
@@ -701,7 +700,7 @@ def delete_document(dst, doc_number, force=False):
                     except:
                         pass
             except Exception as e:
-                logging.info(f"WhereUsed failed: {e}")  # Changed to print
+                logging.info(f"WhereUsed failed: {e}")  
 
             if links_to_remove:
                 for link in links_to_remove:
@@ -731,9 +730,9 @@ def delete_document(dst, doc_number, force=False):
                         res = del_client.service.DeleteObject(**del_link_call)
                         if res.resultCode != 0:
                             logging.info(
-                                f"Failed unlink {link['SYSTEM_ID']}: {getattr(res, 'errorDoc', '')}")  # Changed to print
+                                f"Failed unlink {link['SYSTEM_ID']}: {getattr(res, 'errorDoc', '')}") 
                     except Exception as e:
-                        logging.info(f"Exception unlink {link['SYSTEM_ID']}: {e}")  # Changed to print
+                        logging.info(f"Exception unlink {link['SYSTEM_ID']}: {e}")  
 
         del_props = {'propertyCount': 2, 'propertyNames': string_array_type(['%TARGET_LIBRARY', '%OBJECT_IDENTIFIER']),
                      'propertyValues': {
@@ -746,7 +745,7 @@ def delete_document(dst, doc_number, force=False):
                 return True, "Success"
 
             err_doc = getattr(resp, 'errorDoc', '')
-            # logging.info(f"Delete failed: {err_doc}")  # Changed to print
+            # logging.info(f"Delete failed: {err_doc}")  
             return False, str(err_doc)
 
         except Fault as f:
@@ -754,7 +753,7 @@ def delete_document(dst, doc_number, force=False):
             return False, err_msg
 
     except Exception as e:
-        # logging.info(f"Delete exception: {e}")  # Changed to print
+        # logging.info(f"Delete exception: {e}")  
         return False, str(e)
 
 def get_image_by_docnumber(dst, doc_number):
@@ -809,7 +808,7 @@ def get_image_by_docnumber(dst, doc_number):
         return doc_buffer, filename
 
     except Fault as e:
-        # logging.info(f"DMS server fault during retrieval for doc: {doc_number}. Fault: {e}")  # Changed to print
+        # logging.info(f"DMS server fault during retrieval for doc: {doc_number}. Fault: {e}")  
         return None, None
     finally:
         if obj_client:
@@ -862,7 +861,7 @@ def dms_user_login(username, password):
         if not hasattr(client.service, 'LoginSvr5'):
             client = find_client_with_operation('LoginSvr5')
             if not client:
-                # logging.info("LoginSvr5 not found during user login.")  # Changed to print
+                # logging.info("LoginSvr5 not found during user login.")  
                 return None
 
         login_info_type = client.get_type(
@@ -880,10 +879,7 @@ def dms_user_login(username, password):
     except Exception:
         return None
 
-def upload_document_to_dms(dst, file_stream, metadata):
-    """
-    Uploads a document to the DMS.
-    """
+def upload_document_to_dms(dst, file_stream, metadata, parent_id=None):
     import db_connector
 
     svc_client, obj_client = None, None
@@ -896,8 +892,6 @@ def upload_document_to_dms(dst, file_stream, metadata):
 
         string_type = svc_client.get_type('{http://www.w3.org/2001/XMLSchema}string')
         int_type = svc_client.get_type('{http://www.w3.org/2001/XMLSchema}int')
-
-        # logging.info("Step 2: CreateObject - Creating document profile.")  # Changed to print
         string_array_type = svc_client.get_type(
             '{http://schemas.microsoft.com/2003/10/Serialization/Arrays}ArrayOfstring')
 
@@ -947,8 +941,6 @@ def upload_document_to_dms(dst, file_stream, metadata):
         ret_prop_values = create_reply.retProperties.propertyValues.anyType
         created_doc_number = ret_prop_values[ret_prop_names.index('%OBJECT_IDENTIFIER')]
         version_id = ret_prop_values[ret_prop_names.index('%VERSION_ID')]
-
-        # logging.info(f"CreateObject successful. New docnumber: {created_doc_number}, VersionID: {version_id}")  # Changed to print
 
         put_doc_call = {
             'call': {
@@ -1046,13 +1038,43 @@ def upload_document_to_dms(dst, file_stream, metadata):
         }
         update_reply = svc_client.service.UpdateObject(**update_object_call)
 
+        if parent_id and str(parent_id).strip():
+            try:
+                target_parent_id = str(parent_id)
+                parent_ver = get_doc_version_info(dst, target_parent_id)
+
+                ci_names = string_array_type(
+                    ['%TARGET_LIBRARY', 'PARENT', 'PARENT_VERSION', 'DOCNUMBER', '%FOLDERITEM_LIBRARY_NAME',
+                     'DISPLAYNAME', 'VERSION_TYPE'])
+
+                ci_values = {'anyType': [
+                    xsd.AnyObject(string_type, 'RTA_MAIN'),
+                    xsd.AnyObject(string_type, target_parent_id),
+                    xsd.AnyObject(string_type, str(parent_ver)),
+                    xsd.AnyObject(string_type, str(created_doc_number)),
+                    xsd.AnyObject(string_type, 'RTA_MAIN'),
+                    xsd.AnyObject(string_type, metadata['docname']),
+                    xsd.AnyObject(string_type, 'R')
+                ]}
+
+                svc_client.service.CreateObject(call={
+                    'dstIn': dst,
+                    'objectType': 'ContentItem',
+                    'properties': {
+                        'propertyCount': 7,
+                        'propertyNames': ci_names,
+                        'propertyValues': ci_values
+                    }
+                })
+            except Exception as e:
+                logging.error(f"Failed to link document {created_doc_number} to parent folder {parent_id}: {e}")
+
         if created_doc_number and event_id is not None:
             db_connector.link_document_to_event(created_doc_number, event_id)
 
         return created_doc_number
 
     except Exception as e:
-        # logging.info(f"DMS upload failed. Error: {e}")  # Changed to print
         return None
     finally:
         if obj_client:
@@ -1066,14 +1088,14 @@ def upload_document_to_dms(dst, file_stream, metadata):
                     obj_client.service.ReleaseObject(call={'objectID': put_doc_id})
                 except Exception:
                     pass
-
+                
 def get_document_from_dms(dst, doc_number):
     """Retrieves a document's full content."""
     try:
         content_bytes, filename = get_image_by_docnumber(dst, doc_number)
         return content_bytes, filename
     except Exception as e:
-        # logging.info(f"Error retrieving doc {doc_number}: {e}")  # Changed to print
+        # logging.info(f"Error retrieving doc {doc_number}: {e}")  
         return None, None
 
 def get_root_folder_counts(dst):
