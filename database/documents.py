@@ -19,6 +19,7 @@ except ImportError:
     logging.warning("vector_client.py not found. Vector search capabilities will be disabled.")
     vector_client = None
 
+
 def fetch_documents_from_oracle(page=1, page_size=20, search_term=None, date_from=None, date_to=None,
                                 persons=None, person_condition='any', tags=None, years=None, sort=None,
                                 memory_month=None, memory_day=None, user_id=None, lang='en',
@@ -51,7 +52,7 @@ def fetch_documents_from_oracle(page=1, page_size=20, search_term=None, date_fro
     where_clauses = []
     shortlist_clause = ""
 
-    # --- Scope Logic (New) ---
+    # --- Scope Logic ---
     folder_doc_ids = None
     if scope == 'folders':
         # Retrieve all relevant DOCNUMBERS from WSDL first
@@ -74,9 +75,6 @@ def fetch_documents_from_oracle(page=1, page_size=20, search_term=None, date_fro
         for i, doc_id in enumerate(paginated_ids):
             params[f'fid_{i}'] = doc_id
 
-        # Clear media_type here because we already filtered by it in WSDL
-        # But we keep it in the function arg for other logic if needed
-
     else:
         # --- Existing Dynamic Filtering Logic ---
         range_start = 19677386
@@ -92,7 +90,6 @@ def fetch_documents_from_oracle(page=1, page_size=20, search_term=None, date_fro
             doc_filter_sql = f"AND p.DOCNUMBER >= {smart_edms_floor} AND (p.DOCNUMBER < {range_start} OR p.DOCNUMBER > {range_end})"
 
         where_clauses.append(doc_filter_sql.replace('AND ', '', 1))  # Strip first AND if adding to list
-        # -------------------------------
 
         if media_type:
             try:
@@ -142,9 +139,7 @@ def fetch_documents_from_oracle(page=1, page_size=20, search_term=None, date_fro
                 where_clauses.append("1=0")
 
     base_where = f"WHERE p.FORM = 2740 "
-
     shortlist_sql = "AND k.SHORTLISTED = '1'" if security_level == 'Viewer' else ""
-
     vector_doc_ids = None
 
     use_vector_search = (
@@ -153,8 +148,51 @@ def fetch_documents_from_oracle(page=1, page_size=20, search_term=None, date_fro
             not memory_month
     )
 
+    # --- Prepare Keyword Search Conditions (Always generate these for Hybrid search) ---
+    text_search_conditions = []
+    if search_term and not memory_month:
+        search_words = [word.strip() for word in search_term.split(' ') if word.strip()]
+        if search_words:
+            for i, word in enumerate(search_words):
+                key = f"search_word_{i}"
+                key_upper = f"search_word_{i}_upper"
+                params[key] = f"%{word}%"
+                params[key_upper] = f"%{word.upper()}%"
+
+                word_condition = f"""
+                                        (
+                                            p.ABSTRACT LIKE :{key} OR UPPER(p.ABSTRACT) LIKE :{key_upper} OR
+                                            p.DOCNAME LIKE :{key} OR UPPER(p.DOCNAME) LIKE :{key_upper} OR
+                                            TO_CHAR(p.RTADOCDATE, 'YYYY-MM-DD') LIKE :{key} OR
+                                            EXISTS (
+                                                SELECT 1 FROM LKP_DOCUMENT_TAGS ldt
+                                                JOIN KEYWORD k ON ldt.TAG_ID = k.SYSTEM_ID
+                                                WHERE ldt.DOCNUMBER = p.DOCNUMBER 
+                                                AND (k.DESCRIPTION LIKE :{key} OR UPPER(k.KEYWORD_ID) LIKE :{key_upper}) 
+                                                AND ldt.DISABLED = '0'
+                                                {shortlist_sql}
+                                            ) OR
+                                            EXISTS (
+                                                SELECT 1 FROM LKP_PERSON p_filter
+                                                WHERE (p_filter.NAME_ARABIC LIKE :{key} OR UPPER(p_filter.NAME_ENGLISH) LIKE :{key_upper})
+                                                AND (
+                                                        UPPER(p.ABSTRACT) LIKE '%' || UPPER(p_filter.NAME_ENGLISH) || '%'
+                                                        OR (p_filter.NAME_ARABIC IS NOT NULL AND p.ABSTRACT LIKE '%' || p_filter.NAME_ARABIC || '%')
+                                                )
+                                            )
+                                        )
+                                        """
+                text_search_conditions.append(word_condition)
+
+    # --- Perform Vector Search ---
     if use_vector_search:
-        vector_doc_ids = vector_client.query_documents(search_term, n_results=page_size)
+        # FIX: Fetch 'page * page_size' to allow pagination to reach deeper pages
+        # The vector client doesn't support offset natively in this setup, so we fetch the top N
+        try:
+            vector_doc_ids = vector_client.query_documents(search_term, n_results=page * page_size)
+        except Exception as e:
+            logging.error(f"Vector search failed: {e}")
+            vector_doc_ids = None
 
     if memory_month is not None:
         try:
@@ -183,54 +221,29 @@ def fetch_documents_from_oracle(page=1, page_size=20, search_term=None, date_fro
             memory_month = None
 
     if memory_month is None:
-        if vector_doc_ids is None or len(vector_doc_ids) == 0:
-            if use_vector_search:
-                logging.info(
-                    f"Vector search returned no results or failed. Falling back to keyword search for: {search_term}")
+        # --- Combined Hybrid Search Logic ---
+        vector_clause = None
+        text_clause = None
 
-            if search_term:
-                search_words = [word.strip() for word in search_term.split(' ') if word.strip()]
-                if search_words:
-                    word_conditions = []
-                    for i, word in enumerate(search_words):
-                        key = f"search_word_{i}"
-                        key_upper = f"search_word_{i}_upper"
-                        params[key] = f"%{word}%"
-                        params[key_upper] = f"%{word.upper()}%"
-
-                        word_condition = f"""
-                                                (
-                                                    p.ABSTRACT LIKE :{key} OR UPPER(p.ABSTRACT) LIKE :{key_upper} OR
-                                                    p.DOCNAME LIKE :{key} OR UPPER(p.DOCNAME) LIKE :{key_upper} OR
-                                                    TO_CHAR(p.RTADOCDATE, 'YYYY-MM-DD') LIKE :{key} OR
-                                                    EXISTS (
-                                                        SELECT 1 FROM LKP_DOCUMENT_TAGS ldt
-                                                        JOIN KEYWORD k ON ldt.TAG_ID = k.SYSTEM_ID
-                                                        WHERE ldt.DOCNUMBER = p.DOCNUMBER 
-                                                        AND (k.DESCRIPTION LIKE :{key} OR UPPER(k.KEYWORD_ID) LIKE :{key_upper}) 
-                                                        AND ldt.DISABLED = '0'
-                                                        {shortlist_sql}
-                                                    ) OR
-                                                    EXISTS (
-                                                        SELECT 1 FROM LKP_PERSON p_filter
-                                                        WHERE (p_filter.NAME_ARABIC LIKE :{key} OR UPPER(p_filter.NAME_ENGLISH) LIKE :{key_upper})
-                                                        AND (
-                                                             UPPER(p.ABSTRACT) LIKE '%' || UPPER(p_filter.NAME_ENGLISH) || '%'
-                                                             OR (p_filter.NAME_ARABIC IS NOT NULL AND p.ABSTRACT LIKE '%' || p_filter.NAME_ARABIC || '%')
-                                                        )
-                                                    )
-                                                )
-                                                """
-                        word_conditions.append(word_condition)
-                    where_clauses.append(f"({' AND '.join(word_conditions)})")
-
-        else:
+        if vector_doc_ids:
             logging.info(f"Using {len(vector_doc_ids)} doc_ids from vector search.")
             vector_placeholders = ','.join([f":vec_id_{i}" for i in range(len(vector_doc_ids))])
-            where_clauses.append(f"p.docnumber IN ({vector_placeholders})")
+            vector_clause = f"p.docnumber IN ({vector_placeholders})"
             for i, doc_id in enumerate(vector_doc_ids):
                 params[f'vec_id_{i}'] = doc_id
 
+        if text_search_conditions:
+            text_clause = f"({' AND '.join(text_search_conditions)})"
+
+        if vector_clause and text_clause:
+            # Hybrid: Return docs that match EITHER vector search OR text search
+            where_clauses.append(f"({vector_clause} OR {text_clause})")
+        elif vector_clause:
+            where_clauses.append(vector_clause)
+        elif text_clause:
+            where_clauses.append(text_clause)
+
+        # --- Standard Filters ---
         if persons:
             person_list = [p.strip() for p in persons.split(',') if p.strip()]
             if person_list:
@@ -330,9 +343,13 @@ def fetch_documents_from_oracle(page=1, page_size=20, search_term=None, date_fro
     final_where_clause = base_where + ("AND " + " AND ".join(where_clauses) if where_clauses else "")
 
     order_by_clause = "ORDER BY p.DOCNUMBER DESC"
+
+    # --- Ordering Logic for Hybrid Search ---
     if vector_doc_ids and len(vector_doc_ids) > 0:
+        # Priority 1: Vector Matches (ordered by similarity rank)
+        # Priority 2: Keyword Matches (assigned a low rank like N+1)
         order_case_sql = " ".join([f"WHEN :vec_id_{i} THEN {i + 1}" for i in range(len(vector_doc_ids))])
-        order_by_clause = f"ORDER BY CASE p.docnumber {order_case_sql} END"
+        order_by_clause = f"ORDER BY CASE p.docnumber {order_case_sql} ELSE {len(vector_doc_ids) + 1} END ASC, p.RTADOCDATE DESC"
     elif memory_month is not None:
         order_by_clause = "ORDER BY p.RTADOCDATE DESC, p.DOCNUMBER DESC"
         if sort == 'rtadocdate_asc':
@@ -421,7 +438,6 @@ def fetch_documents_from_oracle(page=1, page_size=20, search_term=None, date_fro
             except oracledb.Error:
                 logging.error("Error closing DB connection.")
     return documents, total_rows
-
 
 def get_documents_to_process():
     """Gets a batch of documents that need AI processing."""
