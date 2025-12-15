@@ -127,7 +127,7 @@ def get_media_info_from_dms(dst, doc_number):
             media_type = resolved_map.get(str(doc_number), 'file')
         except Exception as e:
             logging.error(f"Error resolving media type from DB for {doc_number}: {e}")
-            # Only fallback to extension if DB lookup failed entirely
+            # Fallback to extension if DB lookup failed entirely
             video_extensions = [
                 '.mp4', '.mov', '.avi', '.mkv', '.wmv', '.flv', '.webm',
                 '.m4v', '.3gp', '.mts', '.ts', '.3g2'
@@ -135,6 +135,8 @@ def get_media_info_from_dms(dst, doc_number):
             pdf_extensions = ['.pdf']
             image_extensions = ['.jpg', '.jpeg', '.png', '.gif', '.bmp', '.tif', '.tiff', '.webp', '.heic']
             text_extensions = ['.txt', '.csv', '.json', '.xml', '.log', '.md', '.yml', '.yaml', '.ini', '.conf']
+            excel_extensions = ['.xls', '.xlsx', '.ods', '.xlsm']
+            ppt_extensions = ['.ppt', '.pptx', '.odp', '.pps', '.ppsx']
 
             file_ext = os.path.splitext(filename)[1].lower()
 
@@ -146,6 +148,10 @@ def get_media_info_from_dms(dst, doc_number):
                 media_type = 'image'
             elif file_ext in text_extensions:
                 media_type = 'text'
+            elif file_ext in excel_extensions:
+                media_type = 'excel'
+            elif file_ext in ppt_extensions:
+                media_type = 'powerpoint'
             else:
                 media_type = 'file'
 
@@ -2717,7 +2723,7 @@ def get_media_type_counts(app_source='unknown', scope=None):
 
 def resolve_media_types_from_db(doc_ids):
     """
-    Queries the database to find the media type (image, video, pdf, file, text) for a list of document IDs
+    Queries the database to find the media type (image, video, pdf, file, text, excel, powerpoint) for a list of document IDs
     by checking their Application ID and default extension.
     """
     if not doc_ids:
@@ -2749,6 +2755,8 @@ def resolve_media_types_from_db(doc_ids):
             video_exts = {'mp4', 'mov', 'avi', 'wmv', 'mkv', 'flv', 'webm', '3gp'}
             pdf_exts = {'pdf'}
             text_exts = {'txt', 'csv', 'json', 'xml', 'log', 'md', 'yml', 'yaml', 'ini', 'conf'}
+            excel_exts = {'xls', 'xlsx', 'ods', 'xlsm'}
+            ppt_exts = {'ppt', 'pptx', 'odp', 'pps', 'ppsx'}
 
             for doc_id, ext in rows:
                 media_type = 'file'  # Default to generic file
@@ -2763,7 +2771,11 @@ def resolve_media_types_from_db(doc_ids):
                         media_type = 'pdf'
                     elif clean_ext in text_exts:
                         media_type = 'text'
-                    # else it remains 'file' (docx, xlsx, zip, etc.)
+                    elif clean_ext in excel_exts:
+                        media_type = 'excel'
+                    elif clean_ext in ppt_exts:
+                        media_type = 'powerpoint'
+                    # else it remains 'file' (zip, rar, etc.)
 
                 resolved_map[str(doc_id)] = media_type
 
