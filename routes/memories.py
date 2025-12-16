@@ -1,23 +1,37 @@
-from flask import Blueprint, request, jsonify
-import logging
+from fastapi import APIRouter, HTTPException, Query
+from typing import Optional
 from datetime import datetime
 import db_connector
 
-memories_bp = Blueprint('memories', __name__)
+router = APIRouter()
 
-@memories_bp.route('/api/memories', methods=['GET'])
-def api_get_memories():
+
+@router.get('/api/memories')
+def api_get_memories(
+        month: Optional[str] = None,
+        day: Optional[str] = None,
+        limit: str = '5'
+):
     try:
         current_dt = datetime.now()
-        month_str = request.args.get('month')
-        month = int(month_str) if month_str and month_str.isdigit() else current_dt.month
-        day_str = request.args.get('day')
-        day = int(day_str) if day_str and day_str.isdigit() else None
-        limit_str = request.args.get('limit', '5')
-        limit = max(1, min(int(limit_str) if limit_str.isdigit() else 5, 10))
-        if not 1 <= month <= 12: return jsonify({"error": "Invalid month."}), 400
-        if day is not None and not 1 <= day <= 31: return jsonify({"error": "Invalid day."}), 400
-        memories = db_connector.fetch_memories_from_oracle(month=month, day=day, limit=limit)
-        return jsonify({"memories": memories})
+
+        parsed_month = int(month) if month and month.isdigit() else current_dt.month
+        parsed_day = int(day) if day and day.isdigit() else None
+
+        limit_val = 5
+        if limit and limit.isdigit():
+            limit_val = max(1, min(int(limit), 10))
+
+        if not 1 <= parsed_month <= 12:
+            raise HTTPException(status_code=400, detail="Invalid month.")
+        if parsed_day is not None and not 1 <= parsed_day <= 31:
+            raise HTTPException(status_code=400, detail="Invalid day.")
+
+        memories = db_connector.fetch_memories_from_oracle(
+            month=parsed_month, day=parsed_day, limit=limit_val
+        )
+        return {"memories": memories}
+    except HTTPException:
+        raise
     except Exception as e:
-        return jsonify({"error": "Failed to fetch memories."}), 500
+        raise HTTPException(status_code=500, detail="Failed to fetch memories.")

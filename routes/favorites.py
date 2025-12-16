@@ -1,32 +1,58 @@
-from flask import Blueprint, request, jsonify, session
-import math
+from fastapi import APIRouter, Request, HTTPException, Header
 import db_connector
 
-favorites_bp = Blueprint('favorites', __name__)
+router = APIRouter()
 
-@favorites_bp.route('/api/favorites/<int:doc_id>', methods=['POST'])
-def add_favorite_route(doc_id):
-    if 'user' not in session: return jsonify({"error": "Unauthorized"}), 401
-    user_id = session['user'].get('username')
+
+@router.post('/api/favorites/{doc_id}')
+def add_favorite_route(doc_id: int, request: Request):
+    user = request.session.get('user')
+    if not user:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    user_id = user.get('username')
     success, message = db_connector.add_favorite(user_id, doc_id)
-    if success: return jsonify({"message": message}), 201
-    else: return jsonify({"error": message}), 500
+    if success:
+        return {"message": message}
+    else:
+        raise HTTPException(status_code=500, detail=message)
 
-@favorites_bp.route('/api/favorites/<int:doc_id>', methods=['DELETE'])
-def remove_favorite_route(doc_id):
-    if 'user' not in session: return jsonify({"error": "Unauthorized"}), 401
-    user_id = session['user'].get('username')
+
+@router.delete('/api/favorites/{doc_id}')
+def remove_favorite_route(doc_id: int, request: Request):
+    user = request.session.get('user')
+    if not user:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    user_id = user.get('username')
     success, message = db_connector.remove_favorite(user_id, doc_id)
-    if success: return jsonify({"message": message}), 200
-    else: return jsonify({"error": message}), 500
+    if success:
+        return {"message": message}
+    else:
+        raise HTTPException(status_code=500, detail=message)
 
-@favorites_bp.route('/api/favorites', methods=['GET'])
-def get_favorites_route():
-    if 'user' not in session: return jsonify({"error": "Unauthorized"}), 401
-    user_id = session['user'].get('username')
-    app_source = request.headers.get('X-App-Source', 'unknown')
-    page = request.args.get('page', 1, type=int)
-    page_size = request.args.get('pageSize', 20, type=int)
-    documents, total_rows = db_connector.get_favorites(user_id, page, page_size, app_source=app_source)
-    total_pages = math.ceil(total_rows / page_size) if total_rows > 0 else 1
-    return jsonify({"documents": documents, "page": page, "total_pages": total_pages, "total_documents": total_rows})
+
+@router.get('/api/favorites')
+def get_favorites_route(
+        request: Request,
+        x_app_source: str = Header("unknown", alias="X-App-Source"),
+        page: int = 1,
+        pageSize: int = 20
+):
+    user = request.session.get('user')
+    if not user:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    user_id = user.get('username')
+    documents, total_rows = db_connector.get_favorites(
+        user_id, page, pageSize, app_source=x_app_source
+    )
+
+    total_pages = (total_rows + pageSize - 1) // pageSize if total_rows > 0 else 1
+
+    return {
+        "documents": documents,
+        "page": page,
+        "total_pages": total_pages,
+        "total_documents": total_rows
+    }

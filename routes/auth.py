@@ -1,77 +1,91 @@
-from flask import Blueprint, request, jsonify, session
+from fastapi import APIRouter, HTTPException, Request, Response, status
+from pydantic import BaseModel
 import db_connector
 import wsdl_client
 
-auth_bp = Blueprint('auth', __name__)
+router = APIRouter()
 
-@auth_bp.route('/api/auth/login', methods=['POST'])
-def login():
-    data = request.get_json()
-    username = data.get('username')
-    password = data.get('password')
-    if not username or not password:
-        return jsonify({"error": "Username and password are required"}), 400
-    dst = wsdl_client.dms_user_login(username, password)
+
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+
+class LangUpdateRequest(BaseModel):
+    lang: str
+
+
+class ThemeUpdateRequest(BaseModel):
+    theme: str
+
+
+@router.post('/api/auth/login')
+def login(request: Request, creds: LoginRequest):
+    dst = wsdl_client.dms_user_login(creds.username, creds.password)
     if dst:
-        user_details = db_connector.get_user_details(username)
+        user_details = db_connector.get_user_details(creds.username)
         if user_details is None or 'security_level' not in user_details:
-            return jsonify({"error": "User not authorized for this application"}), 401
-        session['user'] = user_details
-        session.permanent = True
-        return jsonify({"message": "Login successful", "user": user_details}), 200
+            raise HTTPException(status_code=401, detail="User not authorized for this application")
+
+        request.session['user'] = user_details
+        return {"message": "Login successful", "user": user_details}
     else:
-        return jsonify({"error": "Invalid DMS credentials"}), 401
+        raise HTTPException(status_code=401, detail="Invalid DMS credentials")
 
-@auth_bp.route('/api/auth/logout', methods=['POST'])
-def logout():
-    session.pop('user', None)
-    return jsonify({"message": "Logout successful"}), 200
 
-@auth_bp.route('/api/auth/user', methods=['GET'])
-def get_user():
-    user_session = session.get('user')
+@router.post('/api/auth/logout')
+def logout(request: Request):
+    request.session.pop('user', None)
+    return {"message": "Logout successful"}
+
+
+@router.get('/api/auth/user')
+def get_user(request: Request):
+    user_session = request.session.get('user')
     if user_session and 'username' in user_session:
         user_details = db_connector.get_user_details(user_session['username'])
         if user_details:
-            session['user'] = user_details
-            return jsonify({'user': user_details}), 200
+            request.session['user'] = user_details
+            return {'user': user_details}
         else:
-            session.pop('user', None)
-            return jsonify({'error': 'User not found'}), 401
+            request.session.pop('user', None)
+            raise HTTPException(status_code=401, detail='User not found')
     else:
-        return jsonify({'error': 'Not authenticated'}), 401
+        raise HTTPException(status_code=401, detail='Not authenticated')
 
-@auth_bp.route('/api/user/language', methods=['PUT'])
-def update_user_language():
-    if 'user' not in session:
-        return jsonify({"error": "Unauthorized"}), 401
-    data = request.get_json()
-    lang = data.get('lang')
-    if lang not in ['en', 'ar']:
-        return jsonify({"error": "Invalid language"}), 400
-    success = db_connector.update_user_language(session['user']['username'], lang)
-    if success:
-        user_session = session['user']
-        user_session['lang'] = lang
-        session['user'] = user_session
-        return jsonify({"message": "Language updated"}), 200
-    else:
-        return jsonify({"error": "Failed to update language"}), 500
 
-@auth_bp.route('/api/user/theme', methods=['PUT'])
-def api_update_user_theme():
-    if 'user' not in session:
-        return jsonify({"error": "Unauthorized"}), 401
-    data = request.get_json()
-    theme = data.get('theme')
-    if theme not in ['light', 'dark']:
-        return jsonify({"error": "Invalid theme"}), 400
-    username = session['user']['username']
-    success = db_connector.update_user_theme(username, theme)
+@router.put('/api/user/language')
+def update_user_language(request: Request, data: LangUpdateRequest):
+    user = request.session.get('user')
+    if not user:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    if data.lang not in ['en', 'ar']:
+        raise HTTPException(status_code=400, detail="Invalid language")
+
+    success = db_connector.update_user_language(user['username'], data.lang)
     if success:
-        user_session = session['user']
-        user_session['theme'] = theme
-        session['user'] = user_session
-        return jsonify({"message": "Theme updated"}), 200
+        user['lang'] = data.lang
+        request.session['user'] = user
+        return {"message": "Language updated"}
     else:
-        return jsonify({"error": "Failed to update theme"}), 500
+        raise HTTPException(status_code=500, detail="Failed to update language")
+
+
+@router.put('/api/user/theme')
+def api_update_user_theme(request: Request, data: ThemeUpdateRequest):
+    user = request.session.get('user')
+    if not user:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    if data.theme not in ['light', 'dark']:
+        raise HTTPException(status_code=400, detail="Invalid theme")
+
+    username = user['username']
+    success = db_connector.update_user_theme(username, data.theme)
+    if success:
+        user['theme'] = data.theme
+        request.session['user'] = user
+        return {"message": "Theme updated"}
+    else:
+        raise HTTPException(status_code=500, detail="Failed to update theme")

@@ -1,14 +1,13 @@
-from functools import wraps
-from flask import session, abort
+from fastapi import Request, HTTPException, status
 import re
 
-def editor_required(f):
-    @wraps(f)
-    def decorated_function(*args, **kwargs):
-        if 'user' not in session or session['user'].get('security_level') != 'Editor':
-            abort(403)
-        return f(*args, **kwargs)
-    return decorated_function
+def verify_editor(request: Request):
+    user = request.session.get("user")
+    if not user or user.get("security_level") != "Editor":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Forbidden: Editor privileges required."
+        )
 
 def clean_repeated_words(text):
     if not text:
