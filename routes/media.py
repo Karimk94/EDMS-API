@@ -9,9 +9,8 @@ from utils.common import verify_editor
 
 router = APIRouter()
 
-
 @router.get('/api/image/{doc_id}')
-def api_get_image(doc_id: int):
+async def api_get_image(doc_id: int):
     dst = db_connector.dms_system_login()
     if not dst:
         raise HTTPException(status_code=500, detail='DMS login failed.')
@@ -21,9 +20,8 @@ def api_get_image(doc_id: int):
         return Response(content=bytes(image_data), media_type='image/jpeg')
     raise HTTPException(status_code=404, detail='Image not found in EDMS.')
 
-
 @router.get('/api/pdf/{doc_id}')
-def api_get_pdf(doc_id: int):
+async def api_get_pdf(doc_id: int):
     dst = db_connector.dms_system_login()
     if not dst:
         raise HTTPException(status_code=500, detail='DMS login failed.')
@@ -33,14 +31,14 @@ def api_get_pdf(doc_id: int):
         return Response(content=bytes(pdf_data), media_type='application/pdf')
     raise HTTPException(status_code=404, detail='PDF not found in EDMS.')
 
-
 @router.get('/api/video/{doc_id}')
-def api_get_video(doc_id: int):
+async def api_get_video(doc_id: int):
     dst = db_connector.dms_system_login()
     if not dst:
         raise HTTPException(status_code=500, detail='DMS login failed.')
 
-    original_filename, media_type, file_ext = db_connector.get_media_info_from_dms(dst, doc_id)
+    # ASYNC DB CALL
+    original_filename, media_type, file_ext = await db_connector.get_media_info_from_dms(dst, doc_id)
     if not original_filename:
         raise HTTPException(status_code=404, detail='Video metadata not found.')
     if media_type != 'video':
@@ -66,17 +64,15 @@ def api_get_video(doc_id: int):
     mimetype, _ = mimetypes.guess_type(cached_video_path)
     return StreamingResponse(stream_generator, media_type=mimetype or "video/mp4")
 
-
 @router.get('/cache/{filename}')
-def serve_cached_thumbnail(filename: str):
+async def serve_cached_thumbnail(filename: str):
     file_path = os.path.join(db_connector.thumbnail_cache_dir, filename)
     if os.path.exists(file_path):
         return FileResponse(file_path)
     raise HTTPException(status_code=404, detail="File not found")
 
-
 @router.post('/api/clear_cache', dependencies=[Depends(verify_editor)])
-def api_clear_cache():
+async def api_clear_cache():
     try:
         db_connector.clear_thumbnail_cache()
         db_connector.clear_video_cache()
@@ -84,14 +80,13 @@ def api_clear_cache():
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to clear cache: {e}")
 
-
 @router.get('/api/media_counts')
-def get_media_counts(
+async def get_media_counts(
         x_app_source: str = Header("unknown", alias="X-App-Source"),
         scope: Optional[str] = None
 ):
     try:
-        counts = db_connector.get_media_type_counts(app_source=x_app_source, scope=scope)
+        counts = await db_connector.get_media_type_counts(app_source=x_app_source, scope=scope)
         if counts:
             return counts
         else:

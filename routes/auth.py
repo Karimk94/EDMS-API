@@ -1,29 +1,15 @@
-from fastapi import APIRouter, HTTPException, Request, Response, status
-from pydantic import BaseModel
+from fastapi import APIRouter, HTTPException, Request
 import db_connector
 import wsdl_client
+from schemas.auth import LoginRequest, LangUpdateRequest, ThemeUpdateRequest
 
 router = APIRouter()
 
-
-class LoginRequest(BaseModel):
-    username: str
-    password: str
-
-
-class LangUpdateRequest(BaseModel):
-    lang: str
-
-
-class ThemeUpdateRequest(BaseModel):
-    theme: str
-
-
 @router.post('/api/auth/login')
-def login(request: Request, creds: LoginRequest):
+async def login(request: Request, creds: LoginRequest):
     dst = wsdl_client.dms_user_login(creds.username, creds.password)
     if dst:
-        user_details = db_connector.get_user_details(creds.username)
+        user_details = await db_connector.get_user_details(creds.username)
         if user_details is None or 'security_level' not in user_details:
             raise HTTPException(status_code=401, detail="User not authorized for this application")
 
@@ -32,18 +18,16 @@ def login(request: Request, creds: LoginRequest):
     else:
         raise HTTPException(status_code=401, detail="Invalid DMS credentials")
 
-
 @router.post('/api/auth/logout')
-def logout(request: Request):
+async def logout(request: Request):
     request.session.pop('user', None)
     return {"message": "Logout successful"}
 
-
 @router.get('/api/auth/user')
-def get_user(request: Request):
+async def get_user(request: Request):
     user_session = request.session.get('user')
     if user_session and 'username' in user_session:
-        user_details = db_connector.get_user_details(user_session['username'])
+        user_details = await db_connector.get_user_details(user_session['username'])
         if user_details:
             request.session['user'] = user_details
             return {'user': user_details}
@@ -53,9 +37,8 @@ def get_user(request: Request):
     else:
         raise HTTPException(status_code=401, detail='Not authenticated')
 
-
 @router.put('/api/user/language')
-def update_user_language(request: Request, data: LangUpdateRequest):
+async def update_user_language(request: Request, data: LangUpdateRequest):
     user = request.session.get('user')
     if not user:
         raise HTTPException(status_code=401, detail="Unauthorized")
@@ -63,7 +46,7 @@ def update_user_language(request: Request, data: LangUpdateRequest):
     if data.lang not in ['en', 'ar']:
         raise HTTPException(status_code=400, detail="Invalid language")
 
-    success = db_connector.update_user_language(user['username'], data.lang)
+    success = await db_connector.update_user_language(user['username'], data.lang)
     if success:
         user['lang'] = data.lang
         request.session['user'] = user
@@ -71,9 +54,8 @@ def update_user_language(request: Request, data: LangUpdateRequest):
     else:
         raise HTTPException(status_code=500, detail="Failed to update language")
 
-
 @router.put('/api/user/theme')
-def api_update_user_theme(request: Request, data: ThemeUpdateRequest):
+async def api_update_user_theme(request: Request, data: ThemeUpdateRequest):
     user = request.session.get('user')
     if not user:
         raise HTTPException(status_code=401, detail="Unauthorized")
@@ -82,7 +64,7 @@ def api_update_user_theme(request: Request, data: ThemeUpdateRequest):
         raise HTTPException(status_code=400, detail="Invalid theme")
 
     username = user['username']
-    success = db_connector.update_user_theme(username, data.theme)
+    success = await db_connector.update_user_theme(username, data.theme)
     if success:
         user['theme'] = data.theme
         request.session['user'] = user

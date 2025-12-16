@@ -41,3 +41,18 @@ def get_connection():
         # Log the detailed error
         logging.error(f"DB connection error: {error.message} (Code: {error.code}, Context: {error.context})")
         return None
+
+async def get_async_connection():
+    """Establishes an asynchronous connection to the Oracle database."""
+    try:
+        dsn = f"{os.getenv('DB_HOST')}:{os.getenv('DB_PORT')}/{os.getenv('DB_SERVICE_NAME')}"
+        user = os.getenv('DB_USERNAME')
+        password = os.getenv('DB_PASSWORD')
+        if not all([user, password, dsn]):
+            logging.error("Database connection details missing in environment variables.")
+            return None
+        return await oracledb.connect_async(user=user, password=password, dsn=dsn)
+    except oracledb.Error as ex:
+        error, = ex.args
+        logging.error(f"Async DB connection error: {error.message} (Code: {error.code})")
+        return None

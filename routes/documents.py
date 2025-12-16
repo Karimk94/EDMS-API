@@ -1,52 +1,28 @@
-from fastapi import APIRouter, Request, HTTPException, Depends, UploadFile, File, Form, Response, BackgroundTasks, \
-    Header, Query
+from fastapi import APIRouter, Request, HTTPException, UploadFile, File, Form, BackgroundTasks, Header
 from fastapi.responses import StreamingResponse
 from werkzeug.utils import secure_filename
-from typing import List, Optional
+from typing import Optional
 from datetime import datetime
 import os
 import io
 import mimetypes
 import logging
-from pydantic import BaseModel
-
 import db_connector
 import wsdl_client
 from services.processor import process_document
 from utils.watermark import apply_watermark_to_image, apply_watermark_to_pdf, apply_watermark_to_video
+from schemas.documents import ProcessUploadRequest, UpdateMetadataRequest, UpdateAbstractRequest, LinkEventRequest
 
 router = APIRouter()
 
-
-# --- Pydantic Models ---
-class ProcessUploadRequest(BaseModel):
-    docnumbers: List[int]
-
-
-class UpdateMetadataRequest(BaseModel):
-    doc_id: int
-    abstract: Optional[str] = None
-    date_taken: Optional[str] = None
-
-
-class UpdateAbstractRequest(BaseModel):
-    doc_id: int
-    names: List[str]
-
-
-class LinkEventRequest(BaseModel):
-    event_id: Optional[int]
-
-
 # --- Helper for Background Task ---
-def run_db_update(result_data):
-    db_connector.update_document_processing_status(**result_data)
-
+async def run_db_update(result_data):
+    await db_connector.update_document_processing_status(**result_data)
 
 # --- Routes ---
 
 @router.get('/api/documents')
-def api_get_documents(
+async def api_get_documents(
         request: Request,
         x_app_source: str = Header("unknown", alias="X-App-Source"),
         page: int = 1,
@@ -74,7 +50,7 @@ def api_get_documents(
         if pageSize < 1: pageSize = 20
         if pageSize > 100: pageSize = 100
 
-        documents, total_rows = db_connector.fetch_documents_from_oracle(
+        documents, total_rows = await db_connector.fetch_documents_from_oracle(
             page=page, page_size=pageSize, search_term=search, date_from=date_from,
             date_to=date_to, persons=persons, person_condition=person_condition, tags=tags,
             years=years, sort=sort, memory_month=memoryMonth, memory_day=memoryDay,
@@ -96,12 +72,12 @@ def api_get_documents(
 
 
 @router.post('/process-batch')
-def process_batch(background_tasks: BackgroundTasks):
+async def process_batch(background_tasks: BackgroundTasks):
     dms_session_token = db_connector.dms_system_login()
     if not dms_session_token:
         raise HTTPException(status_code=500, detail="Failed to authenticate with DMS.")
 
-    documents = db_connector.get_documents_to_process()
+    documents = await db_connector.get_documents_to_process()
     if not documents:
         return {"status": "success", "message": "No new documents to process.", "processed_count": 0}
 
@@ -109,7 +85,7 @@ def process_batch(background_tasks: BackgroundTasks):
     # In FastAPI, we can dispatch background tasks.
     # Since we have a list, we iterate and add them.
     for doc in documents:
-        result_data = process_document(doc, dms_session_token)
+        result_data = await process_document(doc, dms_session_token)
         background_tasks.add_task(run_db_update, result_data)
         if result_data.get('status') == 3:
             processed_count += 1
@@ -117,9 +93,8 @@ def process_batch(background_tasks: BackgroundTasks):
     return {"status": "success", "message": f"Processing started for {len(documents)} documents.",
             "processed_count": processed_count}
 
-
 @router.post('/api/upload_document')
-def api_upload_document(
+async def api_upload_document(
         file: UploadFile = File(...),
         docname: Optional[str] = Form(None),
         abstract: str = Form("Uploaded via EDMS Viewer"),
@@ -143,7 +118,7 @@ def api_upload_document(
 
     original_filename = secure_filename(file.filename)
     file_extension = os.path.splitext(original_filename)[1].lstrip('.').upper()
-    app_id = db_connector.get_app_id_from_extension(file_extension) or 'UNKNOWN'
+    app_id = await db_connector.get_app_id_from_extension(file_extension) or 'UNKNOWN'
 
     final_docname = docname.strip() if docname and docname.strip() else os.path.splitext(original_filename)[0]
 
@@ -165,25 +140,24 @@ def api_upload_document(
     }
 
     # Passing file.file (SpooledTemporaryFile) acts like a stream
-    new_doc_number = wsdl_client.upload_document_to_dms(dst, file.file, metadata, parent_id=parent_id)
+    new_doc_number = await wsdl_client.upload_document_to_dms(dst, file.file, metadata, parent_id=parent_id)
 
     if new_doc_number:
         return {"success": True, "docnumber": new_doc_number, "filename": original_filename}
     else:
         raise HTTPException(status_code=500, detail="Failed to upload file to DMS.")
 
-
 @router.post('/api/process_uploaded_documents')
-def api_process_uploaded_documents(data: ProcessUploadRequest, background_tasks: BackgroundTasks):
+async def api_process_uploaded_documents(data: ProcessUploadRequest, background_tasks: BackgroundTasks):
     dms_session_token = db_connector.dms_system_login()
     if not dms_session_token:
         raise HTTPException(status_code=500, detail="Failed to authenticate.")
 
     results = {"processed": [], "failed": [], "in_progress": []}
-    docs_to_process = db_connector.get_specific_documents_for_processing(data.docnumbers)
+    docs_to_process = await db_connector.get_specific_documents_for_processing(data.docnumbers)
 
     for doc in docs_to_process:
-        result_data = process_document(doc, dms_session_token)
+        result_data = await process_document(doc, dms_session_token)
         # For uploaded processing, we add to background tasks to update DB
         background_tasks.add_task(run_db_update, result_data)
 
@@ -197,9 +171,8 @@ def api_process_uploaded_documents(data: ProcessUploadRequest, background_tasks:
 
     return results
 
-
 @router.get('/api/document/{docnumber}')
-def get_document_file(docnumber: int, request: Request):
+async def get_document_file(docnumber: int, request: Request):
     if 'user' not in request.session:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
@@ -219,9 +192,8 @@ def get_document_file(docnumber: int, request: Request):
     else:
         raise HTTPException(status_code=404, detail="Document not found")
 
-
 @router.put('/api/update_metadata')
-def api_update_metadata(data: UpdateMetadataRequest):
+async def api_update_metadata(data: UpdateMetadataRequest):
     if data.abstract is None and data.date_taken is None:
         raise HTTPException(status_code=400, detail='At least one field must be provided.')
 
@@ -239,7 +211,7 @@ def api_update_metadata(data: UpdateMetadataRequest):
     # Use Ellipsis (...) to indicate no update in DB connector if logic follows that pattern
     date_arg = new_date_taken if update_date else Ellipsis
 
-    success, message = db_connector.update_document_metadata(
+    success, message = await db_connector.update_document_metadata(
         data.doc_id,
         new_abstract=data.abstract,
         new_date_taken=date_arg
@@ -250,20 +222,19 @@ def api_update_metadata(data: UpdateMetadataRequest):
     else:
         raise HTTPException(status_code=500, detail=message)
 
-
 @router.get('/api/download_watermarked/{doc_id}')
-def api_download_watermarked(doc_id: int, request: Request):
+async def api_download_watermarked(doc_id: int, request: Request):
     if 'user' not in request.session:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
     username = request.session['user'].get('username', 'Unknown')
-    system_id = db_connector.get_user_system_id(username) or "UNKNOWN"
+    system_id = await db_connector.get_user_system_id(username) or "UNKNOWN"
 
     dst = wsdl_client.dms_system_login()
     if not dst:
         raise HTTPException(status_code=500, detail="Failed to get token")
 
-    filename, media_type, file_ext = db_connector.get_media_info_from_dms(dst, doc_id)
+    filename, media_type, file_ext = await db_connector.get_media_info_from_dms(dst, doc_id)
     if not filename:
         raise HTTPException(status_code=404, detail="Document not found")
 
@@ -289,27 +260,24 @@ def api_download_watermarked(doc_id: int, request: Request):
         headers={"Content-Disposition": f"attachment; filename={filename}"}
     )
 
-
 @router.post('/api/update_abstract')
-def api_update_abstract(data: UpdateAbstractRequest):
-    success, message = db_connector.update_abstract_with_vips(data.doc_id, data.names)
+async def api_update_abstract(data: UpdateAbstractRequest):
+    success, message = await db_connector.update_abstract_with_vips(data.doc_id, data.names)
     if success:
         return {'message': message}
     else:
         raise HTTPException(status_code=500, detail=message)
 
-
 @router.put('/api/document/{doc_id}/event')
-def link_document_event(doc_id: int, data: LinkEventRequest):
-    success, message = db_connector.link_document_to_event(doc_id, data.event_id)
+async def link_document_event(doc_id: int, data: LinkEventRequest):
+    success, message = await db_connector.link_document_to_event(doc_id, data.event_id)
     if success:
         return {"message": message}
     else:
         raise HTTPException(status_code=500, detail=message)
 
-
 @router.get('/api/document/{doc_id}/event')
-def get_document_event(doc_id: int):
-    event_info = db_connector.get_event_for_document(doc_id)
+async def get_document_event(doc_id: int):
+    event_info = await db_connector.get_event_for_document(doc_id)
     # Return empty dict if None to match JSON behavior or handle strictly
     return event_info if event_info else {}

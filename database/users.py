@@ -1,19 +1,19 @@
 import oracledb
 import logging
-from database.connection import get_connection
+from database.connection import get_async_connection
 
-def get_user_security_level(username):
+async def get_user_security_level(username):
     """Fetches the user's security level name from the database using their user ID from the PEOPLE table."""
-    conn = get_connection()
+    conn = await get_async_connection()
     if not conn:
         return None  # Return None if DB connection fails
 
     security_level = None  # Default value is now None
     try:
-        with conn.cursor() as cursor:
+        async with conn.cursor() as cursor:
             # Use upper for case-insensitive comparison
-            cursor.execute("SELECT SYSTEM_ID FROM PEOPLE WHERE UPPER(USER_ID) = UPPER(:username)", username=username)
-            user_result = cursor.fetchone()
+            await cursor.execute("SELECT SYSTEM_ID FROM PEOPLE WHERE UPPER(USER_ID) = UPPER(:username)", username=username)
+            user_result = await cursor.fetchone()
 
             if user_result:
                 user_id = user_result[0]
@@ -25,8 +25,8 @@ def get_user_security_level(username):
                     JOIN LKP_EDMS_SECURITY sl ON us.SECURITY_LEVEL_ID = sl.SYSTEM_ID
                     WHERE us.USER_ID = :user_id
                 """
-                cursor.execute(query, user_id=user_id)
-                level_result = cursor.fetchone()
+                await cursor.execute(query, user_id=user_id)
+                level_result = await cursor.fetchone()
                 if level_result:
                     security_level = level_result[0]
                 else:
@@ -38,21 +38,21 @@ def get_user_security_level(username):
         logging.error(f"Oracle Database error in get_user_security_level for {username}: {e}", exc_info=True)
     finally:
         if conn:
-            conn.close()
+            await conn.close()
     return security_level
 
-def get_user_details(username):
+async def get_user_details(username):
     """Fetches user details including security level, language, and theme preference."""
-    conn = get_connection()
+    conn = await get_async_connection()
     if not conn:
         return None
 
     user_details = None
     try:
-        with conn.cursor() as cursor:
+        async with conn.cursor() as cursor:
             # First, get the USER_ID from the PEOPLE table
-            cursor.execute("SELECT SYSTEM_ID FROM PEOPLE WHERE UPPER(USER_ID) = UPPER(:username)", username=username)
-            user_result = cursor.fetchone()
+            await cursor.execute("SELECT SYSTEM_ID FROM PEOPLE WHERE UPPER(USER_ID) = UPPER(:username)", username=username)
+            user_result = await cursor.fetchone()
 
             if user_result:
                 user_id = user_result[0]
@@ -64,8 +64,8 @@ def get_user_details(username):
                     JOIN LKP_EDMS_SECURITY sl ON us.SECURITY_LEVEL_ID = sl.SYSTEM_ID
                     WHERE us.USER_ID = :user_id
                 """
-                cursor.execute(query, user_id=user_id)
-                details_result = cursor.fetchone()
+                await cursor.execute(query, user_id=user_id)
+                details_result = await cursor.fetchone()
 
                 if details_result:
                     security_level, lang, theme = details_result
@@ -84,20 +84,20 @@ def get_user_details(username):
         logging.error(f"Oracle Database error in get_user_details for {username}: {e}", exc_info=True)
     finally:
         if conn:
-            conn.close()
+            await conn.close()
 
     return user_details
 
-def update_user_language(username, lang):
+async def update_user_language(username, lang):
     """Updates the language preference for a user."""
-    conn = get_connection()
+    conn = await get_async_connection()
     if not conn:
         return False
 
     try:
-        with conn.cursor() as cursor:
-            cursor.execute("SELECT SYSTEM_ID FROM PEOPLE WHERE UPPER(USER_ID) = UPPER(:username)", username=username)
-            user_result = cursor.fetchone()
+        async with conn.cursor() as cursor:
+            await cursor.execute("SELECT SYSTEM_ID FROM PEOPLE WHERE UPPER(USER_ID) = UPPER(:username)", username=username)
+            user_result = await cursor.fetchone()
 
             if not user_result:
                 logging.error(f"Cannot update language. User '{username}' not found in PEOPLE table.")
@@ -111,26 +111,26 @@ def update_user_language(username, lang):
                 SET LANG = :lang
                 WHERE USER_ID = :user_id
             """
-            cursor.execute(update_query, lang=lang, user_id=user_id)
+            await cursor.execute(update_query, lang=lang, user_id=user_id)
 
             if cursor.rowcount == 0:
                 logging.warning(f"No rows updated for user '{username}' (user_id: {user_id}). They may not have a security record.")
                 return False
 
-            conn.commit()
+            await conn.commit()
             return True
 
     except oracledb.Error as e:
         logging.error(f"Oracle Database error in update_user_language for {username}: {e}", exc_info=True)
-        conn.rollback()
+        await conn.rollback()
         return False
     finally:
         if conn:
-            conn.close()
+            await conn.close()
 
-def update_user_theme(username, theme):
+async def update_user_theme(username, theme):
     """Updates the theme preference for a user."""
-    conn = get_connection()
+    conn = await get_async_connection()
     if not conn:
         return False
 
@@ -139,9 +139,9 @@ def update_user_theme(username, theme):
         return False
 
     try:
-        with conn.cursor() as cursor:
-            cursor.execute("SELECT SYSTEM_ID FROM PEOPLE WHERE UPPER(USER_ID) = UPPER(:username)", username=username)
-            user_result = cursor.fetchone()
+        async with conn.cursor() as cursor:
+            await cursor.execute("SELECT SYSTEM_ID FROM PEOPLE WHERE UPPER(USER_ID) = UPPER(:username)", username=username)
+            user_result = await cursor.fetchone()
 
             if not user_result:
                 logging.error(f"Cannot update theme. User '{username}' not found in PEOPLE table.")
@@ -155,34 +155,34 @@ def update_user_theme(username, theme):
                 SET THEME = :theme
                 WHERE USER_ID = :user_id
             """
-            cursor.execute(update_query, theme=theme, user_id=user_id)
+            await cursor.execute(update_query, theme=theme, user_id=user_id)
 
             if cursor.rowcount == 0:
                 logging.warning(f"No rows updated for user '{username}' (user_id: {user_id}). They may not have a security record.")
-                return False # Or True, if you consider "not having a record" a non-failure
+                return False
 
-            conn.commit()
+            await conn.commit()
             return True
 
     except oracledb.Error as e:
         logging.error(f"Oracle Database error in update_user_theme for {username}: {e}", exc_info=True)
-        conn.rollback()
+        await conn.rollback()
         return False
     finally:
         if conn:
-            conn.close()
+            await conn.close()
 
-def get_user_system_id(username):
+async def get_user_system_id(username):
     """Fetches the SYSTEM_ID from the PEOPLE table for a given username."""
-    conn = get_connection()
+    conn = await get_async_connection()
     if not conn:
         return None
 
     system_id = None
     try:
-        with conn.cursor() as cursor:
-            cursor.execute("SELECT SYSTEM_ID FROM PEOPLE WHERE UPPER(USER_ID) = UPPER(:username)", username=username)
-            result = cursor.fetchone()
+        async with conn.cursor() as cursor:
+            await cursor.execute("SELECT SYSTEM_ID FROM PEOPLE WHERE UPPER(USER_ID) = UPPER(:username)", username=username)
+            result = await cursor.fetchone()
             if result:
                 system_id = result[0]
             else:
@@ -191,5 +191,5 @@ def get_user_system_id(username):
         logging.error(f"Oracle Database error in get_user_system_id for {username}: {e}", exc_info=True)
     finally:
         if conn:
-            conn.close()
+            await conn.close()
     return system_id

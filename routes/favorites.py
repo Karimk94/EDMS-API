@@ -3,37 +3,34 @@ import db_connector
 
 router = APIRouter()
 
-
 @router.post('/api/favorites/{doc_id}')
-def add_favorite_route(doc_id: int, request: Request):
+async def add_favorite_route(doc_id: int, request: Request):
     user = request.session.get('user')
     if not user:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
     user_id = user.get('username')
-    success, message = db_connector.add_favorite(user_id, doc_id)
+    success, message = await db_connector.add_favorite(user_id, doc_id)
     if success:
         return {"message": message}
     else:
         raise HTTPException(status_code=500, detail=message)
-
 
 @router.delete('/api/favorites/{doc_id}')
-def remove_favorite_route(doc_id: int, request: Request):
+async def remove_favorite_route(doc_id: int, request: Request):
     user = request.session.get('user')
     if not user:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
     user_id = user.get('username')
-    success, message = db_connector.remove_favorite(user_id, doc_id)
+    success, message = await db_connector.remove_favorite(user_id, doc_id)
     if success:
         return {"message": message}
     else:
         raise HTTPException(status_code=500, detail=message)
 
-
 @router.get('/api/favorites')
-def get_favorites_route(
+async def get_favorites_route(
         request: Request,
         x_app_source: str = Header("unknown", alias="X-App-Source"),
         page: int = 1,
@@ -44,7 +41,7 @@ def get_favorites_route(
         raise HTTPException(status_code=401, detail="Unauthorized")
 
     user_id = user.get('username')
-    documents, total_rows = db_connector.get_favorites(
+    documents, total_rows = await db_connector.get_favorites(
         user_id, page, pageSize, app_source=x_app_source
     )
 

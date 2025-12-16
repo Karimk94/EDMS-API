@@ -56,18 +56,5 @@ if __name__ == '__main__':
         "app:app",
         host='0.0.0.0',
         port=port,
-        reload=True,
-        reload_excludes=[
-            "*.log",
-            "*.pyc",
-            "__pycache__",
-            "venv",
-            ".idea",
-            ".vscode",
-            ".git",
-            "thumbnail_cache",
-            "video_cache",
-            "chroma_db",
-            "*.tmp"
-        ]
+        reload=False
     )

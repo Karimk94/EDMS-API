@@ -3,7 +3,7 @@ import logging
 from datetime import datetime
 import re
 import wsdl_client
-from database.connection import get_connection
+from database.connection import get_async_connection
 from database.media import (
     dms_system_login,
     get_media_info_from_dms,
@@ -19,26 +19,27 @@ except ImportError:
     logging.warning("vector_client.py not found. Vector search capabilities will be disabled.")
     vector_client = None
 
-
-def fetch_documents_from_oracle(page=1, page_size=20, search_term=None, date_from=None, date_to=None,
-                                persons=None, person_condition='any', tags=None, years=None, sort=None,
-                                memory_month=None, memory_day=None, user_id=None, lang='en',
-                                security_level='Editor', app_source='unknown', media_type=None, scope=None):
+async def fetch_documents_from_oracle(page=1, page_size=20, search_term=None, date_from=None, date_to=None,
+                                      persons=None, person_condition='any', tags=None, years=None, sort=None,
+                                      memory_month=None, memory_day=None, user_id=None, lang='en',
+                                      security_level='Editor', app_source='unknown', media_type=None, scope=None):
     """Fetches a paginated list of documents, applying filters including media_type."""
-    conn = get_connection()
+    conn = await get_async_connection()
     if not conn: return [], 0
 
     dst = dms_system_login()
     if not dst:
         logging.error("Could not log into DMS. Aborting document fetch.")
+        if conn: await conn.close()
         return [], 0
 
     db_user_id = None
     if user_id:
         try:
-            with conn.cursor() as cursor:
-                cursor.execute("SELECT SYSTEM_ID FROM PEOPLE WHERE UPPER(USER_ID) = UPPER(:username)", username=user_id)
-                user_result = cursor.fetchone()
+            async with conn.cursor() as cursor:
+                await cursor.execute("SELECT SYSTEM_ID FROM PEOPLE WHERE UPPER(USER_ID) = UPPER(:username)",
+                                     username=user_id)
+                user_result = await cursor.fetchone()
                 if user_result:
                     db_user_id = user_result[0]
         except oracledb.Error as e:
@@ -55,9 +56,10 @@ def fetch_documents_from_oracle(page=1, page_size=20, search_term=None, date_fro
     # --- Scope Logic ---
     folder_doc_ids = None
     if scope == 'folders':
-        # Retrieve all relevant DOCNUMBERS from WSDL first
+        # Retrieve all relevant DOCNUMBERS from WSDL first (Sync call)
         folder_doc_ids = wsdl_client.get_recursive_doc_ids(dst, media_type)
         if not folder_doc_ids:
+            if conn: await conn.close()
             return [], 0
 
         # Paginate IDs *before* querying DB to handle large lists efficiently
@@ -65,6 +67,7 @@ def fetch_documents_from_oracle(page=1, page_size=20, search_term=None, date_fro
 
         # If requested page is out of range, return empty
         if offset >= total_rows:
+            if conn: await conn.close()
             return [], total_rows
 
         paginated_ids = folder_doc_ids[offset: offset + page_size]
@@ -93,18 +96,18 @@ def fetch_documents_from_oracle(page=1, page_size=20, search_term=None, date_fro
 
         if media_type:
             try:
-                with conn.cursor() as app_cursor:
+                async with conn.cursor() as app_cursor:
                     # Step 1: Try to fetch SYSTEM_ID (Numeric) from APPS
                     id_column = "SYSTEM_ID"
                     try:
-                        app_cursor.execute(f"SELECT {id_column}, DEFAULT_EXTENSION FROM APPS")
-                        apps_rows = app_cursor.fetchall()
+                        await app_cursor.execute(f"SELECT {id_column}, DEFAULT_EXTENSION FROM APPS")
+                        apps_rows = await app_cursor.fetchall()
                     except oracledb.DatabaseError:
                         # Fallback if SYSTEM_ID column doesn't exist
                         logging.warning("SYSTEM_ID column not found in APPS, falling back to APPLICATION column.")
                         id_column = "APPLICATION"
-                        app_cursor.execute(f"SELECT {id_column}, DEFAULT_EXTENSION FROM APPS")
-                        apps_rows = app_cursor.fetchall()
+                        await app_cursor.execute(f"SELECT {id_column}, DEFAULT_EXTENSION FROM APPS")
+                        apps_rows = await app_cursor.fetchall()
 
                 # Using the same extended lists as the working reference
                 image_exts = {'jpg', 'jpeg', 'png', 'gif', 'bmp', 'tif', 'tiff', 'webp', 'heic', 'ico', 'jfif'}
@@ -184,10 +187,8 @@ def fetch_documents_from_oracle(page=1, page_size=20, search_term=None, date_fro
                                         """
                 text_search_conditions.append(word_condition)
 
-    # --- Perform Vector Search ---
+    # --- Perform Vector Search (Blocking Call) ---
     if use_vector_search:
-        # FIX: Fetch 'page * page_size' to allow pagination to reach deeper pages
-        # The vector client doesn't support offset natively in this setup, so we fetch the top N
         try:
             vector_doc_ids = vector_client.query_documents(search_term, n_results=page * page_size)
         except Exception as e:
@@ -236,7 +237,6 @@ def fetch_documents_from_oracle(page=1, page_size=20, search_term=None, date_fro
             text_clause = f"({' AND '.join(text_search_conditions)})"
 
         if vector_clause and text_clause:
-            # Hybrid: Return docs that match EITHER vector search OR text search
             where_clauses.append(f"({vector_clause} OR {text_clause})")
         elif vector_clause:
             where_clauses.append(vector_clause)
@@ -346,8 +346,6 @@ def fetch_documents_from_oracle(page=1, page_size=20, search_term=None, date_fro
 
     # --- Ordering Logic for Hybrid Search ---
     if vector_doc_ids and len(vector_doc_ids) > 0:
-        # Priority 1: Vector Matches (ordered by similarity rank)
-        # Priority 2: Keyword Matches (assigned a low rank like N+1)
         order_case_sql = " ".join([f"WHEN :vec_id_{i} THEN {i + 1}" for i in range(len(vector_doc_ids))])
         order_by_clause = f"ORDER BY CASE p.docnumber {order_case_sql} ELSE {len(vector_doc_ids) + 1} END ASC, p.RTADOCDATE DESC"
     elif memory_month is not None:
@@ -361,12 +359,13 @@ def fetch_documents_from_oracle(page=1, page_size=20, search_term=None, date_fro
             order_by_clause = "ORDER BY p.RTADOCDATE ASC, p.DOCNUMBER ASC"
 
     try:
-        with conn.cursor() as cursor:
+        async with conn.cursor() as cursor:
             # If scope is folders, we already know the total rows from the recursive fetch
             if scope != 'folders':
                 count_query = f"SELECT COUNT(p.DOCNUMBER) FROM PROFILE p {final_where_clause}"
-                cursor.execute(count_query, params)
-                total_rows = cursor.fetchone()[0]
+                await cursor.execute(count_query, params)
+                count_result = await cursor.fetchone()
+                total_rows = count_result[0]
 
             date_column = "p.RTADOCDATE"
             fetch_query = f"""
@@ -378,7 +377,7 @@ def fetch_documents_from_oracle(page=1, page_size=20, search_term=None, date_fro
             {order_by_clause}
             """
 
-            # Add offset/fetch logic only if NOT folder scope (since we already paginated IDs)
+            # Add offset/fetch logic only if NOT folder scope
             if scope != 'folders':
                 fetch_query += " OFFSET :offset ROWS FETCH NEXT :page_size ROWS ONLY"
                 params['offset'] = offset
@@ -386,13 +385,12 @@ def fetch_documents_from_oracle(page=1, page_size=20, search_term=None, date_fro
 
             params['db_user_id'] = db_user_id
 
-            cursor.execute(fetch_query, params)
-            rows = cursor.fetchall()
+            await cursor.execute(fetch_query, params)
+            rows = await cursor.fetchall()
 
             for row in rows:
                 doc_id, abstract, author, doc_date, docname, is_favorite = row
                 thumbnail_path = None
-                # Default, will update below
                 media_type = 'image'
 
                 final_abstract = abstract or ""
@@ -400,14 +398,15 @@ def fetch_documents_from_oracle(page=1, page_size=20, search_term=None, date_fro
                     final_abstract = ""
 
                 try:
-                    # Optimization: If scope=folders, we already resolved media type in WSDL, but DB check is fine
-                    original_filename, media_type, file_ext = get_media_info_from_dms(dst, doc_id)
+                    # Async call to resolve media type/filename
+                    original_filename, media_type, file_ext = await get_media_info_from_dms(dst, doc_id)
                     cached_thumbnail_file = f"{doc_id}.jpg"
                     cached_path = os.path.join(thumbnail_cache_dir, cached_thumbnail_file)
 
                     if os.path.exists(cached_path):
                         thumbnail_path = f"cache/{cached_thumbnail_file}"
                     else:
+                        # Sync call for content retrieval (WSDL)
                         media_bytes = get_media_content_from_dms(dst, doc_id)
                         if media_bytes:
                             thumbnail_path = create_thumbnail(doc_id, media_type, file_ext, media_bytes)
@@ -433,18 +432,16 @@ def fetch_documents_from_oracle(page=1, page_size=20, search_term=None, date_fro
         return [], 0
     finally:
         if conn:
-            try:
-                conn.close()
-            except oracledb.Error:
-                logging.error("Error closing DB connection.")
+            await conn.close()
     return documents, total_rows
 
-def get_documents_to_process():
+async def get_documents_to_process():
     """Gets a batch of documents that need AI processing."""
-    conn = get_connection()
-    if conn:
-        cursor = conn.cursor()
-        try:
+    conn = await get_async_connection()
+    if not conn: return []
+
+    try:
+        async with conn.cursor() as cursor:
             sql = """
             SELECT p.docnumber, p.abstract,
                    NVL(q.o_detected, 0) as o_detected,
@@ -459,26 +456,28 @@ def get_documents_to_process():
               AND (q.ATTEMPTS <= 3 OR q.ATTEMPTS IS NULL)
             FETCH FIRST 10 ROWS ONLY
             """
-            cursor.execute(sql, {'form_id': 2740})
+            await cursor.execute(sql, {'form_id': 2740})
             columns = [col[0].lower() for col in cursor.description]
-            return [dict(zip(columns, row)) for row in cursor.fetchall()]
-        finally:
-            conn.close()
-    return []
+            rows = await cursor.fetchall()
+            return [dict(zip(columns, row)) for row in rows]
+    finally:
+        if conn:
+            await conn.close()
 
-def update_document_processing_status(docnumber, new_abstract, o_detected, ocr, face, status, error, transcript,
-                                      attempts):
+async def update_document_processing_status(docnumber, new_abstract, o_detected, ocr, face, status, error, transcript,
+                                            attempts):
     """Updates the processing status of a document in the database with robust transaction handling."""
-    conn = get_connection()
+    conn = await get_async_connection()
     if not conn:
         logging.error(f"DB_UPDATE_FAILURE: Could not get a database connection for docnumber {docnumber}.")
         return
 
     try:
-        with conn.cursor() as cursor:
-            conn.begin()
+        async with conn.cursor() as cursor:
+            # Explicit transaction start not strictly needed with Python DB-API if auto-commit off, but okay.
+            # conn.begin() is available in oracledb but async/await context manager handles it usually.
 
-            cursor.execute("UPDATE PROFILE SET abstract = :1 WHERE docnumber = :2", (new_abstract, docnumber))
+            await cursor.execute("UPDATE PROFILE SET abstract = :1 WHERE docnumber = :2", (new_abstract, docnumber))
 
             merge_sql = """
             MERGE INTO TAGGING_QUEUE q
@@ -490,45 +489,40 @@ def update_document_processing_status(docnumber, new_abstract, o_detected, ocr, 
                 INSERT (SYSTEM_ID, docnumber, o_detected, OCR, face, status, error, transcript, attempts, LAST_UPDATE, DISABLED)
                 VALUES ((SELECT NVL(MAX(SYSTEM_ID), 0) + 1 FROM TAGGING_QUEUE), :docnumber, :o_detected, :ocr, :face, :status, :error, :transcript, :attempts, SYSDATE, 0)
             """
-            cursor.execute(merge_sql, {
+            await cursor.execute(merge_sql, {
                 'docnumber': docnumber, 'o_detected': o_detected, 'ocr': ocr, 'face': face,
                 'status': status, 'error': error, 'transcript': transcript, 'attempts': attempts
             })
 
-            conn.commit()
-            # logging.info(f"DB_UPDATE_SUCCESS: Successfully updated status for docnumber {docnumber}.")
+            await conn.commit()
 
-            # --- NEW: VECTOR INDEXING HOOK ---
-            if status == 3 and vector_client:  # If processing was successful
+            # --- VECTOR INDEXING HOOK (Blocking Call) ---
+            if status == 3 and vector_client:
                 logging.info(f"Queueing vector update for doc_id {docnumber}.")
                 try:
-                    # Run in a thread? For now, run inline.
                     vector_client.add_or_update_document(docnumber, new_abstract)
                 except Exception as e:
                     logging.error(f"Failed to update vector index for doc_id {docnumber}: {e}", exc_info=True)
-            # --- END: VECTOR INDEXING HOOK ---
 
     except oracledb.Error as e:
         logging.error(f"DB_UPDATE_ERROR: Oracle error while updating docnumber {docnumber}: {e}", exc_info=True)
         try:
-            conn.rollback()
-            # logging.info(f"DB_ROLLBACK: Transaction for docnumber {docnumber} was rolled back.")
+            await conn.rollback()
         except oracledb.Error as rb_e:
             logging.error(f"DB_ROLLBACK_ERROR: Failed to rollback transaction for docnumber {docnumber}: {rb_e}",
                           exc_info=True)
-
     finally:
         if conn:
-            conn.close()
+            await conn.close()
 
-def update_abstract_with_vips(doc_id, vip_names):
+async def update_abstract_with_vips(doc_id, vip_names):
     """Appends or updates VIP names in a document's abstract."""
-    conn = get_connection()
+    conn = await get_async_connection()
     if not conn: return False, "Could not connect to the database."
     try:
-        with conn.cursor() as cursor:
-            cursor.execute("SELECT ABSTRACT FROM PROFILE WHERE DOCNUMBER = :1", [doc_id])
-            result = cursor.fetchone()
+        async with conn.cursor() as cursor:
+            await cursor.execute("SELECT ABSTRACT FROM PROFILE WHERE DOCNUMBER = :1", [doc_id])
+            result = await cursor.fetchone()
             if result is None: return False, f"Document with ID {doc_id} not found."
 
             current_abstract = result[0] or ""
@@ -539,157 +533,124 @@ def update_abstract_with_vips(doc_id, vip_names):
 
             if names_str:
                 vips_section = f"VIPs: {names_str}"
-
                 new_abstract = base_abstract + ("\n\n" if base_abstract else "") + vips_section
             else:
                 new_abstract = base_abstract
 
-            cursor.execute("UPDATE PROFILE SET ABSTRACT = :1 WHERE DOCNUMBER = :2", [new_abstract, doc_id])
-            conn.commit()
+            await cursor.execute("UPDATE PROFILE SET ABSTRACT = :1 WHERE DOCNUMBER = :2", [new_abstract, doc_id])
+            await conn.commit()
 
-            # --- NEW: VECTOR INDEXING HOOK ---
+            # --- VECTOR INDEXING HOOK (Blocking Call) ---
             if vector_client:
                 try:
                     vector_client.add_or_update_document(doc_id, new_abstract)
                 except Exception as e:
                     logging.error(f"Failed to update vector index for doc_id {doc_id} after VIP update: {e}",
                                   exc_info=True)
-            # --- END: VECTOR INDEXING HOOK ---
 
             return True, "Abstract updated successfully."
     except oracledb.Error as e:
+        if conn: await conn.rollback()
         return False, f"Database error: {e}"
     finally:
         if conn:
-            conn.close()
+            await conn.close()
 
-def update_document_metadata(doc_id, new_abstract=None, new_date_taken=Ellipsis):
-    """
-    Updates metadata (abstract and/or RTADOCDATE) for a specific document number in the PROFILE table.
-    - If new_abstract is provided, updates the ABSTRACT column.
-    - If new_date_taken is provided (not Ellipsis), updates the RTADOCDATE column.
-      - If new_date_taken is None, sets RTADOCDATE to NULL.
-      - If new_date_taken is a datetime object, sets RTADOCDATE accordingly.
-    - Ellipsis for new_date_taken means "do not change the date".
-    """
-    conn = get_connection()
+async def update_document_metadata(doc_id, new_abstract=None, new_date_taken=Ellipsis):
+    """Updates metadata (abstract and/or RTADOCDATE) for a specific document number in the PROFILE table."""
+    conn = await get_async_connection()
     if not conn:
         return False, "Database connection failed."
 
     update_parts = []
     params = {}
-    abstract_to_index = None  # For vector indexing
+    abstract_to_index = None
 
-    # Build the SET part of the UPDATE statement dynamically
     if new_abstract is not None:
         update_parts.append("ABSTRACT = :abstract")
         params['abstract'] = new_abstract
-        abstract_to_index = new_abstract  # Store for indexing
+        abstract_to_index = new_abstract
     else:
-        abstract_to_index = None  # Will need to fetch it if only date changes
+        abstract_to_index = None
 
-    if new_date_taken is not Ellipsis:  # Check against Ellipsis to see if date update is requested
+    if new_date_taken is not Ellipsis:
         if new_date_taken is None:
             update_parts.append("RTADOCDATE = NULL")
-            # No parameter needed for NULL
         elif isinstance(new_date_taken, datetime):
-            # Oracle TO_DATE expects a string in the specified format
             update_parts.append("RTADOCDATE = TO_DATE(:date_taken, 'YYYY-MM-DD HH24:MI:SS')")
             params['date_taken'] = new_date_taken.strftime('%Y-%m-%d %H:%M:%S')
         else:
-            # This case should ideally be caught by the API layer parsing
             logging.error(f"Invalid type for new_date_taken for doc_id {doc_id}: {type(new_date_taken)}")
+            if conn: await conn.close()
             return False, "Invalid date format received by database function."
 
-    # Check if there's anything to update
     if not update_parts:
+        if conn: await conn.close()
         return False, "No valid fields provided for update."
 
-    # Finalize SQL statement
     sql = f"UPDATE PROFILE SET {', '.join(update_parts)} WHERE DOCNUMBER = :doc_id"
     params['doc_id'] = doc_id
 
-    logging.debug(f"Executing metadata update SQL: {sql}")
-    logging.debug(f"With params: {params}")
-
     try:
-        with conn.cursor() as cursor:
+        async with conn.cursor() as cursor:
             # Check if document exists first
-            cursor.execute("SELECT 1 FROM PROFILE WHERE DOCNUMBER = :1", [doc_id])
-            if cursor.fetchone() is None:
+            await cursor.execute("SELECT 1 FROM PROFILE WHERE DOCNUMBER = :1", [doc_id])
+            if await cursor.fetchone() is None:
                 return False, f"Document with ID {doc_id} not found."
 
-            # --- MODIFICATION ---
-            # If abstract isn't being updated, but we need it for re-indexing
             if abstract_to_index is None and new_abstract is None:
-                cursor.execute("SELECT ABSTRACT FROM PROFILE WHERE DOCNUMBER = :1", [doc_id])
-                result = cursor.fetchone()
+                await cursor.execute("SELECT ABSTRACT FROM PROFILE WHERE DOCNUMBER = :1", [doc_id])
+                result = await cursor.fetchone()
                 if result:
                     abstract_to_index = result[0]
-            # --- END MODIFICATION ---
 
-            # Perform the update
-            cursor.execute(sql, params)
+            await cursor.execute(sql, params)
 
-            # Check if any row was updated
             if cursor.rowcount == 0:
-                conn.rollback()  # Rollback if no rows affected
-                # This could happen if the doc_id exists but the update didn't change anything (e.g., same abstract/date)
-                # Or potentially a race condition. Treat as failure for clarity.
+                await conn.rollback()
                 return False, f"Update affected 0 rows for Document ID {doc_id}. Check if data actually changed."
 
-            conn.commit()
+            await conn.commit()
 
-            # --- NEW: VECTOR INDEXING HOOK ---
-            # Only re-index if the abstract was actually changed
+            # --- VECTOR INDEXING HOOK (Blocking Call) ---
             if new_abstract is not None and vector_client:
                 try:
                     vector_client.add_or_update_document(doc_id, abstract_to_index)
                 except Exception as e:
                     logging.error(f"Failed to update vector index for doc_id {doc_id} after metadata update: {e}",
                                   exc_info=True)
-            # --- END: VECTOR INDEXING HOOK ---
 
             return True, "Metadata updated successfully."
 
     except oracledb.Error as e:
-        error_obj, = e.args
-        logging.error(f"Oracle error updating metadata for doc_id {doc_id}: {error_obj.message}", exc_info=True)
-        try:
-            conn.rollback()
-        except oracledb.Error:
-            logging.error(f"Failed to rollback metadata update transaction for doc_id {doc_id}.")
-        return False, f"Database error occurred: {error_obj.message}"
+        logging.error(f"Oracle error updating metadata for doc_id {doc_id}: {e}", exc_info=True)
+        if conn: await conn.rollback()
+        return False, f"Database error occurred: {e}"
     except Exception as e:
         logging.error(f"Unexpected error updating metadata for doc_id {doc_id}: {e}", exc_info=True)
-        try:
-            conn.rollback()
-        except Exception:
-            pass  # Ignore rollback error if main operation failed unexpectedly
+        if conn:
+            try:
+                await conn.rollback()
+            except:
+                pass
         return False, "An unexpected server error occurred."
     finally:
         if conn:
-            try:
-                conn.close()
-            except oracledb.Error:
-                logging.error(f"Error closing DB connection after metadata update for doc_id {doc_id}.")
+            await conn.close()
 
-def get_specific_documents_for_processing(docnumbers):
+async def get_specific_documents_for_processing(docnumbers):
     """Gets details for a specific list of docnumbers that need AI processing."""
     if not docnumbers:
         return []
 
-    conn = get_connection()
+    conn = await get_async_connection()
     if not conn:
         logging.error("Failed to get DB connection in get_specific_documents_for_processing.")
         return []
 
     try:
-        with conn.cursor() as cursor:
-            # Ensure docnumbers are integers for binding
+        async with conn.cursor() as cursor:
             int_docnumbers = [int(d) for d in docnumbers]
-
-            # Create placeholders for the IN clause
             placeholders = ','.join([f':{i + 1}' for i in range(len(int_docnumbers))])
 
             sql = f"""
@@ -702,41 +663,33 @@ def get_specific_documents_for_processing(docnumbers):
             LEFT JOIN TAGGING_QUEUE q ON p.docnumber = q.docnumber
             WHERE p.docnumber IN ({placeholders})
             """
-            cursor.execute(sql, int_docnumbers)
+            await cursor.execute(sql, int_docnumbers)
             columns = [col[0].lower() for col in cursor.description]
-            return [dict(zip(columns, row)) for row in cursor.fetchall()]
-    except (oracledb.Error, ValueError) as e:  # Catch potential int conversion error
+            rows = await cursor.fetchall()
+            return [dict(zip(columns, row)) for row in rows]
+    except (oracledb.Error, ValueError) as e:
         logging.error(f"Error in get_specific_documents_for_processing: {e}", exc_info=True)
         return []
     finally:
         if conn:
-            conn.close()
+            await conn.close()
 
-def check_processing_status(docnumbers):
-    """
-    Checks the TAGGING_QUEUE for a list of docnumbers and returns those
-    that are not yet successfully processed (status != 3).
-    """
+async def check_processing_status(docnumbers):
+    """Checks the TAGGING_QUEUE for a list of docnumbers and returns those not yet processed."""
     if not docnumbers:
         return []
 
-    conn = get_connection()
+    conn = await get_async_connection()
     if not conn:
         logging.error("Failed to get DB connection in check_processing_status.")
-        return docnumbers  # Assume still processing if DB is down
+        return docnumbers
 
     try:
-        # Ensure docnumbers are integers
         int_docnumbers = [int(d) for d in docnumbers]
-        with conn.cursor() as cursor:
-            # Using bind variables is generally safer and more performant
+        async with conn.cursor() as cursor:
             bind_names = [f':doc_{i}' for i in range(len(int_docnumbers))]
             bind_vars = {f'doc_{i}': val for i, val in enumerate(int_docnumbers)}
 
-            # Construct the SQL using bind names
-            # Using SYS.ODCINUMBERLIST or similar collection type for IN clause binding
-            # NOTE: For very large lists, consider alternative approaches like temporary tables
-            # if performance becomes an issue. SYS.ODCINUMBERLIST is generally fine for moderate lists.
             sql = f"""
             SELECT COLUMN_VALUE
             FROM TABLE(SYS.ODCINUMBERLIST({','.join(bind_names)})) input_docs
@@ -745,20 +698,12 @@ def check_processing_status(docnumbers):
             )
             """
 
-            # Execute with the original bind_vars dictionary.
-            # The driver handles using the same bind names multiple times.
-            cursor.execute(sql, bind_vars)
-
-            still_processing = [row[0] for row in cursor.fetchall()]
-            return still_processing
+            await cursor.execute(sql, bind_vars)
+            rows = await cursor.fetchall()
+            return [row[0] for row in rows]
     except (oracledb.Error, ValueError) as e:
-        # Log the specific Oracle error or ValueError (from int conversion)
-        error_message = f"Error in check_processing_status: {e}"
-        if isinstance(e, oracledb.Error):
-            error_obj, = e.args
-            error_message = f"Oracle Error in check_processing_status: {error_obj.message} (Code: {error_obj.code})"
-        logging.error(error_message, exc_info=True)
-        return docnumbers  # Return original list on error to be safe
+        logging.error(f"Error in check_processing_status: {e}", exc_info=True)
+        return docnumbers
     finally:
         if conn:
-            conn.close()
+            await conn.close()

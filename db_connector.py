@@ -1,4 +1,4 @@
-from database.connection import get_connection, BLOCKLIST
+from database.connection import get_async_connection, get_connection, BLOCKLIST
 from database.media import (
     dms_system_login, get_media_info_from_dms, get_media_content_from_dms,
     get_dms_stream_details, stream_and_cache_generator, create_thumbnail,

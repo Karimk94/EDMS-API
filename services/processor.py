@@ -6,8 +6,7 @@ import db_connector
 import wsdl_client
 from utils.common import clean_repeated_words
 
-
-def process_document(doc, dms_session_token):
+async def process_document(doc, dms_session_token):
     docnumber = doc['docnumber']
     logging.info(f"Starting processing for document: {docnumber}")
     original_abstract = doc.get('abstract') or ''
@@ -25,10 +24,13 @@ def process_document(doc, dms_session_token):
         "attempts": doc.get('attempts', 0) + 1
     }
     try:
+        # get_image_by_docnumber is still sync in wsdl_client because it doesn't hit DB
         media_bytes, filename = wsdl_client.get_image_by_docnumber(dms_session_token, docnumber)
         if not media_bytes:
             raise Exception(f"Failed to retrieve media for docnumber {docnumber} from WSDL service.")
-        _, media_type, _ = db_connector.get_media_info_from_dms(dms_session_token, docnumber)
+
+        # This one IS async in db_connector now
+        _, media_type, _ = await db_connector.get_media_info_from_dms(dms_session_token, docnumber)
         logging.info(f"Media for {docnumber} ({filename}) fetched successfully. Type: {media_type}")
 
         if media_type == 'video':
@@ -88,7 +90,8 @@ def process_document(doc, dms_session_token):
             else:
                 results['ocr'] = 1
             if keywords_to_insert:
-                db_connector.insert_keywords_and_tags(docnumber, keywords_to_insert)
+                # ASYNC DB CALL
+                await db_connector.insert_keywords_and_tags(docnumber, keywords_to_insert)
             if caption_parts:
                 ai_abstract_parts['CAPTION'] = ", ".join(sorted(list(set(caption_parts))))
 
@@ -116,7 +119,8 @@ def process_document(doc, dms_session_token):
             else:
                 results['ocr'] = 1
             if keywords_to_insert:
-                db_connector.insert_keywords_and_tags(docnumber, keywords_to_insert)
+                # ASYNC DB CALL
+                await db_connector.insert_keywords_and_tags(docnumber, keywords_to_insert)
             results['o_detected'] = 1
             results['face'] = 1
             if caption_parts:
@@ -152,7 +156,8 @@ def process_document(doc, dms_session_token):
             else:
                 results['face'] = 0
             if keywords_to_insert:
-                db_connector.insert_keywords_and_tags(docnumber, keywords_to_insert)
+                # ASYNC DB CALL
+                await db_connector.insert_keywords_and_tags(docnumber, keywords_to_insert)
 
         final_abstract_parts = [base_abstract]
         if ai_abstract_parts.get('CAPTION'): final_abstract_parts.append(f"Caption: {ai_abstract_parts['CAPTION']} ")

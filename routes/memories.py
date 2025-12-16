@@ -5,9 +5,8 @@ import db_connector
 
 router = APIRouter()
 
-
 @router.get('/api/memories')
-def api_get_memories(
+async def api_get_memories(
         month: Optional[str] = None,
         day: Optional[str] = None,
         limit: str = '5'
@@ -27,7 +26,7 @@ def api_get_memories(
         if parsed_day is not None and not 1 <= parsed_day <= 31:
             raise HTTPException(status_code=400, detail="Invalid day.")
 
-        memories = db_connector.fetch_memories_from_oracle(
+        memories = await db_connector.fetch_memories_from_oracle(
             month=parsed_month, day=parsed_day, limit=limit_val
         )
         return {"memories": memories}

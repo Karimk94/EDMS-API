@@ -1,23 +1,12 @@
 from fastapi import APIRouter, Request, HTTPException, Header
-from pydantic import BaseModel
 from typing import Optional
 import wsdl_client
+from schemas.folders import CreateFolderRequest, RenameFolderRequest
 
 router = APIRouter()
 
-
-class CreateFolderRequest(BaseModel):
-    name: str
-    description: Optional[str] = ""
-    parent_id: Optional[str] = None
-
-
-class RenameFolderRequest(BaseModel):
-    name: str
-
-
 @router.get('/api/folders')
-def api_list_folders(
+async def api_list_folders(
         request: Request,
         x_app_source: str = Header("unknown", alias="X-App-Source"),
         scope: Optional[str] = None,
@@ -36,16 +25,16 @@ def api_list_folders(
         raise HTTPException(status_code=500, detail="Failed to authenticate with DMS")
 
     try:
-        contents = wsdl_client.list_folder_contents(
+        # Await the async WSDL/DB call
+        contents = await wsdl_client.list_folder_contents(
             dst, parent_id, x_app_source, scope=scope, media_type=media_type, search_term=search
         )
         return {"contents": contents}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-
 @router.post('/api/folders')
-def api_create_folder(request: Request, data: CreateFolderRequest):
+async def api_create_folder(request: Request, data: CreateFolderRequest):
     if 'user' not in request.session:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
@@ -60,6 +49,7 @@ def api_create_folder(request: Request, data: CreateFolderRequest):
         raise HTTPException(status_code=500, detail="Failed to authenticate")
 
     try:
+        # wsdl_client.create_dms_folder is synchronous (SOAP only), so no await needed
         new_folder_id = wsdl_client.create_dms_folder(
             dst=dst,
             folder_name=data.name,
@@ -74,9 +64,8 @@ def api_create_folder(request: Request, data: CreateFolderRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-
 @router.put('/api/folders/{folder_id}')
-def api_rename_folder(folder_id: str, request: Request, data: RenameFolderRequest):
+async def api_rename_folder(folder_id: str, request: Request, data: RenameFolderRequest):
     if 'user' not in request.session:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
@@ -84,24 +73,12 @@ def api_rename_folder(folder_id: str, request: Request, data: RenameFolderReques
     if not dst:
         raise HTTPException(status_code=500, detail="Failed to authenticate")
 
-    success = wsdl_client.rename_document(dst, folder_id, data.name)
-    if success:
-        return {"message": "Renamed", "id": folder_id}
-    else:
-        raise HTTPException(status_code=500, detail="Failed to rename")
-
-
-@router.delete('/api/folders/{folder_id}')
-def api_delete_folder(folder_id: str, request: Request, force: bool = False):
-    if 'user' not in request.session:
-        raise HTTPException(status_code=401, detail="Unauthorized")
-
-    dst = wsdl_client.dms_system_login()
-    if not dst:
-        raise HTTPException(status_code=500, detail="Failed to authenticate")
-
-    success, message = wsdl_client.delete_document(dst, folder_id, force=force)
-    if success:
-        return {"message": "Deleted", "id": folder_id}
-    else:
-        raise HTTPException(status_code=500, detail=message)
+    try:
+        # Assuming sync SOAP call
+        success = wsdl_client.rename_document(dst, folder_id, data.name)
+        if success:
+            return {"message": "Renamed", "id": folder_id}
+        else:
+            raise HTTPException(status_code=500, detail="Failed to rename")
+    except AttributeError:
+         raise HTTPException(status_code=500, detail="Rename function not implemented in WSDL client")

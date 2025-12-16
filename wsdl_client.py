@@ -12,7 +12,6 @@ WSDL_URL = os.getenv("WSDL_URL")
 DMS_USER = os.getenv("DMS_USER")
 DMS_PASSWORD = os.getenv("DMS_PASSWORD")
 
-# --- CONSTANTS ---
 SMART_EDMS_ROOT_ID = '19685837'
 
 def get_soap_client(service_name=None):
@@ -55,8 +54,7 @@ def dms_system_login():
         if response and response.resultCode == 0 and response.DSTOut:
             return response.DSTOut
         return None
-    except Exception as e:
-        # logging.info(f"Login failed: {e}")
+    except Exception:
         return None
 
 def get_doc_version_info(dst, doc_number):
@@ -129,39 +127,26 @@ def create_dms_folder(dst, folder_name, description="", parent_id=None, user_id=
 
         return new_id
     except Exception as e:
-        # logging.info(f"Create folder failed: {e}")
         return None
 
 def parse_binary_result_buffer(buffer):
-    """
-    Parses the raw text buffer from DMS to extract folder/file items.
-    Handles zlib compression.
-    Identifies type based on APP_ID (e.g. ACROBAT, MSWORD) mapping and extensions.
-    """
     items = []
     try:
-        # --- Step 1: Handle Decompression ---
         try:
             if len(buffer) > 8 and buffer[8:10] == b'\x78\x9c':
                 decompressed = zlib.decompress(buffer[8:])
                 buffer = decompressed
-        except Exception as e:
+        except Exception:
             pass
 
-        # --- Step 2: Decode Text ---
         try:
             raw_text = buffer.decode('utf-16-le', errors='ignore')
         except:
             raw_text = buffer.decode('utf-8', errors='ignore')
 
-        # Clean text but keep dots for extensions
         clean_text = re.sub(r'[^\w\s\-\.]', ' ', raw_text)
         tokens = clean_text.split()
-
-        # Known Folder Applications
         FOLDER_APPS = {'FOLDER', 'DEF_PROF', 'SAVED_SEARCHES', 'CONTENTSCOLLECTION'}
-
-        # Extensions Map
         EXT_MAP = {
             'pdf': 'pdf', 'doc': 'pdf', 'docx': 'pdf', 'txt': 'pdf', 'xls': 'pdf', 'xlsx': 'pdf', 'ppt': 'pdf',
             'pptx': 'pdf',
@@ -174,91 +159,56 @@ def parse_binary_result_buffer(buffer):
         i = 0
         while i < len(tokens):
             token = tokens[i]
-
-            # Check if token is likely a Doc ID (numeric, 5+ digits)
             if token.isdigit() and len(token) >= 5:
-                # Look ahead until the NEXT ID
                 if i + 1 < len(tokens):
                     chunk_tokens = []
                     j = i + 1
-
-                    # Consume until next ID
                     while j < len(tokens):
                         next_token = tokens[j]
-                        if next_token.isdigit() and len(next_token) >= 5:
-                            break
+                        if next_token.isdigit() and len(next_token) >= 5: break
                         chunk_tokens.append(next_token)
                         j += 1
-
-                    # Advance main loop
                     i = j - 1
 
                     if chunk_tokens:
-                        item_type = 'folder'  # Default to folder if nothing matches
+                        item_type = 'folder'
                         media_type = 'folder'
-                        name_parts = []
                         is_folder = False
-
-                        # --- 1. Strict Folder Check ---
-                        # Check for 'F' at end
                         if chunk_tokens[-1] == 'F' or (len(chunk_tokens) > 1 and chunk_tokens[-2] == 'F'):
                             is_folder = True
                         else:
-                            # Check for folder keywords in tokens
                             for t in chunk_tokens:
                                 if t.upper() in FOLDER_APPS:
                                     is_folder = True
                                     break
-
-                        # --- 2. File Type Detection ---
                         if not is_folder:
                             item_type = 'file'
-                            media_type = 'resolve'  # Default to resolve if unknown
-
-                            # Check for extension in name tokens
+                            media_type = 'resolve'
                             for t in chunk_tokens:
                                 if '.' in t:
                                     ext = t.split('.')[-1].lower()
                                     if ext in EXT_MAP:
                                         media_type = EXT_MAP[ext]
                                         break
-
-                        # --- CLEANUP NAME ---
                         name_parts = []
                         for t in chunk_tokens:
                             if t not in ['N', 'D', 'F'] and t.upper() not in FOLDER_APPS:
                                 name_parts.append(t)
-
                         full_name = " ".join(name_parts).strip()
-
                         if len(full_name) > 0:
                             items.append({
-                                'id': token,
-                                'name': full_name,
-                                'type': item_type,
-                                'media_type': media_type,
-                                'node_type': 'F' if is_folder else 'N',
-                                'is_standard': False
+                                'id': token, 'name': full_name, 'type': item_type,
+                                'media_type': media_type, 'node_type': 'F' if is_folder else 'N', 'is_standard': False
                             })
             i += 1
-    except Exception as e:
-        # logging.info(f"Error parsing binary buffer: {e}")
+    except Exception:
         pass
     return items
 
-def get_recursive_doc_ids(dst, media_type_filter=None, search_term=None, start_node=None):
-    """
-    Recursively scans from the start_node (default ROOT) and returns a list of items
-    that match the given media_type and/or search_term.
-    """
+async def get_recursive_doc_ids(dst, media_type_filter=None, search_term=None, start_node=None):
     import db_connector
-
     root_node = start_node if start_node else SMART_EDMS_ROOT_ID
-    logging.info(
-        f"DEBUG: Starting recursive scan. Root: {root_node}, Filter: {media_type_filter}, Search: {search_term}")
-
     matching_docs = []
-
     folder_queue = [root_node]
     processed_folders = set()
     MAX_FOLDERS_TO_SCAN = 100
@@ -267,46 +217,30 @@ def get_recursive_doc_ids(dst, media_type_filter=None, search_term=None, start_n
     data_client = find_client_with_operation('GetDataW') or find_client_with_operation('GetData')
     method_name = 'GetDataW' if hasattr(data_client.service, 'GetDataW') else 'GetData'
 
-    if not data_client:
-        logging.info("DEBUG: Data client not found.")
-        return []
+    if not data_client: return []
 
     try:
         while folder_queue:
-            if len(processed_folders) >= MAX_FOLDERS_TO_SCAN:
-                logging.info(f"DEBUG: Recursion limit reached ({MAX_FOLDERS_TO_SCAN}).")
-                break
-
+            if len(processed_folders) >= MAX_FOLDERS_TO_SCAN: break
             current_folder_id = folder_queue.pop(0)
-            if current_folder_id in processed_folders:
-                continue
+            if current_folder_id in processed_folders: continue
             processed_folders.add(current_folder_id)
 
             search_call = {
-                'call': {
-                    'dstIn': dst,
-                    'objectType': 'ContentsCollection',
-                    'signature': {
-                        'libraries': {'string': ['RTA_MAIN']},
-                        'criteria': {
-                            'criteriaCount': 1,
-                            'criteriaNames': {'string': ['%ITEM']},
-                            'criteriaValues': {'string': [str(current_folder_id)]}
-                        },
-                        'retProperties': {
-                            'string': ['FI.DOCNUMBER', '%DISPLAY_NAME', 'FI.NODE_TYPE', 'DOCNAME', 'APPLICATION',
-                                       'APP_ID', 'DOSEXTENSION']},
-                        'sortProps': {'propertyCount': 1, 'propertyNames': {'string': ['%DISPLAY_NAME']},
-                                      'propertyFlags': {'int': [1]}},
-                        'maxRows': 0
-                    }
-                }
+                'call': {'dstIn': dst, 'objectType': 'ContentsCollection',
+                         'signature': {'libraries': {'string': ['RTA_MAIN']},
+                                       'criteria': {'criteriaCount': 1, 'criteriaNames': {'string': ['%ITEM']},
+                                                    'criteriaValues': {'string': [str(current_folder_id)]}},
+                                       'retProperties': {
+                                           'string': ['FI.DOCNUMBER', '%DISPLAY_NAME', 'FI.NODE_TYPE', 'DOCNAME',
+                                                      'APPLICATION', 'APP_ID', 'DOSEXTENSION']},
+                                       'sortProps': {'propertyCount': 1,
+                                                     'propertyNames': {'string': ['%DISPLAY_NAME']},
+                                                     'propertyFlags': {'int': [1]}},
+                                       'maxRows': 0}}
             }
-
             search_reply = search_client.service.Search(**search_call)
-
-            if not (search_reply and search_reply.resultCode == 0 and search_reply.resultSetID):
-                continue
+            if not (search_reply and search_reply.resultCode == 0 and search_reply.resultSetID): continue
 
             result_set_id = search_reply.resultSetID
             chunk_size = 500
@@ -316,11 +250,9 @@ def get_recursive_doc_ids(dst, media_type_filter=None, search_term=None, start_n
                 get_data_call = {
                     'call': {'resultSetID': result_set_id, 'requestedRows': chunk_size, 'startingRow': start_row}}
                 data_reply = getattr(data_client.service, method_name)(**get_data_call)
-
                 items_batch = []
                 has_data = False
 
-                # 1. XML Logic
                 row_nodes = None
                 if hasattr(data_reply, 'rowNode'):
                     row_nodes = data_reply.rowNode
@@ -337,11 +269,8 @@ def get_recursive_doc_ids(dst, media_type_filter=None, search_term=None, start_n
                             doc_id = props[0]
                             name = props[1] if len(props) > 1 else str(doc_id)
                             node_type = props[2] if len(props) > 2 else 'N'
-
                             is_folder = (node_type == 'F')
                             media_type = 'folder' if is_folder else 'resolve'
-
-                            # Simple heuristic for common types based on DOSEXTENSION (index 6)
                             if not is_folder and len(props) > 6 and props[6]:
                                 dos_ext = str(props[6]).lower().replace('.', '').strip()
                                 if dos_ext in ['jpg', 'jpeg', 'png', 'gif', 'bmp']:
@@ -350,17 +279,11 @@ def get_recursive_doc_ids(dst, media_type_filter=None, search_term=None, start_n
                                     media_type = 'video'
                                 elif dos_ext in ['pdf', 'doc', 'docx']:
                                     media_type = 'pdf'
-
-                            items_batch.append({
-                                'id': str(doc_id),
-                                'name': name,
-                                'media_type': media_type,
-                                'type': 'folder' if is_folder else 'file'
-                            })
+                            items_batch.append({'id': str(doc_id), 'name': name, 'media_type': media_type,
+                                                'type': 'folder' if is_folder else 'file'})
                         except Exception:
                             pass
 
-                # 2. Binary Fallback
                 if not items_batch and hasattr(data_reply, 'resultSetData') and data_reply.resultSetData:
                     container = data_reply.resultSetData
                     if hasattr(container, 'resultBuffer') and container.resultBuffer:
@@ -369,77 +292,51 @@ def get_recursive_doc_ids(dst, media_type_filter=None, search_term=None, start_n
                             has_data = True
                             items_batch.extend(parsed)
 
-                if not has_data or not items_batch:
-                    break
+                if not has_data or not items_batch: break
 
                 ids_to_resolve = []
-
                 for item in items_batch:
-                    # Logic: If it's a folder, traverse it
                     if item.get('type') == 'folder' or item.get('media_type') == 'folder':
                         if item['id'] not in processed_folders and item['id'] not in folder_queue:
                             folder_queue.append(item['id'])
-
-                        # If searching, folders themselves can be matches
                         if search_term and search_term.lower() in item['name'].lower():
-                            # Ensure thumbnail exists for consistency
                             item['thumbnail_url'] = f"cache/{item['id']}.jpg"
                             matching_docs.append(item)
                         continue
 
-                    # --- File Matching Logic ---
                     is_match = True
-
-                    # 1. Search Term Filter
-                    if search_term:
-                        if search_term.lower() not in item['name'].lower():
-                            is_match = False
-
-                    # 2. Media Type Filter (only if searching passes or no search)
+                    if search_term and search_term.lower() not in item['name'].lower(): is_match = False
                     if is_match and media_type_filter:
                         m_type = item.get('media_type')
                         if m_type == 'resolve':
-                            # Defer check to DB resolution
                             ids_to_resolve.append(item)
-                            is_match = False  # Will be re-evaluated below
+                            is_match = False
                         elif m_type != media_type_filter:
                             is_match = False
 
                     if is_match:
-                        if 'thumbnail_url' not in item:
-                            item['thumbnail_url'] = f"cache/{item['id']}.jpg"
+                        if 'thumbnail_url' not in item: item['thumbnail_url'] = f"cache/{item['id']}.jpg"
                         matching_docs.append(item)
 
-                # Resolve deferred items
                 if ids_to_resolve:
                     try:
                         resolve_ids_only = [x['id'] for x in ids_to_resolve]
-                        resolved_map = db_connector.resolve_media_types_from_db(resolve_ids_only)
-
+                        resolved_map = await db_connector.resolve_media_types_from_db(resolve_ids_only)
                         for resolve_item in ids_to_resolve:
                             doc_id = resolve_item['id']
-                            r_type = resolved_map.get(doc_id, 'pdf')  # Default to pdf
-
-                            # Determine if this resolved item matches the media filter
+                            r_type = resolved_map.get(doc_id, 'pdf')
                             media_match = True
-                            if media_type_filter and r_type != media_type_filter:
-                                media_match = False
-
-                            # Note: Search term was already checked implicitly before adding to ids_to_resolve?
-                            # Actually no, we added to ids_to_resolve if m_type == 'resolve'.
-                            # So we must re-check search term here if present.
+                            if media_type_filter and r_type != media_type_filter: media_match = False
                             search_match = True
-                            if search_term and search_term.lower() not in resolve_item['name'].lower():
-                                search_match = False
-
+                            if search_term and search_term.lower() not in resolve_item[
+                                'name'].lower(): search_match = False
                             if media_match and search_match:
                                 resolve_item['media_type'] = r_type
-                                if 'thumbnail_url' not in resolve_item:
-                                    resolve_item['thumbnail_url'] = f"cache/{doc_id}.jpg"
+                                if 'thumbnail_url' not in resolve_item: resolve_item[
+                                    'thumbnail_url'] = f"cache/{doc_id}.jpg"
                                 matching_docs.append(resolve_item)
-
-                    except Exception as e:
-                        logging.info(f"DEBUG: DB resolve error: {e}")
+                    except Exception:
+                        pass
 
                 start_row += chunk_size
                 if start_row > 2000: break
@@ -449,119 +346,75 @@ def get_recursive_doc_ids(dst, media_type_filter=None, search_term=None, start_n
                 search_client.service.ReleaseObject(call={'objectID': result_set_id})
             except:
                 pass
-
-    except Exception as e:
-        logging.info(f"DEBUG: Recursive scan error: {e}")
-
-    logging.info(f"DEBUG: Scan complete. Found {len(matching_docs)} items.")
+    except Exception:
+        pass
     return matching_docs
 
-def list_folder_contents(dst, parent_id=None, app_source=None, scope=None, media_type=None, search_term=None):
-    """
-    Lists contents of a folder.
-    If scope='folders' and media_type is provided (Standard Folders), it recurses.
-    If search_term is provided, it recurses from the current node.
-    """
+async def list_folder_contents(dst, parent_id=None, app_source=None, scope=None, media_type=None, search_term=None):
     import db_connector
-
     items = []
-
-    # --- Robust Media Type Detection for Standard Folders ---
     if parent_id == 'images':
-        media_type = 'image'
+        media_type = 'image';
         scope = 'folders'
     elif parent_id == 'videos':
-        media_type = 'video'
+        media_type = 'video';
         scope = 'folders'
     elif parent_id == 'files':
-        media_type = 'pdf'
+        media_type = 'pdf';
         scope = 'folders'
 
-    # Determine valid numeric target_id
     target_id = parent_id
     if not target_id or str(target_id).strip() == "" or str(target_id).lower() == "null" or target_id in ['images',
                                                                                                           'videos',
                                                                                                           'files']:
         target_id = SMART_EDMS_ROOT_ID
 
-    # print(f"DEBUG: list_folder_contents. Parent: {parent_id} -> {target_id}, Scope: {scope}, Media: {media_type}, Search: {search_term}")
-
-    # --- 1. Recursive Fetch (Standard Folders OR Search) ---
-    # We use recursive fetch if:
-    # A) We are in a 'folders' scope (e.g. clicked 'Images' library)
-    # B) We are performing a search (traverse subfolders)
     if (scope == 'folders' and media_type) or search_term:
-        # If searching inside a standard folder (e.g. search "foo" inside "Images"), use root as start_node
-        # but keep media_type filter.
-        # If searching inside a normal folder, use that folder ID as start_node.
-
         start_node = target_id
-
-        return get_recursive_doc_ids(dst, media_type_filter=media_type, search_term=search_term, start_node=start_node)
-
-    # -------------------------------------------------------
-    # --- 2. Standard (Non-Recursive, Immediate Children) Logic ---
+        return await get_recursive_doc_ids(dst, media_type_filter=media_type, search_term=search_term,
+                                           start_node=start_node)
 
     is_root_view = (target_id == SMART_EDMS_ROOT_ID)
-
-    # Add Standard Library Folders (Root Only)
     if is_root_view and not media_type and not search_term:
         try:
-            counts = db_connector.get_media_type_counts(app_source, scope=scope)
+            # AWAIT HERE
+            counts = await db_connector.get_media_type_counts(app_source, scope=scope)
 
             def get_cnt(k):
                 return counts.get(k, 0) if counts else 0
 
-            items.append(
-                {'id': 'images', 'name': 'Images', 'type': 'folder', 'is_standard': True, 'count': get_cnt('images')})
-            items.append(
-                {'id': 'videos', 'name': 'Videos', 'type': 'folder', 'is_standard': True, 'count': get_cnt('videos')})
+            items.append({'id': 'images', 'name': 'Images', 'type': 'folder', 'is_standard': True,
+                          'count': get_cnt('images')})
+            items.append({'id': 'videos', 'name': 'Videos', 'type': 'folder', 'is_standard': True,
+                          'count': get_cnt('videos')})
             items.append(
                 {'id': 'files', 'name': 'Files', 'type': 'folder', 'is_standard': True, 'count': get_cnt('files')})
         except Exception:
             pass
 
-    # Fetch Immediate Children via DMS
     try:
         search_client = get_soap_client('BasicHttpBinding_IDMSvc')
-
-        search_call = {
-            'call': {
-                'dstIn': dst,
-                'objectType': 'ContentsCollection',
-                'signature': {
-                    'libraries': {'string': ['RTA_MAIN']},
-                    'criteria': {
-                        'criteriaCount': 1,
-                        'criteriaNames': {'string': ['%ITEM']},
-                        'criteriaValues': {'string': [str(target_id)]}
-                    },
-                    'retProperties': {
-                        'string': ['FI.DOCNUMBER', '%DISPLAY_NAME', 'FI.NODE_TYPE', 'DOCNAME', 'APPLICATION',
-                                   'APP_ID', 'DOSEXTENSION']},
-                    'sortProps': {'propertyCount': 1, 'propertyNames': {'string': ['%DISPLAY_NAME']},
-                                  'propertyFlags': {'int': [1]}},
-                    'maxRows': 0
-                }
-            }
-        }
-
+        search_call = {'call': {'dstIn': dst, 'objectType': 'ContentsCollection',
+                                'signature': {'libraries': {'string': ['RTA_MAIN']},
+                                              'criteria': {'criteriaCount': 1, 'criteriaNames': {'string': ['%ITEM']},
+                                                           'criteriaValues': {'string': [str(target_id)]}},
+                                              'retProperties': {
+                                                  'string': ['FI.DOCNUMBER', '%DISPLAY_NAME', 'FI.NODE_TYPE', 'DOCNAME',
+                                                             'APPLICATION', 'APP_ID', 'DOSEXTENSION']},
+                                              'sortProps': {'propertyCount': 1,
+                                                            'propertyNames': {'string': ['%DISPLAY_NAME']},
+                                                            'propertyFlags': {'int': [1]}}, 'maxRows': 0}}}
         search_reply = search_client.service.Search(**search_call)
-
-        if not (search_reply and search_reply.resultCode == 0 and search_reply.resultSetID):
-            return items
+        if not (search_reply and search_reply.resultCode == 0 and search_reply.resultSetID): return items
 
         result_set_id = search_reply.resultSetID
         data_client = find_client_with_operation('GetDataW') or find_client_with_operation('GetData')
         method_name = 'GetDataW' if hasattr(data_client.service, 'GetDataW') else 'GetData'
-
-        if not data_client:
-            return items
+        if not data_client: return items
 
         get_data_call = {'call': {'resultSetID': result_set_id, 'requestedRows': 500, 'startingRow': 0}}
         data_reply = getattr(data_client.service, method_name)(**get_data_call)
 
-        # --- PARSING LOGIC ---
         if hasattr(data_reply, 'resultSetData') and data_reply.resultSetData:
             container = data_reply.resultSetData
             if hasattr(container, 'resultBuffer') and container.resultBuffer:
@@ -582,7 +435,6 @@ def list_folder_contents(dst, parent_id=None, app_source=None, scope=None, media
                 row_nodes = data_reply.RowNode
             elif isinstance(data_reply, dict):
                 row_nodes = data_reply.get('rowNode') or data_reply.get('RowNode')
-
             if row_nodes:
                 for row in row_nodes:
                     try:
@@ -592,15 +444,10 @@ def list_folder_contents(dst, parent_id=None, app_source=None, scope=None, media
                         node_type = props[2]
                         is_folder = (node_type == 'F')
                         media_type_item = 'folder' if is_folder else 'resolve'
-
-                        if name_str.endswith(' D') or name_str.endswith(' N') or name_str.endswith(' F'):
-                            name_str = name_str[:-2]
-
-                        items.append({
-                            'id': str(doc_id), 'name': name_str, 'type': 'folder' if is_folder else 'file',
-                            'media_type': media_type_item,
-                            'node_type': str(node_type), 'is_standard': False
-                        })
+                        if name_str.endswith(' D') or name_str.endswith(' N') or name_str.endswith(
+                                ' F'): name_str = name_str[:-2]
+                        items.append({'id': str(doc_id), 'name': name_str, 'type': 'folder' if is_folder else 'file',
+                                      'media_type': media_type_item, 'node_type': str(node_type), 'is_standard': False})
                     except Exception:
                         pass
 
@@ -609,30 +456,22 @@ def list_folder_contents(dst, parent_id=None, app_source=None, scope=None, media
             search_client.service.ReleaseObject(call={'objectID': result_set_id})
         except Exception:
             pass
-
-    except Exception as e:
-        # print(f"Error listing folder contents: {e}")
+    except Exception:
         return items
 
-    # --- RESOLVE UNKNOWN TYPES ---
     ids_to_resolve = [item['id'] for item in items if item.get('media_type') == 'resolve']
     if ids_to_resolve:
         try:
-            resolved_types = db_connector.resolve_media_types_from_db(ids_to_resolve)
+            resolved_types = await db_connector.resolve_media_types_from_db(ids_to_resolve)
             for item in items:
                 if item.get('media_type') == 'resolve':
                     item['media_type'] = resolved_types.get(item['id'], 'pdf')
         except Exception:
             for item in items:
-                if item.get('media_type') == 'resolve':
-                    item['media_type'] = 'pdf'
-
+                if item.get('media_type') == 'resolve': item['media_type'] = 'pdf'
     return items
 
 def delete_document(dst, doc_number, force=False):
-    """
-    Deletes a document/folder.
-    """
     try:
         svc_client = get_soap_client('BasicHttpBinding_IDMSvc')
         del_client = find_client_with_operation('DeleteObject')
@@ -699,8 +538,8 @@ def delete_document(dst, doc_number, force=False):
                         svc_client.service.ReleaseObject(call={'objectID': col_id})
                     except:
                         pass
-            except Exception as e:
-                logging.info(f"WhereUsed failed: {e}")  
+            except Exception:
+                pass
 
             if links_to_remove:
                 for link in links_to_remove:
@@ -727,12 +566,9 @@ def delete_document(dst, doc_number, force=False):
                         }
                     }
                     try:
-                        res = del_client.service.DeleteObject(**del_link_call)
-                        if res.resultCode != 0:
-                            logging.info(
-                                f"Failed unlink {link['SYSTEM_ID']}: {getattr(res, 'errorDoc', '')}") 
-                    except Exception as e:
-                        logging.info(f"Exception unlink {link['SYSTEM_ID']}: {e}")  
+                        del_client.service.DeleteObject(**del_link_call)
+                    except Exception:
+                        pass
 
         del_props = {'propertyCount': 2, 'propertyNames': string_array_type(['%TARGET_LIBRARY', '%OBJECT_IDENTIFIER']),
                      'propertyValues': {
@@ -741,49 +577,28 @@ def delete_document(dst, doc_number, force=False):
         try:
             resp = del_client.service.DeleteObject(
                 call={'dstIn': dst, 'objectType': 'DEF_PROF', 'properties': del_props})
-            if resp.resultCode == 0:
-                return True, "Success"
-
-            err_doc = getattr(resp, 'errorDoc', '')
-            # logging.info(f"Delete failed: {err_doc}")  
-            return False, str(err_doc)
-
+            if resp.resultCode == 0: return True, "Success"
+            return False, str(getattr(resp, 'errorDoc', ''))
         except Fault as f:
-            err_msg = f.message or str(f)
-            return False, err_msg
-
+            return False, f.message or str(f)
     except Exception as e:
-        # logging.info(f"Delete exception: {e}")  
         return False, str(e)
 
 def get_image_by_docnumber(dst, doc_number):
-    """Retrieves a single document's image bytes."""
     svc_client, obj_client, content_id, stream_id = None, None, None, None
     try:
         svc_client = get_soap_client('BasicHttpBinding_IDMSvc')
         obj_client = get_soap_client('BasicHttpBinding_IDMObj')
-
-        get_doc_call = {
-            'call': {
-                'dstIn': dst,
-                'criteria': {
-                    'criteriaCount': 3,
-                    'criteriaNames': {'string': ['%TARGET_LIBRARY', '%DOCUMENT_NUMBER', '%VERSION_ID']},
-                    'criteriaValues': {'string': ['RTA_MAIN', str(doc_number), '%VERSION_TO_INDEX']}
-                }
-            }
-        }
+        get_doc_call = {'call': {'dstIn': dst, 'criteria': {'criteriaCount': 3, 'criteriaNames': {
+            'string': ['%TARGET_LIBRARY', '%DOCUMENT_NUMBER', '%VERSION_ID']}, 'criteriaValues': {
+            'string': ['RTA_MAIN', str(doc_number), '%VERSION_TO_INDEX']}}}}
         doc_reply = svc_client.service.GetDocSvr3(**get_doc_call)
-
-        if not (doc_reply and doc_reply.resultCode == 0 and doc_reply.getDocID):
-            return None, None
+        if not (doc_reply and doc_reply.resultCode == 0 and doc_reply.getDocID): return None, None
         content_id = doc_reply.getDocID
-
         stream_reply = obj_client.service.GetReadStream(call={'dstIn': dst, 'contentID': content_id})
-        if not (stream_reply and stream_reply.resultCode == 0 and stream_reply.streamID):
-            raise Exception("Failed to get read stream.")
+        if not (stream_reply and stream_reply.resultCode == 0 and stream_reply.streamID): raise Exception(
+            "Failed to get read stream.")
         stream_id = stream_reply.streamID
-
         doc_buffer = bytearray()
         while True:
             read_reply = obj_client.service.ReadStream(call={'streamID': stream_id, 'requestedBytes': 65536})
@@ -800,15 +615,11 @@ def get_image_by_docnumber(dst, doc_number):
                     index = prop_names.index('%VERSION_FILE_NAME')
                     version_file_name = doc_reply.docProperties.propertyValues.anyType[index]
                     _, extension = os.path.splitext(str(version_file_name))
-                    if extension:
-                        filename = f"{doc_number}{extension}"
+                    if extension: filename = f"{doc_number}{extension}"
             except Exception:
                 pass
-
         return doc_buffer, filename
-
-    except Fault as e:
-        # logging.info(f"DMS server fault during retrieval for doc: {doc_number}. Fault: {e}")  
+    except Fault:
         return None, None
     finally:
         if obj_client:
@@ -824,45 +635,30 @@ def get_image_by_docnumber(dst, doc_number):
                     pass
 
 def get_dms_stream_details(dst, doc_number):
-    """Opens a stream to a DMS document."""
     try:
         svc_client = get_soap_client('BasicHttpBinding_IDMSvc')
         obj_client = get_soap_client('BasicHttpBinding_IDMObj')
-
-        get_doc_call = {'call': {'dstIn': dst,
-                                 'criteria': {'criteriaCount': 2,
-                                              'criteriaNames': {'string': ['%TARGET_LIBRARY', '%DOCUMENT_NUMBER']},
-                                              'criteriaValues': {'string': ['RTA_MAIN', str(doc_number)]}}}}
+        get_doc_call = {'call': {'dstIn': dst, 'criteria': {'criteriaCount': 2, 'criteriaNames': {
+            'string': ['%TARGET_LIBRARY', '%DOCUMENT_NUMBER']}, 'criteriaValues': {
+            'string': ['RTA_MAIN', str(doc_number)]}}}}
         doc_reply = svc_client.service.GetDocSvr3(**get_doc_call)
-        if not (doc_reply and doc_reply.resultCode == 0 and doc_reply.getDocID):
-            return None
-
+        if not (doc_reply and doc_reply.resultCode == 0 and doc_reply.getDocID): return None
         content_id = doc_reply.getDocID
         stream_reply = obj_client.service.GetReadStream(call={'dstIn': dst, 'contentID': content_id})
         if not (stream_reply and stream_reply.resultCode == 0 and stream_reply.streamID):
             obj_client.service.ReleaseObject(call={'objectID': content_id})
             return None
-
-        return {
-            "obj_client": obj_client,
-            "stream_id": stream_reply.streamID,
-            "content_id": content_id
-        }
-    except Exception as e:
+        return {"obj_client": obj_client, "stream_id": stream_reply.streamID, "content_id": content_id}
+    except Exception:
         return None
 
 def dms_user_login(username, password):
-    """Logs into the DMS SOAP service with user-provided credentials."""
     try:
         if not WSDL_URL: raise ValueError("WSDL_URL is not set.")
         client = get_soap_client()
-
-        # If default client doesn't have LoginSvr5, search for it
         if not hasattr(client.service, 'LoginSvr5'):
             client = find_client_with_operation('LoginSvr5')
-            if not client:
-                # logging.info("LoginSvr5 not found during user login.")  
-                return None
+            if not client: return None
 
         login_info_type = client.get_type(
             '{http://schemas.datacontract.org/2004/07/OpenText.DMSvr.Serializable}DMSvrLoginInfo')
@@ -879,7 +675,7 @@ def dms_user_login(username, password):
     except Exception:
         return None
 
-def upload_document_to_dms(dst, file_stream, metadata, parent_id=None):
+async def upload_document_to_dms(dst, file_stream, metadata, parent_id=None):
     import db_connector
 
     svc_client, obj_client = None, None
@@ -1070,7 +866,7 @@ def upload_document_to_dms(dst, file_stream, metadata, parent_id=None):
                 logging.error(f"Failed to link document {created_doc_number} to parent folder {parent_id}: {e}")
 
         if created_doc_number and event_id is not None:
-            db_connector.link_document_to_event(created_doc_number, event_id)
+            await db_connector.link_document_to_event(created_doc_number, event_id)
 
         return created_doc_number
 
@@ -1088,177 +884,47 @@ def upload_document_to_dms(dst, file_stream, metadata, parent_id=None):
                     obj_client.service.ReleaseObject(call={'objectID': put_doc_id})
                 except Exception:
                     pass
-                
+
 def get_document_from_dms(dst, doc_number):
-    """Retrieves a document's full content."""
     try:
         content_bytes, filename = get_image_by_docnumber(dst, doc_number)
         return content_bytes, filename
-    except Exception as e:
-        # logging.info(f"Error retrieving doc {doc_number}: {e}")  
+    except Exception:
         return None, None
 
-def get_root_folder_counts(dst):
-    """
-    Counts the media types (image, video, file) directly under the SMART_EDMS_ROOT_ID folder.
-    This function is used by db_connector.py to calculate counts for the main folders page.
-    """
-    import db_connector
-
-    # Reuse the recursive logic but don't filter by a specific type yet
-    # We want counts for ALL types.
-
-    counts = {'images': 0, 'videos': 0, 'files': 0}
-
-    # We can't reuse get_recursive_doc_ids easily because it returns a list for ONE type.
-    # So we'll implement a simplified traversal here that counts everything.
-
-    folder_queue = [SMART_EDMS_ROOT_ID]
-    processed_folders = set()
-    MAX_FOLDERS_TO_SCAN = 100
-
-    search_client = get_soap_client('BasicHttpBinding_IDMSvc')
-    data_client = find_client_with_operation('GetDataW') or find_client_with_operation('GetData')
-    method_name = 'GetDataW' if hasattr(data_client.service, 'GetDataW') else 'GetData'
-
-    if not data_client:
-        return counts
-
+def rename_document(dst, doc_id, new_name):
     try:
-        while folder_queue:
-            if len(processed_folders) >= MAX_FOLDERS_TO_SCAN:
-                break
+        svc_client = get_soap_client('BasicHttpBinding_IDMSvc')
+        string_type = svc_client.get_type('{http://www.w3.org/2001/XMLSchema}string')
+        int_type = svc_client.get_type('{http://www.w3.org/2001/XMLSchema}int')
+        string_array_type = svc_client.get_type(
+            '{http://schemas.microsoft.com/2003/10/Serialization/Arrays}ArrayOfstring')
 
-            current_folder_id = folder_queue.pop(0)
-            if current_folder_id in processed_folders:
-                continue
-            processed_folders.add(current_folder_id)
+        prop_names = string_array_type(['%TARGET_LIBRARY', '%OBJECT_IDENTIFIER', 'DOCNAME'])
+        prop_values = {'anyType': [
+            xsd.AnyObject(string_type, 'RTA_MAIN'),
+            xsd.AnyObject(int_type, int(doc_id)),
+            xsd.AnyObject(string_type, new_name)
+        ]}
 
-            search_call = {
-                'call': {
-                    'dstIn': dst,
-                    'objectType': 'ContentsCollection',
-                    'signature': {
-                        'libraries': {'string': ['RTA_MAIN']},
-                        'criteria': {
-                            'criteriaCount': 1,
-                            'criteriaNames': {'string': ['%ITEM']},
-                            'criteriaValues': {'string': [str(current_folder_id)]}
-                        },
-                        'retProperties': {
-                            'string': ['FI.DOCNUMBER', '%DISPLAY_NAME', 'FI.NODE_TYPE', 'DOCNAME', 'APPLICATION',
-                                       'APP_ID', 'DOSEXTENSION']},
-                        'sortProps': {'propertyCount': 1, 'propertyNames': {'string': ['%DISPLAY_NAME']},
-                                      'propertyFlags': {'int': [1]}},
-                        'maxRows': 0
-                    }
+        update_call = {
+            'call': {
+                'dstIn': dst,
+                'objectType': 'DEF_PROF',
+                'properties': {
+                    'propertyCount': 3,
+                    'propertyNames': prop_names,
+                    'propertyValues': prop_values
                 }
             }
+        }
 
-            search_reply = search_client.service.Search(**search_call)
-            if not (search_reply and search_reply.resultCode == 0 and search_reply.resultSetID):
-                continue
+        response = svc_client.service.UpdateObject(**update_call)
 
-            result_set_id = search_reply.resultSetID
-            chunk_size = 500
-            start_row = 0
+        if response.resultCode == 0:
+            return True
+        else:
+            return False
 
-            while True:
-                get_data_call = {
-                    'call': {'resultSetID': result_set_id, 'requestedRows': chunk_size, 'startingRow': start_row}}
-                data_reply = getattr(data_client.service, method_name)(**get_data_call)
-
-                items_batch = []
-                has_data = False
-
-                # 1. XML
-                row_nodes = None
-                if hasattr(data_reply, 'rowNode'):
-                    row_nodes = data_reply.rowNode
-                elif hasattr(data_reply, 'RowNode'):
-                    row_nodes = data_reply.RowNode
-                elif isinstance(data_reply, dict):
-                    row_nodes = data_reply.get('rowNode') or data_reply.get('RowNode')
-
-                if row_nodes:
-                    has_data = True
-                    for row in row_nodes:
-                        try:
-                            props = row.propValues.anyType
-                            doc_id = props[0]
-                            node_type = props[2] if len(props) > 2 else 'N'
-
-                            is_folder = (node_type == 'F')
-                            media_type = 'folder' if is_folder else 'resolve'
-
-                            # Simple ext check
-                            if not is_folder and len(props) > 6 and props[6]:
-                                dos_ext = str(props[6]).lower().replace('.', '').strip()
-                                if dos_ext in ['jpg', 'jpeg', 'png', 'gif', 'bmp']:
-                                    media_type = 'image'
-                                elif dos_ext in ['mp4', 'mov', 'avi', 'mkv']:
-                                    media_type = 'video'
-                                elif dos_ext in ['pdf', 'doc', 'docx']:
-                                    media_type = 'pdf'
-
-                            items_batch.append({'id': str(doc_id), 'media_type': media_type,
-                                                'type': 'folder' if is_folder else 'file'})
-                        except Exception:
-                            pass
-
-                # 2. Binary
-                if not items_batch and hasattr(data_reply, 'resultSetData') and data_reply.resultSetData:
-                    container = data_reply.resultSetData
-                    if hasattr(container, 'resultBuffer') and container.resultBuffer:
-                        parsed = parse_binary_result_buffer(container.resultBuffer)
-                        if parsed:
-                            has_data = True
-                            items_batch.extend(parsed)
-
-                if not has_data or not items_batch:
-                    break
-
-                ids_to_resolve = []
-                for item in items_batch:
-                    if item.get('type') == 'folder' or item.get('media_type') == 'folder':
-                        if item['id'] not in processed_folders and item['id'] not in folder_queue:
-                            folder_queue.append(item['id'])
-                        continue
-
-                    m_type = item.get('media_type')
-                    if m_type == 'image':
-                        counts['images'] += 1
-                    elif m_type == 'video':
-                        counts['videos'] += 1
-                    elif m_type == 'pdf':
-                        counts['files'] += 1
-                    elif m_type == 'resolve':
-                        ids_to_resolve.append(item['id'])
-
-                if ids_to_resolve:
-                    try:
-                        resolved_map = db_connector.resolve_media_types_from_db(ids_to_resolve)
-                        for doc_id in ids_to_resolve:
-                            r_type = resolved_map.get(doc_id, 'pdf')
-                            if r_type == 'image':
-                                counts['images'] += 1
-                            elif r_type == 'video':
-                                counts['videos'] += 1
-                            else:
-                                counts['files'] += 1
-                    except Exception:
-                        counts['files'] += len(ids_to_resolve)  # Default fallback
-
-                start_row += chunk_size
-                if start_row > 2000: break
-
-            try:
-                search_client.service.ReleaseData(call={'resultSetID': result_set_id})
-                search_client.service.ReleaseObject(call={'objectID': result_set_id})
-            except:
-                pass
-
-    except Exception as e:
-        print(f"Error getting root folder counts: {e}")
-
-    return counts
+    except Exception:
+        return False
