@@ -328,7 +328,10 @@ async def resolve_media_types_from_db(doc_ids):
 
             image_exts = {'jpg', 'jpeg', 'png', 'gif', 'bmp', 'tif', 'tiff', 'webp', 'heic'}
             video_exts = {'mp4', 'mov', 'avi', 'wmv', 'mkv', 'flv', 'webm', '3gp'}
-            pdf_exts = {'pdf'}
+            pdf_exts = {'pdf', 'doc', 'docx'}
+            excel_exts = {'xls', 'xlsx', 'ods', 'xlsm'}
+            ppt_exts = {'ppt', 'pptx', 'odp', 'pps', 'ppsx'}
+            text_exts = {'txt', 'csv', 'json', 'xml', 'log', 'md'}
 
             for doc_id, ext in rows:
                 media_type = 'file'
@@ -340,6 +343,12 @@ async def resolve_media_types_from_db(doc_ids):
                         media_type = 'video'
                     elif clean_ext in pdf_exts:
                         media_type = 'pdf'
+                    elif clean_ext in excel_exts:
+                        media_type = 'excel'
+                    elif clean_ext in ppt_exts:
+                        media_type = 'powerpoint'
+                    elif clean_ext in text_exts:
+                        media_type = 'text'
                 resolved_map[str(doc_id)] = media_type
     except Exception as e:
         logging.error(f"Error resolving media types: {e}")
