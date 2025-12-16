@@ -45,7 +45,8 @@ def get_exif_date(image_stream):
 
 async def get_media_info_from_dms(dst, doc_number):
     """
-    Retrieves metadata for a document. Resolves media type via ASYNC DB call.
+    Efficiently retrieves only the metadata (like filename) for a document from the DMS
+    without downloading the full file content. Uses DB resolution for media type.
     """
     try:
         settings = Settings(strict=False, xml_huge_tree=True)
@@ -67,7 +68,7 @@ async def get_media_info_from_dms(dst, doc_number):
         if not (doc_reply and doc_reply.resultCode == 0):
             return None, 'image', ''
 
-        filename = f"{doc_number}"
+        filename = f"{doc_number}"  # Default
         if doc_reply.docProperties and doc_reply.docProperties.propertyValues:
             try:
                 prop_names = doc_reply.docProperties.propertyNames.string
@@ -77,28 +78,54 @@ async def get_media_info_from_dms(dst, doc_number):
                     if version_file_name:
                         filename = str(version_file_name)
             except Exception as e:
-                print(f"Could not get filename for {doc_number}: {e}")
+                logging.error(f"Could not get filename for {doc_number}, using default. Error: {e}")
 
-        # Async DB Resolution
-        media_type = 'file'
+        # Resolve media type strictly from DB first
+        media_type = 'file'  # Default
         try:
+            # 'resolve_media_types_from_db' is a coroutine, so we must await it
             resolved_map = await resolve_media_types_from_db([doc_number])
             media_type = resolved_map.get(str(doc_number), 'file')
         except Exception as e:
             logging.error(f"Error resolving media type from DB for {doc_number}: {e}")
+
+        # Fallback to extension if DB lookup failed entirely or returned generic file
+        if media_type == 'file':
+            video_extensions = [
+                '.mp4', '.mov', '.avi', '.mkv', '.wmv', '.flv', '.webm',
+                '.m4v', '.3gp', '.mts', '.ts', '.3g2'
+            ]
+            pdf_extensions = ['.pdf']
+            image_extensions = ['.jpg', '.jpeg', '.png', '.gif', '.bmp', '.tif', '.tiff', '.webp', '.heic']
+            text_extensions = ['.txt', '.csv', '.json', '.xml', '.log', '.md', '.yml', '.yaml', '.ini', '.conf']
+            excel_extensions = ['.xls', '.xlsx', '.ods', '.xlsm']
+            ppt_extensions = ['.ppt', '.pptx', '.odp', '.pps', '.ppsx']
+
             file_ext = os.path.splitext(filename)[1].lower()
-            if file_ext in ['.mp4', '.mov', '.avi']:
+
+            if file_ext in video_extensions:
                 media_type = 'video'
-            elif file_ext in ['.pdf']:
+            elif file_ext in pdf_extensions:
                 media_type = 'pdf'
-            elif file_ext in ['.jpg', '.png']:
+            elif file_ext in image_extensions:
                 media_type = 'image'
+            elif file_ext in text_extensions:
+                media_type = 'text'
+            elif file_ext in excel_extensions:
+                media_type = 'excel'
+            elif file_ext in ppt_extensions:
+                media_type = 'powerpoint'
+            else:
+                media_type = 'file'
 
         file_ext = os.path.splitext(filename)[1].lower()
         return filename, media_type, file_ext
 
     except Fault as e:
-        print(f"DMS metadata fault for doc {doc_number}: {e}")
+        logging.error(f"DMS metadata fault for doc {doc_number}: {e}")
+        return None, 'image', ''
+    except Exception as e:
+        logging.error(f"Unexpected error in get_media_info_from_dms: {e}")
         return None, 'image', ''
 
 def get_media_content_from_dms(dst, doc_number):
@@ -134,30 +161,36 @@ def stream_and_cache_generator(obj_client, stream_id, content_id, final_cache_pa
         if os.path.exists(temp_cache_path): os.remove(temp_cache_path)
 
 def create_thumbnail(doc_number, media_type, file_ext, media_bytes):
-    """Creates a thumbnail from media bytes."""
+    """Creates a thumbnail from media bytes and saves it to the cache."""
+    if media_type in ['excel', 'powerpoint', 'text', 'file']:
+        return None
+
     thumbnail_filename = f"{doc_number}.jpg"
     cached_path = os.path.join(thumbnail_cache_dir, thumbnail_filename)
     try:
         if media_type == 'video':
             temp_video_path = os.path.join(thumbnail_cache_dir, f"{doc_number}{file_ext}")
-            with open(temp_video_path, 'wb') as f:
-                f.write(media_bytes)
-            with VideoFileClip(temp_video_path) as clip:
-                clip.save_frame(cached_path, t=1)
+            with open(temp_video_path, 'wb') as f: f.write(media_bytes)
+            # Use moviepy.editor
+            with VideoFileClip(temp_video_path) as clip: clip.save_frame(cached_path, t=1)
             os.remove(temp_video_path)
         elif media_type == 'pdf':
+            # Use fitz (PyMuPDF)
             with fitz.open(stream=media_bytes, filetype="pdf") as doc:
-                page = doc.load_page(0)
+                page = doc.load_page(0)  # Load the first page
                 pix = page.get_pixmap()
+                # Create PIL image from pixmap samples
                 with Image.frombytes("RGB", [pix.width, pix.height], pix.samples) as img:
                     img.save(cached_path, "JPEG", quality=95)
-        else:
+        else: # Assumed image
+            # Use Pillow
             with Image.open(io.BytesIO(media_bytes)) as img:
                 img.thumbnail((300, 300))
+                # Ensure image is RGB before saving as JPEG
                 img.convert("RGB").save(cached_path, "JPEG", quality=95)
-        return f"cache/{thumbnail_filename}"
+        return f"cache/{thumbnail_filename}" # Return relative path for URL
     except Exception as e:
-        logging.error(f"Thumbnail error {doc_number}: {e}")
+        print(f"Could not create thumbnail for {doc_number}: {e}")
         return None
 
 def clear_thumbnail_cache():

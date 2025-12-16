@@ -25,7 +25,7 @@ def get_db_connection():
     try:
         conn = db_connector.get_connection()
         if conn:
-            logging.info("Successfully connected to Oracle Database.")
+            # logging.info("Successfully connected to Oracle Database.")
             return conn
         else:
             logging.error("Failed to get Oracle connection.")

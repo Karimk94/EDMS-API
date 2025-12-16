@@ -14,6 +14,9 @@ load_dotenv()
 # Configure Logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
+# --- Log Filtering ---
+logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
+
 app = FastAPI(title="EDMS Middleware API")
 
 # --- Security & Middleware ---

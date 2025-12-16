@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Request, HTTPException, UploadFile, File, Form, BackgroundTasks, Header
+from fastapi import APIRouter, Request, HTTPException, UploadFile, File, Form, BackgroundTasks, Header, Response
 from fastapi.responses import StreamingResponse
 from werkzeug.utils import secure_filename
 from typing import Optional
@@ -69,7 +69,6 @@ async def api_get_documents(
     except Exception as e:
         logging.error(f"Error in /api/documents endpoint: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Failed to fetch documents due to server error.")
-
 
 @router.post('/process-batch')
 async def process_batch(background_tasks: BackgroundTasks):
@@ -173,6 +172,10 @@ async def api_process_uploaded_documents(data: ProcessUploadRequest, background_
 
 @router.get('/api/document/{docnumber}')
 async def get_document_file(docnumber: int, request: Request):
+    """
+    View document inline.
+    Updated to use db_connector for better media type resolution and correct file extensions.
+    """
     if 'user' not in request.session:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
@@ -180,17 +183,58 @@ async def get_document_file(docnumber: int, request: Request):
     if not dst:
         raise HTTPException(status_code=500, detail="Failed to get token")
 
-    file_bytes, filename = wsdl_client.get_document_from_dms(dst, docnumber)
-    if file_bytes and filename:
-        mimetype = mimetypes.guess_type(filename)[0] or 'application/octet-stream'
-        # Convert bytes to stream for StreamingResponse
-        return StreamingResponse(
-            io.BytesIO(file_bytes),
-            media_type=mimetype,
-            headers={"Content-Disposition": f"inline; filename={filename}"}
-        )
-    else:
-        raise HTTPException(status_code=404, detail="Document not found")
+    # Use db_connector to get accurate media info including type
+    try:
+        filename, media_type, file_ext = await db_connector.get_media_info_from_dms(dst, docnumber)
+
+        # Ensure filename has extension
+        if file_ext and not filename.lower().endswith(file_ext.lower()):
+            filename = f"{filename}{file_ext}"
+
+        # Get content
+        file_bytes = db_connector.get_media_content_from_dms(dst, docnumber)
+
+        if file_bytes:
+            # Determine correct content type
+            mimetype = 'application/octet-stream'
+            disposition = 'inline'
+
+            if media_type == 'pdf':
+                mimetype = "application/pdf"
+            elif media_type == 'image':
+                mimetype = f"image/{file_ext.replace('.', '')}"
+            elif media_type == 'video':
+                mimetype = f"video/{file_ext.replace('.', '')}"
+            elif media_type == 'text':
+                mimetype = "text/plain"
+            elif media_type == 'excel':
+                mimetype = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                disposition = 'attachment'  # Browsers often can't preview Excel inline
+            elif media_type == 'powerpoint':
+                mimetype = "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+                disposition = 'attachment'
+
+            # Convert bytes to stream for StreamingResponse
+            return StreamingResponse(
+                io.BytesIO(file_bytes),
+                media_type=mimetype,
+                headers={"Content-Disposition": f"{disposition}; filename={filename}"}
+            )
+        else:
+            # Fallback to old method if db_connector fails to get content
+            file_bytes, filename = wsdl_client.get_document_from_dms(dst, docnumber)
+            if file_bytes:
+                mimetype = mimetypes.guess_type(filename)[0] or 'application/octet-stream'
+                return StreamingResponse(
+                    io.BytesIO(file_bytes),
+                    media_type=mimetype,
+                    headers={"Content-Disposition": f"inline; filename={filename}"}
+                )
+            raise HTTPException(status_code=404, detail="Document not found")
+
+    except Exception as e:
+        logging.error(f"Error in get_document_file: {e}")
+        raise HTTPException(status_code=500, detail="Internal Server Error")
 
 @router.put('/api/update_metadata')
 async def api_update_metadata(data: UpdateMetadataRequest):
@@ -224,6 +268,10 @@ async def api_update_metadata(data: UpdateMetadataRequest):
 
 @router.get('/api/download_watermarked/{doc_id}')
 async def api_download_watermarked(doc_id: int, request: Request):
+    """
+    Downloads document.
+    Updated to correct filename extensions and Content-Types for Office documents.
+    """
     if 'user' not in request.session:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
@@ -234,9 +282,14 @@ async def api_download_watermarked(doc_id: int, request: Request):
     if not dst:
         raise HTTPException(status_code=500, detail="Failed to get token")
 
+    # Await async media info
     filename, media_type, file_ext = await db_connector.get_media_info_from_dms(dst, doc_id)
     if not filename:
         raise HTTPException(status_code=404, detail="Document not found")
+
+    # FIX: Ensure filename has the correct extension
+    if file_ext and not filename.lower().endswith(file_ext.lower()):
+        filename = f"{filename}{file_ext}"
 
     file_bytes = db_connector.get_media_content_from_dms(dst, doc_id)
     if not file_bytes:
@@ -244,20 +297,30 @@ async def api_download_watermarked(doc_id: int, request: Request):
 
     watermark_text = f"{system_id} - {doc_id} | {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
 
+    # Determine mime type
+    mimetype = 'application/octet-stream'
+    processed_bytes = file_bytes
+
     if media_type == 'image':
         processed_bytes, mimetype = apply_watermark_to_image(file_bytes, watermark_text)
     elif media_type == 'pdf':
         processed_bytes, mimetype = apply_watermark_to_pdf(file_bytes, watermark_text)
     elif media_type == 'video':
-        # apply_watermark_to_video is expensive/blocking. Consider background task or warning.
         processed_bytes, mimetype = apply_watermark_to_video(file_bytes, watermark_text, filename)
-    else:
-        processed_bytes, mimetype = file_bytes, 'application/octet-stream'
+    elif media_type == 'excel':
+        mimetype = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    elif media_type == 'powerpoint':
+        mimetype = "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+    elif media_type == 'text':
+        mimetype = "text/plain"
 
     return StreamingResponse(
         io.BytesIO(processed_bytes),
         media_type=mimetype,
-        headers={"Content-Disposition": f"attachment; filename={filename}"}
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Access-Control-Expose-Headers": "Content-Disposition"
+        }
     )
 
 @router.post('/api/update_abstract')
