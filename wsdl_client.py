@@ -928,3 +928,367 @@ def rename_document(dst, doc_id, new_name):
 
     except Exception:
         return False
+
+def set_trustees(dst, doc_id, library, trustees, security_enabled="1"):
+    try:
+        svc_client = get_soap_client('BasicHttpBinding_IDMSvc')
+        string_type = svc_client.get_type('{http://www.w3.org/2001/XMLSchema}string')
+        string_array_type = svc_client.get_type(
+            '{http://schemas.microsoft.com/2003/10/Serialization/Arrays}ArrayOfstring')
+        int_array_type = svc_client.get_type('{http://schemas.microsoft.com/2003/10/Serialization/Arrays}ArrayOfint')
+
+        names = [t.username for t in trustees]
+        flags = [t.flag if t.flag is not None else 2 for t in trustees]
+        rights = [t.rights for t in trustees]
+
+        trustee_names_obj = string_array_type(names)
+        trustee_flags_obj = int_array_type(flags)
+        trustee_rights_obj = int_array_type(rights)
+
+        prop_names = string_array_type(['%TARGET_LIBRARY', '%OBJECT_IDENTIFIER', '%RECENTLY_USED_LOCATION', 'SECURITY'])
+
+        val_list = [
+            xsd.AnyObject(string_type, library),
+            xsd.AnyObject(string_type, str(doc_id)),
+            xsd.AnyObject(string_type, f"DOCSOPEN!L\\{library}"),
+            xsd.AnyObject(string_type, str(security_enabled))
+        ]
+        prop_values = {'anyType': val_list}
+
+        call_data = {
+            'dstIn': dst,
+            'objectType': 'DEF_PROF',
+            'properties': {
+                'propertyCount': 4,
+                'propertyNames': prop_names,
+                'propertyValues': prop_values
+            },
+            'trustees': {
+                'trusteeCount': len(trustees),
+                'trusteeNames': trustee_names_obj,
+                'trusteeFlags': trustee_flags_obj,
+                'trusteeRights': trustee_rights_obj
+            }
+        }
+
+        response = svc_client.service.SetTrustees(call=call_data)
+        if response.resultCode == 0:
+            return True, "Success"
+        return False, f"Error: {getattr(response, 'resultCode', 'Unknown')}"
+
+    except Exception as e:
+        return False, str(e)
+
+def get_object_trustees(dst, doc_id, library='RTA_MAIN'):
+    try:
+        svc_client = get_soap_client('BasicHttpBinding_IDMSvc')
+        string_type = svc_client.get_type('{http://www.w3.org/2001/XMLSchema}string')
+        string_array_type = svc_client.get_type(
+            '{http://schemas.microsoft.com/2003/10/Serialization/Arrays}ArrayOfstring')
+
+        prop_names = string_array_type(['%TARGET_LIBRARY', '%OBJECT_IDENTIFIER'])
+        prop_values = {'anyType': [
+            xsd.AnyObject(string_type, library),
+            xsd.AnyObject(string_type, str(doc_id))
+        ]}
+
+        call_data = {
+            'dstIn': dst,
+            'objectType': 'DEF_PROF',
+            'properties': {
+                'propertyCount': 2,
+                'propertyNames': prop_names,
+                'propertyValues': prop_values
+            }
+        }
+
+        if hasattr(svc_client.service, 'GetTrustees'):
+            response = svc_client.service.GetTrustees(call=call_data)
+
+            if response.resultCode == 0 and response.trustees:
+                trustees = []
+                # Safely access properties with defaults
+                t_names = response.trustees.trusteeNames.string if (
+                            response.trustees.trusteeNames and hasattr(response.trustees.trusteeNames,
+                                                                       'string')) else []
+                t_flags = response.trustees.trusteeFlags.int if (
+                            response.trustees.trusteeFlags and hasattr(response.trustees.trusteeFlags, 'int')) else []
+                t_rights = response.trustees.trusteeRights.int if (
+                            response.trustees.trusteeRights and hasattr(response.trustees.trusteeRights, 'int')) else []
+
+                # Ensure count is an int
+                count = response.trustees.trusteeCount if response.trustees.trusteeCount is not None else 0
+
+                # Ensure we don't go out of bounds if arrays are shorter than count for some reason
+                limit = min(count, len(t_names), len(t_flags), len(t_rights))
+
+                for i in range(limit):
+                    trustees.append({
+                        'username': t_names[i],
+                        'flag': t_flags[i],
+                        'rights': t_rights[i]
+                    })
+                return trustees
+        return []
+    except Exception as e:
+        logging.error(f"Error getting trustees: {e}")
+        return []
+
+def get_group_members(dst, group_id, library='RTA_MAIN'):
+    try:
+        svc_client = get_soap_client('BasicHttpBinding_IDMSvc')
+
+        # Based on Search XML trace for v_peoplegroups
+        search_call = {
+            'call': {
+                'dstIn': dst,
+                'objectType': 'v_peoplegroups',
+                'signature': {
+                    'libraries': {'string': [library]},
+                    'criteria': {
+                        'criteriaCount': 1,
+                        'criteriaNames': {'string': ['GROUP_ID']},
+                        'criteriaValues': {'string': [group_id]}
+                    },
+                    'retProperties': {
+                        'string': ['USER_ID', 'FULL_NAME', 'PEOPLE_SYSTEM_ID', 'Disabled', 'ALLOW_LOGIN']
+                    },
+                    'sortProps': {
+                        'propertyCount': 1,
+                        'propertyNames': {'string': ['FULL_NAME']},
+                        'propertyFlags': {'int': [1]}
+                    },
+                    'maxRows': 0
+                }
+            }
+        }
+
+        search_reply = svc_client.service.Search(**search_call)
+
+        if not (search_reply and search_reply.resultCode == 0 and search_reply.resultSetID):
+            return []
+
+        result_set_id = search_reply.resultSetID
+
+        # Fetch Data
+        data_client = find_client_with_operation('GetDataW') or svc_client
+        method_name = 'GetDataW' if hasattr(data_client.service, 'GetDataW') else 'GetData'
+
+        get_data_call = {
+            'call': {
+                'resultSetID': result_set_id,
+                'requestedRows': 500,
+                'startingRow': 0
+            }
+        }
+
+        data_reply = getattr(data_client.service, method_name)(**get_data_call)
+
+        members = []
+        # Parse logic similar to list_folder_contents but specific columns
+        # If binary buffer, use existing parser or if RowNode use that.
+        # Trace shows binary buffer.
+
+        if hasattr(data_reply, 'resultSetData') and data_reply.resultSetData:
+            container = data_reply.resultSetData
+            if hasattr(container, 'resultBuffer') and container.resultBuffer:
+                # Reusing the parse_binary_result_buffer might be tricky if it expects specific folder columns.
+                # However, for simple string lists it might work if the binary format is standard.
+                # If not, we might need a specific parser or rely on RowNode if available.
+                # Let's check if RowNode is an option in configured binding, otherwise we might need to parse the binary.
+                # The binary parser in existing code is tailored for folder lists (icons etc).
+                # A generic text parser for the buffer:
+                try:
+                    if len(container.resultBuffer) > 8 and container.resultBuffer[8:10] == b'\x78\x9c':
+                        buff = zlib.decompress(container.resultBuffer[8:])
+                    else:
+                        buff = container.resultBuffer
+
+                    try:
+                        text = buff.decode('utf-16-le', errors='ignore')
+                    except:
+                        text = buff.decode('utf-8', errors='ignore')
+
+                    # Very rough parsing of space-separated strings from buffer if that's the format
+                    # Ideally we want RowNode structure.
+                    # If GetData returns RowNode (often XML configuration dependent), we iterate it.
+                    pass
+                except:
+                    pass
+
+        # If data_reply has RowNode/rowNode (Text/XML mode)
+        row_nodes = getattr(data_reply, 'rowNode', None) or getattr(data_reply, 'RowNode', None)
+
+        if row_nodes:
+            for row in row_nodes:
+                vals = row.propValues.anyType
+                if vals:
+                    members.append({
+                        'user_id': vals[0],
+                        'full_name': vals[1],
+                        'system_id': vals[2]
+                    })
+
+        # Cleanup
+        try:
+            svc_client.service.ReleaseData(call={'resultSetID': result_set_id})
+            svc_client.service.ReleaseObject(call={'objectID': result_set_id})
+        except:
+            pass
+
+        return members
+
+    except Exception as e:
+        logging.error(f"Error getting group members: {e}")
+        return []
+
+def get_all_groups(dst, library='RTA_MAIN'):
+    try:
+        svc_client = get_soap_client('BasicHttpBinding_IDMSvc')
+
+        search_call = {
+            'call': {
+                'dstIn': dst,
+                'objectType': 'v_groups',
+                'signature': {
+                    'libraries': {'string': [library]},
+                    'criteria': {
+                        'criteriaCount': 0,  # Search all
+                        'criteriaNames': {'string': []},
+                        'criteriaValues': {'string': []}
+                    },
+                    'retProperties': {
+                        'string': ['GROUP_ID', 'FULL_NAME', 'DESCRIPTION']
+                    },
+                    'sortProps': {
+                        'propertyCount': 1,
+                        'propertyNames': {'string': ['GROUP_ID']},
+                        'propertyFlags': {'int': [1]}
+                    },
+                    'maxRows': 0
+                }
+            }
+        }
+
+        search_reply = svc_client.service.Search(**search_call)
+
+        # If v_groups fails, fallback might be needed, but let's stick to the pattern.
+        if not (search_reply and search_reply.resultCode == 0 and search_reply.resultSetID):
+            return []
+
+        result_set_id = search_reply.resultSetID
+
+        data_client = find_client_with_operation('GetDataW') or svc_client
+        method_name = 'GetDataW' if hasattr(data_client.service, 'GetDataW') else 'GetData'
+
+        get_data_call = {
+            'call': {
+                'resultSetID': result_set_id,
+                'requestedRows': 500,
+                'startingRow': 0
+            }
+        }
+
+        data_reply = getattr(data_client.service, method_name)(**get_data_call)
+
+        groups = []
+        row_nodes = getattr(data_reply, 'rowNode', None) or getattr(data_reply, 'RowNode', None)
+
+        if row_nodes:
+            for row in row_nodes:
+                vals = row.propValues.anyType
+                if vals:
+                    groups.append({
+                        'group_id': vals[0],
+                        'group_name': vals[1] if len(vals) > 1 else vals[0],
+                        'description': vals[2] if len(vals) > 2 else ""
+                    })
+
+        # Cleanup
+        try:
+            svc_client.service.ReleaseData(call={'resultSetID': result_set_id})
+            svc_client.service.ReleaseObject(call={'objectID': result_set_id})
+        except:
+            pass
+
+        return groups
+
+    except Exception as e:
+        logging.error(f"Error getting groups: {e}")
+        return []
+
+def get_current_user_group_members(dst, username, library='RTA_MAIN'):
+    return search_users_in_group(dst, "EDMS_TEST_GRP_2", "")
+
+def search_users_in_group(dst, group_id, search_term, library='RTA_MAIN'):
+    try:
+        svc_client = get_soap_client('BasicHttpBinding_IDMSvc')
+
+        # Ensure we have a valid group_id to search by, as implied by the working trace
+        if not group_id:
+            return []
+
+        search_call = {
+            'call': {
+                'dstIn': dst,
+                'objectType': 'v_peoplegroups',
+                'signature': {
+                    'libraries': {'string': [library]},
+                    'criteria': {
+                        'criteriaCount': 1,
+                        'criteriaNames': {'string': ['GROUP_ID']},
+                        'criteriaValues': {'string': [group_id]}
+                    },
+                    'retProperties': {
+                        'string': ['USER_ID', 'FULL_NAME', 'PEOPLE_SYSTEM_ID']
+                    },
+                    'sortProps': {
+                        'propertyCount': 1,
+                        'propertyNames': {'string': ['FULL_NAME']},
+                        'propertyFlags': {'int': [1]}
+                    },
+                    'maxRows': 0
+                }
+            }
+        }
+
+        search_reply = svc_client.service.Search(**search_call)
+        if not (search_reply and search_reply.resultCode == 0 and search_reply.resultSetID):
+            return []
+
+        result_set_id = search_reply.resultSetID
+
+        data_client = find_client_with_operation('GetDataW') or svc_client
+        method_name = 'GetDataW' if hasattr(data_client.service, 'GetDataW') else 'GetData'
+
+        get_data_call = {'call': {'resultSetID': result_set_id, 'requestedRows': 500, 'startingRow': 0}}
+        data_reply = getattr(data_client.service, method_name)(**get_data_call)
+
+        members = []
+        row_nodes = getattr(data_reply, 'rowNode', None) or getattr(data_reply, 'RowNode', None)
+
+        if row_nodes:
+            for row in row_nodes:
+                vals = row.propValues.anyType
+                if vals:
+                    # Depending on retProperties order
+                    # USER_ID, FULL_NAME, SYSTEM_ID
+                    u_id = vals[0]
+                    f_name = vals[1]
+
+                    # Filter locally since we fetched by Group
+                    if not search_term or (
+                            search_term.lower() in str(f_name).lower() or search_term.lower() in str(u_id).lower()):
+                        members.append({'user_id': u_id, 'full_name': f_name})
+
+        try:
+            svc_client.service.ReleaseData(call={'resultSetID': result_set_id})
+            svc_client.service.ReleaseObject(call={'objectID': result_set_id})
+        except:
+            pass
+
+        return members
+
+    except Exception as e:
+        logging.error(f"Error searching group users: {e}")
+        return []

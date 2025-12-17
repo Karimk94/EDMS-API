@@ -11,7 +11,7 @@ import db_connector
 import wsdl_client
 from services.processor import process_document
 from utils.watermark import apply_watermark_to_image, apply_watermark_to_pdf, apply_watermark_to_video
-from schemas.documents import ProcessUploadRequest, UpdateMetadataRequest, UpdateAbstractRequest, LinkEventRequest
+from schemas.documents import ProcessUploadRequest, UpdateMetadataRequest, UpdateAbstractRequest, LinkEventRequest, SetTrusteesRequest
 
 router = APIRouter()
 
@@ -92,15 +92,12 @@ async def process_batch(background_tasks: BackgroundTasks):
     return {"status": "success", "message": f"Processing started for {len(documents)} documents.",
             "processed_count": processed_count}
 
+
 @router.post('/api/upload_document')
-async def api_upload_document(
-        file: UploadFile = File(...),
-        docname: Optional[str] = Form(None),
-        abstract: str = Form("Uploaded via EDMS Viewer"),
-        event_id: Optional[str] = Form(None),
-        parent_id: Optional[str] = Form(None),
-        date_taken: Optional[str] = Form(None)
-):
+async def api_upload_document(file: UploadFile = File(...), docname: Optional[str] = Form(None),
+                              abstract: str = Form("Uploaded via EDMS Viewer"),
+                              event_id: Optional[str] = Form(None), parent_id: Optional[str] = Form(None),
+                              date_taken: Optional[str] = Form(None)):
     if not file.filename:
         raise HTTPException(status_code=400, detail="No selected file")
 
@@ -344,3 +341,24 @@ async def get_document_event(doc_id: int):
     event_info = await db_connector.get_event_for_document(doc_id)
     # Return empty dict if None to match JSON behavior or handle strictly
     return event_info if event_info else {}
+
+@router.post('/api/document/{doc_id}/security')
+def set_document_security(doc_id: str, request: SetTrusteesRequest, x_session_id: str = Header(None)):
+    """
+    Sets the trustees for a specific document or folder.
+    """
+    if not x_session_id:
+        raise HTTPException(status_code=401, detail="Session ID required")
+
+    success, message = wsdl_client.set_trustees(
+        dst=x_session_id,
+        doc_id=doc_id,
+        library=request.library,
+        trustees=request.trustees,
+        security_enabled=request.security_enabled
+    )
+
+    if not success:
+        raise HTTPException(status_code=500, detail=message)
+
+    return {"status": "success", "message": "Trustees updated successfully"}
