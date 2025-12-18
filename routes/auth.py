@@ -83,7 +83,7 @@ async def api_update_user_theme(request: Request, data: ThemeUpdateRequest):
 
 @router.get("/api/groups/{group_id}/members", response_model=List[GroupMember])
 def get_group_members_route(group_id: str, request: Request):
-    token = get_session_token(request)
+    token = processor.get_session_token(request)
     members = wsdl_client.get_group_members(token, group_id)
     return members
 
