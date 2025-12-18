@@ -1159,9 +1159,9 @@ def search_users_in_group(dst, group_id, search_term, library='RTA_MAIN'):
                 'signature': {
                     'libraries': {'string': [library]},
                     'criteria': {
-                        'criteriaCount': 1,
-                        'criteriaNames': {'string': ['GROUP_ID']},
-                        'criteriaValues': {'string': [group_id]}
+                        'criteriaCount': 2,
+                        'criteriaNames': {'string': ['GROUP_ID', 'DISABLED']},
+                        'criteriaValues': {'string': [group_id, 'N']}
                     },
                     'retProperties': {
                         'string': ['USER_ID', 'FULL_NAME', 'PEOPLE_SYSTEM_ID']
@@ -1190,17 +1190,31 @@ def search_users_in_group(dst, group_id, search_term, library='RTA_MAIN'):
 
         members = []
 
+        # Helper to clean text
+        def clean_text(text):
+            if not text:
+                return ""
+            # Remove control characters
+            return re.sub(r'[\x00-\x1f\x7f]', '', str(text)).strip()
+
         # 1. Try Parsing Binary Buffer (Preferred for large datasets/GetDataW)
         if hasattr(data_reply, 'resultSetData') and data_reply.resultSetData:
             container = data_reply.resultSetData
             if hasattr(container, 'resultBuffer') and container.resultBuffer:
                 parsed_items = parse_user_result_buffer(container.resultBuffer)
                 for p in parsed_items:
-                    # Filter locally
-                    if not search_term or (
-                            search_term.lower() in str(p['full_name']).lower() or
-                            search_term.lower() in str(p['user_id']).lower()):
-                        members.append(p)
+                    # Clean data
+                    c_name = clean_text(p.get('full_name'))
+                    c_id = clean_text(p.get('user_id'))
+
+                    # Filter junk and apply search term
+                    if c_name and c_id:
+                        if not search_term or (
+                                search_term.lower() in c_name.lower() or
+                                search_term.lower() in c_id.lower()):
+                            p['full_name'] = c_name
+                            p['user_id'] = c_id
+                            members.append(p)
 
         # 2. Try XML RowNode (Fallback)
         if not members:
@@ -1209,12 +1223,16 @@ def search_users_in_group(dst, group_id, search_term, library='RTA_MAIN'):
                 for row in row_nodes:
                     vals = row.propValues.anyType
                     if vals:
-                        u_id = vals[0]
-                        f_name = vals[1]
+                        raw_id = vals[0]
+                        raw_name = vals[1]
 
-                        if not search_term or (
-                                search_term.lower() in str(f_name).lower() or search_term.lower() in str(u_id).lower()):
-                            members.append({'user_id': u_id, 'full_name': f_name})
+                        c_id = clean_text(raw_id)
+                        c_name = clean_text(raw_name)
+
+                        if c_id and c_name:
+                            if not search_term or (
+                                    search_term.lower() in c_name.lower() or search_term.lower() in c_id.lower()):
+                                members.append({'user_id': c_id, 'full_name': c_name})
 
         try:
             svc_client.service.ReleaseData(call={'resultSetID': result_set_id})
