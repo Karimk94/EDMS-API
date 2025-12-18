@@ -1,8 +1,9 @@
-from fastapi import APIRouter, HTTPException, Request, Header, Query
+from fastapi import APIRouter, HTTPException, Request, Query
 import db_connector
 import wsdl_client
 from schemas.auth import LoginRequest, LangUpdateRequest, ThemeUpdateRequest, GroupMember, TrusteeResponse, Group
 from typing import List
+from services import processor
 
 router = APIRouter()
 
@@ -80,24 +81,6 @@ async def api_update_user_theme(request: Request, data: ThemeUpdateRequest):
 
 # --- Groups & Security Endpoints (Updated to use Session) ---
 
-def get_session_token(request: Request):
-    user = request.session.get('user')
-    if not user or 'token' not in user:
-        token = db_connector.dms_system_login()
-        if token: return token
-        raise HTTPException(status_code=401, detail="Session required")
-    return user['token']
-
-def get_current_username(request: Request):
-    user = request.session.get('user')
-    return user['username'] if user else None
-
-@router.get("/api/groups", response_model=List[Group])
-def get_groups(request: Request):
-    token = get_session_token(request)
-    groups = wsdl_client.get_all_groups(token)
-    return groups
-
 @router.get("/api/groups/{group_id}/members", response_model=List[GroupMember])
 def get_group_members_route(group_id: str, request: Request):
     token = get_session_token(request)
@@ -106,35 +89,50 @@ def get_group_members_route(group_id: str, request: Request):
 
 @router.get("/api/document/{doc_id}/trustees", response_model=List[TrusteeResponse])
 def get_doc_trustees(doc_id: str, request: Request):
-    token = get_session_token(request)
+    token = processor.get_session_token(request)
     trustees = wsdl_client.get_object_trustees(token, doc_id)
     return trustees
+
+@router.get("/api/groups", response_model=List[Group])
+def get_groups(request: Request):
+    token = processor.get_session_token(request)
+    user = request.session.get('user')
+
+    # Get raw security level from user session
+    raw_level = user.get('security_level', 0) if user else 0
+
+    # Convert to integer using helper
+    try:
+        security_level = int(raw_level)
+    except ValueError:
+        security_level = processor.get_security_level_int(raw_level)
+
+    username = user.get('username')
+
+    # If admin (level 9), show all groups. Otherwise, show only user's groups.
+    if security_level >= 9:
+        groups = wsdl_client.get_all_groups(token)
+    else:
+        # Falls back to get_all_groups inside wsdl_client if user-search fails
+        groups = wsdl_client.get_groups_for_user(token, username)
+
+    return groups
 
 @router.get("/api/groups/search_members", response_model=dict)
 def search_group_members(
         request: Request,
         search: str = Query(""),
-        page: int = 1
+        page: int = 1,
+        group_id: str = Query(None)
 ):
-    token = get_session_token(request)
-    username = get_current_username(request)
+    token = processor.get_session_token(request)
 
-    members = []
+    # Use provided group_id or fallback
+    target_group = group_id if group_id else "EDMS_TEST_GRP_2"
 
-    # If we have a username, try to get their group members
-    if username:
-        members = wsdl_client.get_current_user_group_members(token, username)
-    else:
-        # Fallback
-        target_group = "EDMS_TEST_GRP_2"
-        members = wsdl_client.search_users_in_group(token, target_group, search)
+    members = wsdl_client.search_users_in_group(token, target_group, search)
 
-    # Filter by search term
-    if search:
-        members = [m for m in members if
-                   search.lower() in m['full_name'].lower() or search.lower() in m['user_id'].lower()]
-
-    # Pagination
+    # Manual Pagination since SOAP returns all
     start = (page - 1) * 20
     end = start + 20
     paged_members = members[start:end]

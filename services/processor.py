@@ -5,6 +5,7 @@ import api_client
 import db_connector
 import wsdl_client
 from utils.common import clean_repeated_words
+from fastapi import HTTPException, Request
 
 async def process_document(doc, dms_session_token):
     docnumber = doc['docnumber']
@@ -189,3 +190,24 @@ async def process_document(doc, dms_session_token):
         else:
             results['status'] = 1
     return results
+
+def get_security_level_int(role: str) -> int:
+    role = str(role).lower()
+    if role in ['admin', 'administrator', '9']:
+        return 9
+    if role in ['editor', 'manager', '5']:
+        return 5
+    # Default/Reader
+    return 0
+
+def get_session_token(request: Request):
+    user = request.session.get('user')
+    if not user or 'token' not in user:
+        token = db_connector.dms_system_login()
+        if token: return token
+        raise HTTPException(status_code=401, detail="Session required")
+    return user['token']
+
+def get_current_username(request: Request):
+    user = request.session.get('user')
+    return user['username'] if user else None
