@@ -929,54 +929,287 @@ def rename_document(dst, doc_id, new_name):
     except Exception:
         return False
 
-def set_trustees(dst, doc_id, library, trustees, security_enabled="1"):
+def resolve_trustee_system_id(dst, sys_id):
+    """
+    Resolves a numeric System ID to a textual User ID or Group ID.
+    Returns: (text_id, flag) where flag is 2 for User, 1 for Group.
+    """
+    logging.info(f"Resolving System ID: {sys_id}")
     try:
         svc_client = get_soap_client('BasicHttpBinding_IDMSvc')
+        data_client = find_client_with_operation('GetDataW') or svc_client
+        method_name = 'GetDataW' if hasattr(data_client.service, 'GetDataW') else 'GetData'
+
+        # Helper to perform a quick search and fetch one value
+        def quick_lookup(obj_type, criteria_field, return_field):
+            logging.debug(f"Lookup: {obj_type} where {criteria_field} = {sys_id}")
+            try:
+                search_call = {
+                    'call': {
+                        'dstIn': dst,
+                        'objectType': obj_type,
+                        'signature': {
+                            'libraries': {'string': ['RTA_MAIN']},
+                            'criteria': {
+                                'criteriaCount': 1,
+                                'criteriaNames': {'string': [criteria_field]},
+                                'criteriaValues': {'string': [str(sys_id)]}
+                            },
+                            'retProperties': {'string': [return_field]},
+                            'maxRows': 1
+                        }
+                    }
+                }
+                resp = svc_client.service.Search(**search_call)
+                if resp and resp.resultCode == 0 and resp.resultSetID:
+                    d_resp = getattr(data_client.service, method_name)(
+                        call={'resultSetID': resp.resultSetID, 'requestedRows': 1, 'startingRow': 0})
+
+                    try:
+                        svc_client.service.ReleaseObject(call={'objectID': resp.resultSetID})
+                    except:
+                        pass
+
+                    row_nodes = getattr(d_resp, 'rowNode', None) or getattr(d_resp, 'RowNode', None)
+                    if row_nodes and row_nodes[0].propValues.anyType:
+                        val = row_nodes[0].propValues.anyType[0]
+                        if val:
+                            logging.info(f"Found match in {obj_type}: {val}")
+                            return str(val)
+            except Exception as e:
+                logging.debug(f"Lookup failed for {obj_type}: {e}")
+            return None
+
+        # 1. Search Groups (v_groups)
+        group_id = quick_lookup('v_groups', 'SYSTEM_ID', 'GROUP_ID')
+        if group_id: return group_id, 1
+
+        # 2. Search Users (v_peoples)
+        user_id = quick_lookup('v_peoples', 'SYSTEM_ID', 'USER_ID')
+        if user_id: return user_id, 2
+
+        user_id_pid = quick_lookup('v_peoples', 'PEOPLE_ID', 'USER_ID')
+        if user_id_pid: return user_id_pid, 2
+
+        # 3. Search Specialized Groups
+        ug_id = quick_lookup('v_usergroups', 'SYSTEM_ID', 'GROUP_ID')
+        if ug_id: return ug_id, 1
+
+        ng_id = quick_lookup('v_nativegroups', 'SYSTEM_ID', 'GROUP_ID')
+        if ng_id: return ng_id, 1
+
+        # 4. Search Users (Legacy)
+        user_id_psid = quick_lookup('v_peoples', 'PEOPLE_SYSTEM_ID', 'USER_ID')
+        if user_id_psid: return user_id_psid, 2
+
+        # 5. Search DEF_PROF (Profile lookup) - Check both %OBJECT_IDENTIFIER and DOCNUMBER
+        # Users/Groups are documents. DOCNAME contains the UserID/GroupID.
+        for field in ['%OBJECT_IDENTIFIER', 'DOCNUMBER']:
+            logging.debug(f"Lookup: DEF_PROF where {field} = {sys_id}")
+            try:
+                search_call = {
+                    'call': {
+                        'dstIn': dst,
+                        'objectType': 'DEF_PROF',
+                        'signature': {
+                            'libraries': {'string': ['RTA_MAIN']},
+                            'criteria': {
+                                'criteriaCount': 1,
+                                'criteriaNames': {'string': [field]},
+                                'criteriaValues': {'string': [str(sys_id)]}
+                            },
+                            'retProperties': {'string': ['DOCNAME', 'TYPE_ID']},
+                            'maxRows': 1
+                        }
+                    }
+                }
+                resp = svc_client.service.Search(**search_call)
+                if resp and resp.resultCode == 0 and resp.resultSetID:
+                    d_resp = getattr(data_client.service, method_name)(
+                        call={'resultSetID': resp.resultSetID, 'requestedRows': 1, 'startingRow': 0})
+                    svc_client.service.ReleaseObject(call={'objectID': resp.resultSetID})
+
+                    row_nodes = getattr(d_resp, 'rowNode', None) or getattr(d_resp, 'RowNode', None)
+                    if row_nodes and row_nodes[0].propValues.anyType:
+                        docname = row_nodes[0].propValues.anyType[0]
+                        type_id = str(row_nodes[0].propValues.anyType[1] or "").upper()
+
+                        if docname:
+                            flag = 1 if ('GROUP' in type_id) else 2
+                            logging.info(f"Found profile match: {docname} (Type: {type_id}, Flag: {flag})")
+                            return str(docname), flag
+            except Exception as e:
+                logging.debug(f"Lookup failed for DEF_PROF ({field}): {e}")
+
+    except Exception as e:
+        logging.error(f"Error resolving system ID {sys_id}: {e}")
+
+    return None, None
+
+def set_trustees(dst, doc_id, library, trustees, security_enabled="1"):
+    try:
+        logging.info(f"Setting trustees for doc_id: {doc_id} in library: {library}. Raw count: {len(trustees)}")
+        svc_client = get_soap_client('BasicHttpBinding_IDMSvc')
+
+        # Define types
         string_type = svc_client.get_type('{http://www.w3.org/2001/XMLSchema}string')
+        int_type = svc_client.get_type('{http://www.w3.org/2001/XMLSchema}int')
         string_array_type = svc_client.get_type(
             '{http://schemas.microsoft.com/2003/10/Serialization/Arrays}ArrayOfstring')
         int_array_type = svc_client.get_type('{http://schemas.microsoft.com/2003/10/Serialization/Arrays}ArrayOfint')
 
-        names = [t.username for t in trustees]
-        flags = [t.flag if t.flag is not None else 2 for t in trustees]
-        rights = [t.rights for t in trustees]
+        # Pre-process trustees
+        candidate_list = []
+        for t in trustees:
+            u_name = None
+            flag_val = None
+            right_val = None
+            type_val = None
 
-        trustee_names_obj = string_array_type(names)
-        trustee_flags_obj = int_array_type(flags)
-        trustee_rights_obj = int_array_type(rights)
+            if isinstance(t, dict):
+                u_name = t.get('username')
+                flag_val = t.get('flag')
+                right_val = t.get('rights')
+                type_val = t.get('type')
+            else:
+                u_name = getattr(t, 'username', None)
+                flag_val = getattr(t, 'flag', None)
+                right_val = getattr(t, 'rights', None)
+                type_val = getattr(t, 'type', None)
+
+            if u_name:
+                item = {
+                    'name': str(u_name).strip(),
+                    'rights': int(right_val) if right_val is not None else 1,
+                    'inferred': False
+                }
+
+                if flag_val is not None:
+                    item['flag'] = int(flag_val)
+                else:
+                    item['inferred'] = True
+                    if type_val and str(type_val).lower() in ['group', 'g', '1']:
+                        item['flag'] = 1
+                    else:
+                        item['flag'] = 2
+
+                candidate_list.append(item)
+
+        if not candidate_list:
+            return False, "No valid trustee names provided."
 
         prop_names = string_array_type(['%TARGET_LIBRARY', '%OBJECT_IDENTIFIER', '%RECENTLY_USED_LOCATION', 'SECURITY'])
 
+        sec_val = "1"
+        if security_enabled and str(security_enabled).strip() in ['0', '1']:
+            sec_val = str(security_enabled).strip()
+
         val_list = [
             xsd.AnyObject(string_type, library),
-            xsd.AnyObject(string_type, str(doc_id)),
+            xsd.AnyObject(int_type, int(doc_id)),
             xsd.AnyObject(string_type, f"DOCSOPEN!L\\{library}"),
-            xsd.AnyObject(string_type, str(security_enabled))
+            xsd.AnyObject(string_type, sec_val)
         ]
         prop_values = {'anyType': val_list}
 
-        call_data = {
-            'dstIn': dst,
-            'objectType': 'DEF_PROF',
-            'properties': {
-                'propertyCount': 4,
-                'propertyNames': prop_names,
-                'propertyValues': prop_values
-            },
-            'trustees': {
-                'trusteeCount': len(trustees),
-                'trusteeNames': trustee_names_obj,
-                'trusteeFlags': trustee_flags_obj,
-                'trusteeRights': trustee_rights_obj
-            }
-        }
+        # Retry Loop
+        attempts = 0
+        max_attempts = 2
 
-        response = svc_client.service.SetTrustees(call=call_data)
-        if response.resultCode == 0:
-            return True, "Success"
-        return False, f"Error: {getattr(response, 'resultCode', 'Unknown')}"
+        while attempts < max_attempts:
+            attempts += 1
+
+            current_names = [x['name'] for x in candidate_list]
+            current_flags = [x['flag'] for x in candidate_list]
+            current_rights = [x['rights'] for x in candidate_list]
+
+            logging.info(
+                f"Trustee Payload (Attempt {attempts}) -> Names: {current_names} | Flags: {current_flags} | Rights: {current_rights}")
+
+            call_data = {
+                'dstIn': dst,
+                'objectType': 'DEF_PROF',
+                'properties': {
+                    'propertyCount': 4,
+                    'propertyNames': prop_names,
+                    'propertyValues': prop_values
+                },
+                'trustees': {
+                    'trusteeCount': len(candidate_list),
+                    'trusteeNames': string_array_type(current_names),
+                    'trusteeFlags': int_array_type(current_flags),
+                    'trusteeRights': int_array_type(current_rights)
+                }
+            }
+
+            try:
+                response = svc_client.service.SetTrustees(call=call_data)
+
+                if response.resultCode == 0:
+                    return True, "Success"
+
+                error_msg = getattr(response, 'errorDoc', '') or getattr(response, 'resultCode', 'Unknown')
+
+                if "unknown trustee" in str(error_msg).lower() and attempts < max_attempts:
+                    raise Fault("Unknown trustee (detected in ResultCode)")
+
+                logging.error(f"SetTrustees failed with result code: {response.resultCode}, ErrorDoc: {error_msg}")
+                return False, f"Error: {error_msg}"
+
+            except Fault as f:
+                fault_msg = f.message or str(f)
+                if "unknown trustee" in fault_msg.lower() and attempts < max_attempts:
+                    logging.warning(f"SetTrustees failed with 'unknown trustee'. Attempting auto-correction.")
+
+                    changed_any = False
+
+                    # 1. Try to resolve numeric IDs
+                    for item in candidate_list:
+                        if item['name'].isdigit():
+                            logging.info(f"Resolving ID {item['name']}...")
+                            resolved_name, resolved_flag = resolve_trustee_system_id(dst, item['name'])
+                            if resolved_name:
+                                logging.info(
+                                    f"Resolved {item['name']} -> {resolved_name} (Type: {'User' if resolved_flag == 2 else 'Group'})")
+                                item['name'] = resolved_name
+                                item['flag'] = resolved_flag
+                                changed_any = True
+                            else:
+                                logging.warning(f"Resolution failed for {item['name']}.")
+
+                    # 2. If no resolution, fallback to swapping inferred flags
+                    if not changed_any:
+                        # a) Forced Numeric Swap (User -> Group)
+                        for item in candidate_list:
+                            if item['name'].isdigit() and item['flag'] == 2:
+                                item['flag'] = 1
+                                changed_any = True
+
+                        if changed_any:
+                            logging.info("Forced swap of numeric trustee from User to Group.")
+                        else:
+                            # b) Generic Inferred Swap
+                            for item in candidate_list:
+                                if item['inferred'] and item['flag'] == 2:
+                                    item['flag'] = 1
+                                    changed_any = True
+                            if changed_any:
+                                logging.info("Swapped inferred User flags to Group flags.")
+
+                    if changed_any:
+                        continue
+
+                logging.error(f"SOAP Fault in set_trustees: {fault_msg}", exc_info=True)
+                return False, f"SOAP Fault: {fault_msg}"
+
+            except Exception as e:
+                logging.error(f"Exception in set_trustees: {e}", exc_info=True)
+                return False, str(e)
+
+        return False, "Failed to set trustees after retries."
 
     except Exception as e:
+        logging.error(f"Critical Exception in set_trustees wrapper: {e}", exc_info=True)
         return False, str(e)
 
 def get_object_trustees(dst, doc_id, library='RTA_MAIN'):
@@ -1194,21 +1427,22 @@ def search_users_in_group(dst, group_id, search_term, library='RTA_MAIN'):
         def clean_text(text):
             if not text:
                 return ""
-            # Remove control characters
             return re.sub(r'[\x00-\x1f\x7f]', '', str(text)).strip()
 
-        # 1. Try Parsing Binary Buffer (Preferred for large datasets/GetDataW)
+        # 1. Try Parsing Binary Buffer
         if hasattr(data_reply, 'resultSetData') and data_reply.resultSetData:
             container = data_reply.resultSetData
             if hasattr(container, 'resultBuffer') and container.resultBuffer:
                 parsed_items = parse_user_result_buffer(container.resultBuffer)
                 for p in parsed_items:
-                    # Clean data
                     c_name = clean_text(p.get('full_name'))
                     c_id = clean_text(p.get('user_id'))
 
-                    # Filter junk and apply search term
-                    if c_name and c_id:
+                    # Filtering Logic:
+                    # 1. Must have ID and Name
+                    # 2. ID should NOT be purely numeric (system accounts often are numeric strings in some views)
+                    # 3. Match search term if provided
+                    if c_name and c_id and not c_id.isdigit():
                         if not search_term or (
                                 search_term.lower() in c_name.lower() or
                                 search_term.lower() in c_id.lower()):
@@ -1229,7 +1463,8 @@ def search_users_in_group(dst, group_id, search_term, library='RTA_MAIN'):
                         c_id = clean_text(raw_id)
                         c_name = clean_text(raw_name)
 
-                        if c_id and c_name:
+                        # Filtering Logic (same as above)
+                        if c_id and c_name and not c_id.isdigit():
                             if not search_term or (
                                     search_term.lower() in c_name.lower() or search_term.lower() in c_id.lower()):
                                 members.append({'user_id': c_id, 'full_name': c_name})

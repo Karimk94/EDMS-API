@@ -24,3 +24,29 @@ def clean_repeated_words(text):
         else:
             result_words.append(words[i])
     return " ".join(result_words)
+
+def get_current_user(request: Request):
+    """
+    Unified function to retrieve the current authenticated user from the session.
+    Raises 401 Unauthorized if the user is not logged in.
+    """
+    user = request.session.get('user')
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Unauthorized: User not logged in"
+        )
+    return user
+
+def get_session_token(request: Request):
+    """
+    Unified function to retrieve the DMS token from the current user's session.
+    """
+    user = get_current_user(request)
+    token = user.get('token')
+    if not token:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Unauthorized: Valid session token not found"
+        )
+    return token

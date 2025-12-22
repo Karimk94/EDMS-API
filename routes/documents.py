@@ -8,6 +8,7 @@ import io
 import mimetypes
 import logging
 import db_connector
+from  utils import common
 import wsdl_client
 from services.processor import process_document
 from utils.watermark import apply_watermark_to_image, apply_watermark_to_pdf, apply_watermark_to_video
@@ -343,19 +344,18 @@ async def get_document_event(doc_id: int):
     return event_info if event_info else {}
 
 @router.post('/api/document/{doc_id}/security')
-def set_document_security(doc_id: str, request: SetTrusteesRequest, x_session_id: str = Header(None)):
+def set_document_security(doc_id: str, data: SetTrusteesRequest, request: Request):
     """
-    Sets the trustees for a specific document or folder.
+    Sets the trustees for a specific document or folder using the unified session token.
     """
-    if not x_session_id:
-        raise HTTPException(status_code=401, detail="Session ID required")
+    token = common.get_session_token(request)
 
     success, message = wsdl_client.set_trustees(
-        dst=x_session_id,
+        dst=token,
         doc_id=doc_id,
-        library=request.library,
-        trustees=request.trustees,
-        security_enabled=request.security_enabled
+        library=data.library,
+        trustees=data.trustees,
+        security_enabled=data.security_enabled
     )
 
     if not success:
