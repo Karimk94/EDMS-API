@@ -159,13 +159,17 @@ def parse_binary_result_buffer(buffer):
         i = 0
         while i < len(tokens):
             token = tokens[i]
-            if token.isdigit() and len(token) >= 5:
+            # Update: Increased length check to >= 7.
+            # This prevents splitting on names containing 5 or 6 digit numbers (e.g. "testing 93993")
+            # while still catching valid DocIDs (usually 8 digits, e.g. 19xxxxxx).
+            if token.isdigit() and len(token) >= 7:
                 if i + 1 < len(tokens):
                     chunk_tokens = []
                     j = i + 1
                     while j < len(tokens):
                         next_token = tokens[j]
-                        if next_token.isdigit() and len(next_token) >= 5: break
+                        # Ensure we don't stop on small numbers inside names
+                        if next_token.isdigit() and len(next_token) >= 7: break
                         chunk_tokens.append(next_token)
                         j += 1
                     i = j - 1
@@ -174,13 +178,19 @@ def parse_binary_result_buffer(buffer):
                         item_type = 'folder'
                         media_type = 'folder'
                         is_folder = False
-                        if chunk_tokens[-1] == 'F' or (len(chunk_tokens) > 1 and chunk_tokens[-2] == 'F'):
+
+                        # Prioritize explicit type indicators: 'F' for Folder, 'N' for Node (File)
+                        if 'F' in chunk_tokens:
                             is_folder = True
+                        elif 'N' in chunk_tokens:
+                            is_folder = False
                         else:
+                            # Fallback: check against known folder app names if flags are missing
                             for t in chunk_tokens:
                                 if t.upper() in FOLDER_APPS:
                                     is_folder = True
                                     break
+
                         if not is_folder:
                             item_type = 'file'
                             media_type = 'resolve'
@@ -192,6 +202,7 @@ def parse_binary_result_buffer(buffer):
                                         break
                         name_parts = []
                         for t in chunk_tokens:
+                            # 'D' might also appear as a structural token similar to N/F
                             if t not in ['N', 'D', 'F'] and t.upper() not in FOLDER_APPS:
                                 name_parts.append(t)
                         full_name = " ".join(name_parts).strip()
