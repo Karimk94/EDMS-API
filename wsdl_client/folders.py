@@ -317,3 +317,29 @@ async def list_folder_contents(dst, parent_id=None, app_source=None, scope=None,
             for item in items:
                 if item.get('media_type') == 'resolve': item['media_type'] = 'pdf'
     return items
+
+async def get_root_folder_counts(dst):
+    """
+    Counts documents by media type (images, videos, files) recursively from the root.
+    """
+    try:
+        # Pass media_type_filter=None to get all docs
+        items = await get_recursive_doc_ids(dst, media_type_filter=None)
+
+        counts = {'images': 0, 'videos': 0, 'files': 0}
+
+        for item in items:
+            m_type = item.get('media_type', 'file')
+
+            if m_type == 'image':
+                counts['images'] += 1
+            elif m_type == 'video':
+                counts['videos'] += 1
+            else:
+                # Group pdf, file, text, etc into 'files'
+                counts['files'] += 1
+
+        return counts
+    except Exception as e:
+        logging.error(f"Error in get_root_folder_counts: {e}")
+        return {'images': 0, 'videos': 0, 'files': 0}

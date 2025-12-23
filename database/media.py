@@ -227,26 +227,22 @@ async def get_app_id_from_extension(extension):
 
 async def get_media_type_counts(app_source='unknown', scope=None):
     """Counts documents by media type (Async)."""
-    # This was the culprit. It calls wsdl_client.get_root_folder_counts which is likely async now.
     if scope == 'folders':
         dst = dms_system_login()
         if dst:
-            # AWAIT THIS!
             return await wsdl_client.get_root_folder_counts(dst)
         return {"images": 0, "videos": 0, "files": 0}
 
     conn = get_connection()
     if not conn: return None
 
-    range_start = 19677386
-    range_end = 19679115
-    doc_filter_sql = f"AND p.DOCNUMBER >= {range_start}"
+    doc_filter_sql = "AND p.RTA_TEXT1 = 'edms-media'"
 
     if app_source == 'edms-media':
-        doc_filter_sql = f"AND p.DOCNUMBER BETWEEN {range_start} AND {range_end}"
+        doc_filter_sql = "AND p.RTA_TEXT1 = 'edms-media'"
     elif app_source == 'smart-edms':
         smart_edms_floor = 19662092
-        doc_filter_sql = f"AND p.DOCNUMBER >= {smart_edms_floor} AND (p.DOCNUMBER < {range_start} OR p.DOCNUMBER > {range_end})"
+        doc_filter_sql = f"AND p.DOCNUMBER >= {smart_edms_floor} AND (p.RTA_TEXT1 IS NULL OR p.RTA_TEXT1 != 'edms-media')"
 
     try:
         with conn.cursor() as cursor:

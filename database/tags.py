@@ -84,16 +84,13 @@ async def fetch_all_tags(lang='en', security_level='Editor', app_source='unknown
     conn = await get_async_connection()
     if not conn: return []
 
-    range_start = 19677386
-    range_end = 19679115
-    smart_edms_floor = 19662092
-
-    doc_filter_sql = f"p.DOCNUMBER >= {range_start}"
+    doc_filter_sql = "p.RTA_TEXT1 = 'edms-media'"
 
     if app_source == 'edms-media':
-        doc_filter_sql = f"p.DOCNUMBER BETWEEN {range_start} AND {range_end}"
+        doc_filter_sql = "p.RTA_TEXT1 = 'edms-media'"
     elif app_source == 'smart-edms':
-        doc_filter_sql = f"p.DOCNUMBER >= {smart_edms_floor} AND (p.DOCNUMBER < {range_start} OR p.DOCNUMBER > {range_end})"
+        smart_edms_floor = 19662092
+        doc_filter_sql = f"p.DOCNUMBER >= {smart_edms_floor} AND (p.RTA_TEXT1 IS NULL OR p.RTA_TEXT1 != 'edms-media')"
 
     tags = set()
     try:

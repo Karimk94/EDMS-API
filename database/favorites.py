@@ -88,16 +88,13 @@ async def get_favorites(user_id, page=1, page_size=20, app_source='unknown'):
     documents = []
     total_rows = 0
 
-    range_start = 19677386
-    range_end = 19679115
-
-    doc_filter_sql = f"AND p.DOCNUMBER >= {range_start}"
+    doc_filter_sql = "AND p.RTA_TEXT1 = 'edms-media'"
 
     if app_source == 'edms-media':
-        doc_filter_sql = f"AND p.DOCNUMBER BETWEEN {range_start} AND {range_end}"
+        doc_filter_sql = "AND p.RTA_TEXT1 = 'edms-media'"
     elif app_source == 'smart-edms':
         smart_edms_floor = 19662092
-        doc_filter_sql = f"AND p.DOCNUMBER >= {smart_edms_floor} AND (p.DOCNUMBER < {range_start} OR p.DOCNUMBER > {range_end})"
+        doc_filter_sql = f"AND p.DOCNUMBER >= {smart_edms_floor} AND (p.RTA_TEXT1 IS NULL OR p.RTA_TEXT1 != 'edms-media')"
 
     try:
         async with conn.cursor() as cursor:

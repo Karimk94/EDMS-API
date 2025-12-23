@@ -98,7 +98,8 @@ async def process_batch(background_tasks: BackgroundTasks):
 async def api_upload_document(file: UploadFile = File(...), docname: Optional[str] = Form(None),
                               abstract: str = Form("Uploaded via EDMS Viewer"),
                               event_id: Optional[str] = Form(None), parent_id: Optional[str] = Form(None),
-                              date_taken: Optional[str] = Form(None)):
+                              date_taken: Optional[str] = Form(None),
+                              x_app_source: str = Header("unknown", alias="X-App-Source")):
     if not file.filename:
         raise HTTPException(status_code=400, detail="No selected file")
 
@@ -133,7 +134,8 @@ async def api_upload_document(file: UploadFile = File(...), docname: Optional[st
         "app_id": app_id,
         "filename": original_filename,
         "doc_date": doc_date_taken,
-        "event_id": parsed_event_id
+        "event_id": parsed_event_id,
+        "app_source": x_app_source
     }
 
     # Passing file.file (SpooledTemporaryFile) acts like a stream

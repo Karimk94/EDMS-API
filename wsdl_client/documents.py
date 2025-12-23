@@ -64,6 +64,10 @@ async def upload_document_to_dms(dst, file_stream, metadata, parent_id=None):
             xsd.AnyObject(string_type, '1')
         ]
 
+        if metadata.get('app_source') == 'edms-media':
+            property_names_list.append('RTA_TEXT1')
+            property_values_list.append(xsd.AnyObject(string_type, 'edms-media'))
+
         doc_date = metadata.get('doc_date')
         if doc_date:
             property_names_list.append('RTADOCDATE')

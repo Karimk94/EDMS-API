@@ -79,18 +79,13 @@ async def fetch_documents_from_oracle(page=1, page_size=20, search_term=None, da
             params[f'fid_{i}'] = doc_id
 
     else:
-        # --- Existing Dynamic Filtering Logic ---
-        range_start = 19677386
-        range_end = 19679115
-
-        # Default filter (fallback)
-        doc_filter_sql = f"AND p.DOCNUMBER >= {range_start}"
+        doc_filter_sql = "AND p.RTA_TEXT1 = 'edms-media'"
 
         if app_source == 'edms-media':
-            doc_filter_sql = f"AND p.DOCNUMBER BETWEEN {range_start} AND {range_end}"
+            doc_filter_sql = "AND p.RTA_TEXT1 = 'edms-media'"
         elif app_source == 'smart-edms':
             smart_edms_floor = 19662092
-            doc_filter_sql = f"AND p.DOCNUMBER >= {smart_edms_floor} AND (p.DOCNUMBER < {range_start} OR p.DOCNUMBER > {range_end})"
+            doc_filter_sql = f"AND p.DOCNUMBER >= {smart_edms_floor} AND (p.RTA_TEXT1 IS NULL OR p.RTA_TEXT1 != 'edms-media')"
 
         where_clauses.append(doc_filter_sql.replace('AND ', '', 1))  # Strip first AND if adding to list
 
@@ -129,7 +124,6 @@ async def fetch_documents_from_oracle(page=1, page_size=20, search_term=None, da
                         target_app_ids.append(str_id)
 
                 if target_app_ids:
-                    # Use TRIM(TO_CHAR(...)) to safely compare against string IDs
                     id_list = ",".join(f"'{x}'" for x in target_app_ids)
                     where_clauses.append(f"TRIM(TO_CHAR(p.APPLICATION)) IN ({id_list})")
                 else:
