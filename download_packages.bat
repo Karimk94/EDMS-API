@@ -1,17 +1,12 @@
 @echo off
-REM =================================================================
-REM  Package Downloader for Offline Deployment
-REM  - Downloads all packages from requirements.txt into a 'wheels' folder.
-REM =================================================================
+echo Cleaning old packages...
+rmdir /s /q packages
+mkdir packages
 
-echo [1/2] Changing directory to the script's location...
-cd /d "%~dp0"
+echo Downloading packages for Windows Python 3.12...
 
-echo [2/2] Downloading packages to the 'wheels' folder...
-call venv\Scripts\activate.bat
-if not exist wheels mkdir wheels
-pip download -r requirements.txt -d wheels
+pip wheel -r requirements.txt --wheel-dir ./packages
 
 echo.
-echo Package download complete. The 'wheels' folder is now ready.
+echo Download complete. Copy the 'packages' folder and 'requirements.txt' to your server.
 pause
