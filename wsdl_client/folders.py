@@ -120,11 +120,11 @@ async def get_recursive_doc_ids(dst, media_type_filter=None, search_term=None, s
                             media_type = 'folder' if is_folder else 'resolve'
                             if not is_folder and len(props) > 6 and props[6]:
                                 dos_ext = str(props[6]).lower().replace('.', '').strip()
-                                if dos_ext in ['jpg', 'jpeg', 'png', 'gif', 'bmp']:
+                                if dos_ext in ['jpg', 'jpeg', 'png', 'gif', 'bmp', 'tif', 'tiff', 'webp', 'heic']:
                                     media_type = 'image'
-                                elif dos_ext in ['mp4', 'mov', 'avi', 'mkv']:
+                                elif dos_ext in ['mp4', 'mov', 'avi', 'mkv', 'wmv', 'flv', 'webm', '3gp']:
                                     media_type = 'video'
-                                elif dos_ext in ['pdf', 'doc', 'docx']:
+                                elif dos_ext in ['pdf', 'doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx', 'txt']:
                                     media_type = 'pdf'
                             items_batch.append({'id': str(doc_id), 'name': name, 'media_type': media_type,
                                                 'type': 'folder' if is_folder else 'file'})
@@ -151,18 +151,26 @@ async def get_recursive_doc_ids(dst, media_type_filter=None, search_term=None, s
                             matching_docs.append(item)
                         continue
 
+                    if item.get('media_type') == 'resolve':
+                        ids_to_resolve.append(item)
+                        continue
+
                     is_match = True
-                    if search_term and search_term.lower() not in item['name'].lower(): is_match = False
+                    if search_term and search_term.lower() not in item['name'].lower():
+                        is_match = False
+
                     if is_match and media_type_filter:
-                        m_type = item.get('media_type')
-                        if m_type == 'resolve':
-                            ids_to_resolve.append(item)
-                            is_match = False
-                        elif m_type != media_type_filter:
-                            is_match = False
+                        item_media_type = item.get('media_type')
+                        if media_type_filter == 'files':
+                            if item_media_type in ['image', 'video']:
+                                is_match = False
+                        else:
+                            if item_media_type != media_type_filter:
+                                is_match = False
 
                     if is_match:
-                        if 'thumbnail_url' not in item: item['thumbnail_url'] = f"cache/{item['id']}.jpg"
+                        if 'thumbnail_url' not in item:
+                            item['thumbnail_url'] = f"cache/{item['id']}.jpg"
                         matching_docs.append(item)
 
                 if ids_to_resolve:
@@ -172,15 +180,24 @@ async def get_recursive_doc_ids(dst, media_type_filter=None, search_term=None, s
                         for resolve_item in ids_to_resolve:
                             doc_id = resolve_item['id']
                             r_type = resolved_map.get(doc_id, 'pdf')
+                            resolve_item['media_type'] = r_type
+
                             media_match = True
-                            if media_type_filter and r_type != media_type_filter: media_match = False
+                            if media_type_filter:
+                                if media_type_filter == 'files':
+                                    if r_type in ['image', 'video']:
+                                        media_match = False
+                                else:
+                                    if r_type != media_type_filter:
+                                        media_match = False
+
                             search_match = True
-                            if search_term and search_term.lower() not in resolve_item[
-                                'name'].lower(): search_match = False
+                            if search_term and search_term.lower() not in resolve_item['name'].lower():
+                                search_match = False
+
                             if media_match and search_match:
-                                resolve_item['media_type'] = r_type
-                                if 'thumbnail_url' not in resolve_item: resolve_item[
-                                    'thumbnail_url'] = f"cache/{doc_id}.jpg"
+                                if 'thumbnail_url' not in resolve_item:
+                                    resolve_item['thumbnail_url'] = f"cache/{doc_id}.jpg"
                                 matching_docs.append(resolve_item)
                     except Exception:
                         pass
@@ -201,13 +218,13 @@ async def list_folder_contents(dst, parent_id=None, app_source=None, scope=None,
     import db_connector
     items = []
     if parent_id == 'images':
-        media_type = 'image';
+        media_type = 'image'
         scope = 'folders'
     elif parent_id == 'videos':
-        media_type = 'video';
+        media_type = 'video'
         scope = 'folders'
     elif parent_id == 'files':
-        media_type = 'pdf';
+        media_type = 'files'
         scope = 'folders'
 
     target_id = parent_id
@@ -328,15 +345,33 @@ async def get_root_folder_counts(dst):
 
         counts = {'images': 0, 'videos': 0, 'files': 0}
 
-        for item in items:
-            m_type = item.get('media_type', 'file')
+        image_exts = {'jpg', 'jpeg', 'png', 'gif', 'bmp', 'tif', 'tiff', 'webp'}
+        video_exts = {'mp4', 'mov', 'avi', 'wmv', 'mkv', 'flv', 'webm', '3gp'}
+        pdf_exts = {'pdf', 'doc', 'docx', 'txt', 'xls', 'xlsx', 'ppt', 'pptx'}
 
+        for item in items:
+            m_type = item.get('media_type', 'resolve')
+
+            if m_type == 'resolve':
+                item_name = item.get('name', '')
+                if '.' in item_name:
+                    ext = item_name.split('.')[-1].lower()
+                    if ext in image_exts:
+                        m_type = 'image'
+                    elif ext in video_exts:
+                        m_type = 'video'
+                    elif ext in pdf_exts:
+                        m_type = 'pdf'
+                    else:
+                        m_type = 'file'
+
+            # Count based on resolved type
             if m_type == 'image':
                 counts['images'] += 1
             elif m_type == 'video':
                 counts['videos'] += 1
             else:
-                # Group pdf, file, text, etc into 'files'
+                # Group pdf, file, text, excel, powerpoint, etc into 'files'
                 counts['files'] += 1
 
         return counts
