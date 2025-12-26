@@ -1,3 +1,4 @@
+import logging
 from fastapi import APIRouter, Request, HTTPException, Header
 from typing import Optional
 import wsdl_client
@@ -80,7 +81,7 @@ async def api_rename_folder(folder_id: str, request: Request, data: RenameFolder
         else:
             raise HTTPException(status_code=500, detail="Failed to rename")
     except AttributeError:
-         raise HTTPException(status_code=500, detail="Rename function not implemented in WSDL client")
+        raise HTTPException(status_code=500, detail="Rename function not implemented in WSDL client")
 
 @router.delete('/api/folders/{folder_id}')
 async def api_delete_folder(folder_id: str, request: Request, force: bool = False):
@@ -99,32 +100,31 @@ async def api_delete_folder(folder_id: str, request: Request, force: bool = Fals
             return {"message": "Folder deleted", "id": folder_id}
 
         # Check for specific "Referenced by" error to prompt user
-        if "referenced by one or more folders" in message or "Unable to locate document" in message:
+        if "referenced by one or more folders" in message.lower() or "referenced" in message.lower():
             if not force:
                 raise HTTPException(
                     status_code=409,
-                    detail=f"Folder is not empty or referenced. {message}"
+                    detail=f"Folder is not empty or contains referenced items. Use force delete to remove all contents. Error: {message}"
                 )
             else:
                 # User confirmed Force Delete
-                # We pass 'dst' (token) directly. The function in wsdl_client handles the client creation.
-                contents_deleted = await wsdl_client.delete_folder_contents(dst, folder_id)
+                logging.info(f"Force deleting folder {folder_id} and all contents")
+
+                contents_deleted = await wsdl_client.delete_folder_contents(dst, folder_id, delete_root=True)
 
                 if not contents_deleted:
-                    raise HTTPException(status_code=500, detail="Failed to clear folder contents.")
+                    raise HTTPException(
+                        status_code=500,
+                        detail="Failed to clear folder contents. Some items may still be referenced elsewhere. Check logs for details."
+                    )
 
-                # Retry delete after emptying
-                success_retry, message_retry = wsdl_client.delete_document(dst, folder_id)
-                if success_retry:
-                    return {"message": "Folder and contents deleted", "id": folder_id}
-                else:
-                    raise HTTPException(status_code=500,
-                                        detail=f"Failed to delete folder after emptying: {message_retry}")
+                return {"message": "Folder and contents deleted", "id": folder_id}
 
         # Other errors
-        raise HTTPException(status_code=500, detail=message)
+        raise HTTPException(status_code=500, detail=f"Delete failed: {message}")
 
     except HTTPException as he:
         raise he
     except Exception as e:
+        logging.error(f"Error in api_delete_folder: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))

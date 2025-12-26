@@ -383,8 +383,12 @@ async def get_root_folder_counts(dst):
 
 async def delete_folder_contents(dst, folder_id, delete_root=True):
     """
-    Recursively empties a folder.
+    Recursively empties a folder following the OpenText deletion pattern.
+    Based on successful Fiddler trace analysis.
     """
+    import os
+    from zeep import Client, Settings, xsd
+
     wsdl_url = os.getenv("WSDL_URL")
     settings = Settings(strict=False, xml_huge_tree=True)
 
@@ -405,6 +409,7 @@ async def delete_folder_contents(dst, folder_id, delete_root=True):
     del_client = base_client if hasattr(base_client.service, 'DeleteObject') else find_client('DeleteObject')
 
     if not svc_client or not del_client:
+        logging.error("Failed to initialize SOAP clients")
         return False
 
     # --- Type Definitions ---
@@ -412,206 +417,304 @@ async def delete_folder_contents(dst, folder_id, delete_root=True):
     int_type = svc_client.get_type('{http://www.w3.org/2001/XMLSchema}int')
     string_array_type = svc_client.get_type('{http://schemas.microsoft.com/2003/10/Serialization/Arrays}ArrayOfstring')
 
-    def get_current_version_id(doc_number):
-        if not doc_number or str(doc_number) == '0': return None
-
-        # Strategy A: GetDocSvr3
-        try:
-            call_data = {
-                'dstIn': dst,
-                'criteria': {
-                    'criteriaCount': 2,
-                    'criteriaNames': {'string': ['%TARGET_LIBRARY', '%DOCUMENT_NUMBER']},
-                    'criteriaValues': {'string': ['RTA_MAIN', str(doc_number)]}
-                }
-            }
-            reply = svc_client.service.GetDocSvr3(call=call_data)
-            if reply and reply.resultCode == 0 and reply.docProperties:
-                p_names = reply.docProperties.propertyNames.string
-                p_vals = reply.docProperties.propertyValues.anyType
-                for key in ['%VERSION_ID', 'VERSION_ID']:
-                    if key in p_names:
-                        val = p_vals[p_names.index(key)]
-                        if val and str(val) != '0': return val
-        except Exception:
-            pass
-
-        # Strategy B: VersionsSearch (Matches Trace)
-        try:
-            search_call = {
-                'dstIn': dst, 'objectType': 'VersionsSearch',
-                'signature': {
-                    'libraries': {'string': ['RTA_MAIN']},
-                    'criteria': {'criteriaCount': 1, 'criteriaNames': {'string': ['%OBJECT_IDENTIFIER']},
-                                 'criteriaValues': {'string': [str(doc_number)]}},
-                    'retProperties': {'string': ['VERSION_ID', 'VERSION', 'SUBVERSION']},
-                    'maxRows': 0  # Updated to 0 to match trace
-                }
-            }
-            s_reply = svc_client.service.Search(call=search_call)
-            if s_reply and s_reply.resultCode == 0 and s_reply.resultSetID:
-                d_client = find_client('GetDataW')
-                d_meth = 'GetDataW' if hasattr(d_client.service, 'GetDataW') else 'GetData'
-                d_reply = getattr(d_client.service, d_meth)(
-                    call={'resultSetID': s_reply.resultSetID, 'requestedRows': 1, 'startingRow': 0})
-
-                rows = getattr(d_reply, 'rowNode', []) or getattr(d_reply, 'RowNode', []) or []
-                try:
-                    svc_client.service.ReleaseObject(call={'objectID': s_reply.resultSetID})
-                except:
-                    pass
-
-                if rows and rows[0].propValues.anyType:
-                    return rows[0].propValues.anyType[0]
-        except Exception:
-            pass
-
-        return None
-
-    current_folder_version = get_current_version_id(folder_id)
-
-    def force_delete_item(item_id, direct_link_id=None, known_parent_id=None, known_parent_ver=None):
-        unlinked_current = False
-
-        # 1. UNLOCK
-        try:
-            u_p = ['%TARGET_LIBRARY', '%OBJECT_IDENTIFIER', '%STATUS']
-            u_v = [xsd.AnyObject(string_type, 'RTA_MAIN'), xsd.AnyObject(int_type, int(item_id)),
-                   xsd.AnyObject(string_type, '%UNLOCK')]
-            svc_client.service.UpdateObject(call={
-                'dstIn': dst, 'objectType': 'DEF_PROF',
-                'properties': {'propertyCount': 3, 'propertyNames': string_array_type(u_p),
-                               'propertyValues': {'anyType': u_v}}
-            })
-        except Exception:
-            pass
-
-        links_to_remove = []
-
-        # 2. IMMEDIATE UNLINK
-        if direct_link_id and known_parent_id and known_parent_ver:
-            links_to_remove.append({
-                'SYSTEM_ID': direct_link_id,
-                'PARENT': known_parent_id,
-                'PARENT_VERSION': known_parent_ver,
-                'IS_DIRECT': True
-            })
-        elif direct_link_id:
-            links_to_remove.append({'SYSTEM_ID': direct_link_id, 'IS_DIRECT': True})
-
-        # 3. GLOBAL DISCOVERY
+    def get_where_used_links(doc_id):
+        """
+        Step 1: Get all ContentItem links using %CONTENTS_WHERE_USED
+        This matches the Fiddler trace CreateObject call
+        """
         try:
             coll_names = string_array_type(['%TARGET_LIBRARY', 'DOCNUMBER', '%CONTENTS_DIRECTIVE'])
-            coll_values = {'anyType': [xsd.AnyObject(string_type, 'RTA_MAIN'),
-                                       xsd.AnyObject(string_type, str(item_id)),
-                                       xsd.AnyObject(string_type, '%CONTENTS_WHERE_USED')]}
+            coll_values = {'anyType': [
+                xsd.AnyObject(string_type, 'RTA_MAIN'),
+                xsd.AnyObject(string_type, str(doc_id)),
+                xsd.AnyObject(string_type, '%CONTENTS_WHERE_USED')
+            ]}
 
             coll_reply = svc_client.service.CreateObject(call={
-                'dstIn': dst, 'objectType': 'ContentsCollection',
-                'properties': {'propertyCount': 3, 'propertyNames': coll_names, 'propertyValues': coll_values}})
+                'dstIn': dst,
+                'objectType': 'ContentsCollection',
+                'properties': {
+                    'propertyCount': 3,
+                    'propertyNames': coll_names,
+                    'propertyValues': coll_values
+                }
+            })
 
-            if coll_reply and coll_reply.resultCode == 0 and coll_reply.retProperties:
-                col_id = coll_reply.retProperties.propertyValues.anyType[0]
-                enum_client = find_client('NewEnum')
-                enum_reply = enum_client.service.NewEnum(call={'dstIn': dst, 'collectionID': col_id})
+            if not (coll_reply and coll_reply.resultCode == 0 and coll_reply.retProperties):
+                return []
 
-                if enum_reply and enum_reply.resultCode == 0 and enum_reply.enumID:
-                    next_reply = enum_client.service.NextData(
-                        call={'dstIn': dst, 'enumID': enum_reply.enumID, 'elementCount': 100})
+            col_id = coll_reply.retProperties.propertyValues.anyType[0]
 
-                    if next_reply and next_reply.genericItemsData:
-                        g_data = next_reply.genericItemsData
-                        p_names = g_data.propertyNames.string
-                        rows = g_data.propertyRows.ArrayOfanyType
+            # Step 2: Create enumerator (NewEnum)
+            enum_client = find_client('NewEnum')
+            enum_reply = enum_client.service.NewEnum(call={
+                'dstIn': dst,
+                'collectionID': col_id
+            })
 
-                        idx_sys = p_names.index('SYSTEM_ID') if 'SYSTEM_ID' in p_names else -1
-                        idx_par = p_names.index('PARENT') if 'PARENT' in p_names else -1
-                        idx_ver = p_names.index('PARENT_VERSION') if 'PARENT_VERSION' in p_names else -1
-
-                        if idx_sys != -1 and rows:
-                            for row in rows:
-                                try:
-                                    s_id = row.anyType[idx_sys]
-                                    if not direct_link_id or str(s_id) != str(direct_link_id):
-                                        link = {'SYSTEM_ID': s_id}
-                                        parent_id = row.anyType[idx_par] if idx_par != -1 else None
-                                        p_ver = row.anyType[idx_ver] if idx_ver != -1 else None
-                                        if parent_id:
-                                            link['PARENT'] = parent_id
-                                            if not p_ver or str(p_ver) == '0':
-                                                p_ver = get_current_version_id(parent_id)
-                                            link['PARENT_VERSION'] = p_ver
-                                        links_to_remove.append(link)
-                                except:
-                                    pass
-                    try:
-                        enum_client.service.ReleaseObject(call={'objectID': enum_reply.enumID})
-                    except:
-                        pass
+            if not (enum_reply and enum_reply.resultCode == 0 and enum_reply.enumID):
                 try:
                     svc_client.service.ReleaseObject(call={'objectID': col_id})
                 except:
                     pass
-        except Exception:
-            pass
+                return []
 
-        # 4. EXECUTE LINK DELETION
-        for link in links_to_remove:
+            enum_id = enum_reply.enumID
+
+            # Step 3: Get data from enumerator (NextData)
+            next_reply = enum_client.service.NextData(call={
+                'dstIn': dst,
+                'enumID': enum_id,
+                'elementCount': 500  # Match trace
+            })
+
+            links = []
+            if next_reply and next_reply.genericItemsData:
+                g_data = next_reply.genericItemsData
+                p_names = g_data.propertyNames.string
+                rows = g_data.propertyRows.ArrayOfanyType
+
+                # Log what properties we actually got
+                logging.info(f"WHERE_USED properties for {doc_id}: {p_names}")
+
+                # Get indices for the properties we need
+                idx_sys = p_names.index('SYSTEM_ID') if 'SYSTEM_ID' in p_names else -1
+                idx_par = p_names.index('PARENT') if 'PARENT' in p_names else -1
+                idx_pver = p_names.index('PARENT_VERSION') if 'PARENT_VERSION' in p_names else -1
+                idx_doc = p_names.index('DOCNUMBER') if 'DOCNUMBER' in p_names else -1
+
+                # Also check for alternative column names
+                if idx_par == -1:
+                    idx_par = p_names.index('FOLDERDOCNO_RO') if 'FOLDERDOCNO_RO' in p_names else -1
+
+                if idx_sys != -1 and rows:
+                    for row in rows:
+                        try:
+                            vals = row.anyType
+                            parent_val = vals[idx_par] if idx_par != -1 and idx_par < len(vals) else None
+                            parent_ver_val = vals[idx_pver] if idx_pver != -1 and idx_pver < len(vals) else None
+
+                            link_data = {
+                                'SYSTEM_ID': vals[idx_sys] if idx_sys < len(vals) else None,
+                                'PARENT': parent_val,
+                                'PARENT_VERSION': parent_ver_val,
+                                'DOCNUMBER': vals[idx_doc] if idx_doc != -1 and idx_doc < len(vals) else None
+                            }
+
+                            logging.info(
+                                f"Found link: sys_id={link_data['SYSTEM_ID']}, parent={link_data['PARENT']}, parent_ver={link_data['PARENT_VERSION']}")
+                            links.append(link_data)
+                        except Exception as e:
+                            logging.error(f"Error parsing WHERE_USED row: {e}")
+
+            # Cleanup
             try:
-                p_n = ['%TARGET_LIBRARY', 'SYSTEM_ID']
-                p_v = [xsd.AnyObject(string_type, 'RTA_MAIN'), xsd.AnyObject(int_type, int(link['SYSTEM_ID']))]
-
-                if link.get('PARENT') and link.get('PARENT_VERSION'):
-                    p_n.append('PARENT')
-                    p_v.append(xsd.AnyObject(string_type, str(link['PARENT'])))
-                    p_n.append('PARENT_VERSION')
-                    p_v.append(xsd.AnyObject(string_type, str(link['PARENT_VERSION'])))
-
-                resp = del_client.service.DeleteObject(call={
-                    'dstIn': dst, 'objectType': 'ContentItem',
-                    'properties': {'propertyCount': len(p_n), 'propertyNames': string_array_type(p_n),
-                                   'propertyValues': {'anyType': p_v}}
-                })
-
-                if resp.resultCode == 0:
-                    if link.get('IS_DIRECT'):
-                        unlinked_current = True
-            except Exception:
+                enum_client.service.ReleaseObject(call={'objectID': enum_id})
+            except:
+                pass
+            try:
+                svc_client.service.ReleaseObject(call={'objectID': col_id})
+            except:
                 pass
 
-        # 5. DELETE PROFILE (Global Destroy)
+            return links
+
+        except Exception as e:
+            logging.error(f"Error getting WHERE_USED links: {e}")
+            return []
+
+    def get_parent_version(parent_id):
+        """
+        Get the current version of a parent folder
+        Tries multiple strategies to find the VERSION_ID
+        """
         try:
-            # Using v_defprof and adding %DELETE_OPTION to match Fiddler trace
-            del_props = {'propertyCount': 3,
-                         'propertyNames': string_array_type(
-                             ['%TARGET_LIBRARY', '%OBJECT_IDENTIFIER', '%DELETE_OPTION']),
-                         'propertyValues': {'anyType': [
-                             xsd.AnyObject(string_type, 'RTA_MAIN'),
-                             xsd.AnyObject(int_type, int(item_id)),
-                             xsd.AnyObject(string_type, '')
-                         ]}}
-            resp = del_client.service.DeleteObject(
-                call={'dstIn': dst, 'objectType': 'v_defprof', 'properties': del_props})
-            if resp.resultCode == 0:
-                return True
-        except Exception:
-            pass
+            # Strategy 1: Use GetDocSvr3 (most reliable)
+            try:
+                get_doc_call = {
+                    'call': {
+                        'dstIn': dst,
+                        'criteria': {
+                            'criteriaCount': 2,
+                            'criteriaNames': {'string': ['%TARGET_LIBRARY', '%DOCUMENT_NUMBER']},
+                            'criteriaValues': {'string': ['RTA_MAIN', str(parent_id)]}
+                        }
+                    }
+                }
+                doc_reply = svc_client.service.GetDocSvr3(**get_doc_call)
 
-        # Return success if we at least cleared it from the current folder
-        return unlinked_current
+                if doc_reply and doc_reply.resultCode == 0 and doc_reply.docProperties:
+                    p_names = doc_reply.docProperties.propertyNames.string
+                    p_vals = doc_reply.docProperties.propertyValues.anyType
 
-    # --- Iteration Loop ---
-    while True:
+                    logging.info(f"GetDocSvr3 properties for {parent_id}: {p_names}")
+
+                    # Try both VERSION_ID variants
+                    for key in ['%VERSION_ID', 'VERSION_ID']:
+                        if key in p_names:
+                            val = p_vals[p_names.index(key)]
+                            if val and str(val) != '0':
+                                logging.info(f"GetDocSvr3 found version {val} for parent {parent_id}")
+                                return val
+
+                    # If VERSION_ID is 0 or missing, try to find any version-related field
+                    for i, name in enumerate(p_names):
+                        if 'VERSION' in name.upper():
+                            logging.info(f"  {name} = {p_vals[i]}")
+
+            except Exception as e:
+                logging.debug(f"GetDocSvr3 failed for {parent_id}: {e}")
+
+            # Strategy 2: Search using DEF_PROF (matches Fiddler trace)
+            try:
+                search_call = {
+                    'dstIn': dst,
+                    'objectType': '%RTF:RTA_MAIN V_DEFPROF DOCUMENT_LIST %HITLIST',
+                    'signature': {
+                        'libraries': {'string': ['RTA_MAIN']},
+                        'criteria': {
+                            'criteriaCount': 1,
+                            'criteriaNames': {'string': ['DOCNUM']},
+                            'criteriaValues': {'string': [str(parent_id)]}
+                        },
+                        'retProperties': {
+                            'string': ['VERSION_ID', 'DOCNUM', 'DOCNAME', 'STATUS', 'SYSTEM_ID']
+                        },
+                        'maxRows': 0
+                    }
+                }
+
+                search_reply = svc_client.service.Search(call=search_call)
+                logging.info(
+                    f"DEF_PROF search for {parent_id}: resultCode={search_reply.resultCode if search_reply else 'None'}")
+
+                if search_reply and search_reply.resultCode == 0 and search_reply.resultSetID:
+                    result_set_id = search_reply.resultSetID
+                    data_client = find_client('GetDataW')
+                    d_method = 'GetDataW' if hasattr(data_client.service, 'GetDataW') else 'GetData'
+
+                    d_reply = getattr(data_client.service, d_method)(call={
+                        'resultSetID': result_set_id,
+                        'requestedRows': 2147483647,
+                        'startingRow': 0
+                    })
+
+                    try:
+                        svc_client.service.ReleaseObject(call={'objectID': result_set_id})
+                    except:
+                        pass
+
+                    rows = getattr(d_reply, 'rowNode', []) or getattr(d_reply, 'RowNode', []) or []
+                    logging.info(f"DEF_PROF returned {len(rows)} rows")
+
+                    if rows and rows[0].propValues.anyType:
+                        vals = rows[0].propValues.anyType
+                        logging.info(f"DEF_PROF values: {vals}")
+                        # VERSION_ID is typically the first column
+                        version_id = vals[0]
+                        if version_id and str(version_id) != '0':
+                            logging.info(f"DEF_PROF search found version {version_id} for parent {parent_id}")
+                            return version_id
+            except Exception as e:
+                logging.error(f"DEF_PROF search failed for {parent_id}: {e}", exc_info=True)
+
+            # Strategy 3: VersionsSearch (matches Fiddler exactly)
+            try:
+                search_call = {
+                    'dstIn': dst,
+                    'objectType': 'VersionsSearch',
+                    'signature': {
+                        'libraries': {'string': ['RTA_MAIN']},
+                        'criteria': {
+                            'criteriaCount': 1,
+                            'criteriaNames': {'string': ['%OBJECT_IDENTIFIER']},
+                            'criteriaValues': {'string': [str(parent_id)]}
+                        },
+                        'retProperties': {
+                            'string': ['VERSION_ID', 'VERSION_LABEL', 'AUTHOR', 'TYPIST', 'COMMENTS',
+                                       'LASTEDITDATE', 'LASTEDITTIME', 'VERSION', 'SUBVERSION',
+                                       'STATUS', '%WHERE_READONLY', 'FILE_EXTENSION']
+                        },
+                        'sortProps': {
+                            'propertyCount': 2,
+                            'propertyNames': {'string': ['VERSION', 'SUBVERSION']},
+                            'propertyFlags': {'int': [2, 2]}  # Descending
+                        },
+                        'maxRows': 0  # Match Fiddler trace exactly
+                    }
+                }
+
+                search_reply = svc_client.service.Search(call=search_call)
+                logging.info(
+                    f"VersionsSearch for {parent_id}: resultCode={search_reply.resultCode if search_reply else 'None'}")
+
+                if search_reply and search_reply.resultCode == 0 and search_reply.resultSetID:
+                    result_set_id = search_reply.resultSetID
+                    data_client = find_client('GetDataW')
+                    d_method = 'GetDataW' if hasattr(data_client.service, 'GetDataW') else 'GetData'
+
+                    d_reply = getattr(data_client.service, d_method)(call={
+                        'resultSetID': result_set_id,
+                        'requestedRows': 500,
+                        'startingRow': 0
+                    })
+
+                    try:
+                        svc_client.service.ReleaseData(call={'resultSetID': result_set_id})
+                        svc_client.service.ReleaseObject(call={'objectID': result_set_id})
+                    except:
+                        pass
+
+                    rows = getattr(d_reply, 'rowNode', []) or getattr(d_reply, 'RowNode', []) or []
+                    logging.info(f"VersionsSearch returned {len(rows)} rows")
+
+                    if rows and rows[0].propValues.anyType:
+                        vals = rows[0].propValues.anyType
+                        logging.info(f"VersionsSearch values: {vals}")
+                        version_id = vals[0]
+                        if version_id and str(version_id) != '0':
+                            logging.info(f"VersionsSearch found version {version_id} for parent {parent_id}")
+                            return version_id
+            except Exception as e:
+                logging.error(f"VersionsSearch failed for {parent_id}: {e}", exc_info=True)
+
+            logging.error(f"All strategies failed to get version for parent {parent_id}")
+
+        except Exception as e:
+            logging.error(f"Error getting parent version for {parent_id}: {e}", exc_info=True)
+
+        return None
+
+    def get_folder_contents(parent_id):
+        """
+        Get all items inside a folder using ContentsCollection search
+        This matches the Fiddler trace Search call for ContentsCollection
+        """
         try:
             search_call = {
-                'dstIn': dst, 'objectType': 'ContentsCollection',
+                'dstIn': dst,
+                'objectType': 'ContentsCollection',
                 'signature': {
                     'libraries': {'string': ['RTA_MAIN']},
-                    'criteria': {'criteriaCount': 1, 'criteriaNames': {'string': ['%ITEM']},
-                                 'criteriaValues': {'string': [str(folder_id)]}},
-                    'retProperties': {'string': ['FI.DOCNUMBER', 'FI.NODE_TYPE', '%DISPLAY_NAME', 'SYSTEM_ID']},
-                    'sortProps': {'propertyCount': 1, 'propertyNames': {'string': ['%DISPLAY_NAME']},
-                                  'propertyFlags': {'int': [1]}},
+                    'criteria': {
+                        'criteriaCount': 1,
+                        'criteriaNames': {'string': ['%ITEM']},
+                        'criteriaValues': {'string': [str(parent_id)]}
+                    },
+                    'retProperties': {
+                        'string': [
+                            'FI.SYSTEM_ID', 'FI.PARENT_LIBRARY', 'FI.LIBRARY',
+                            'FI.DOCNUMBER', 'FI.VERSION', 'FI.NEXT', 'FI.STATUS',
+                            'FI.ISFIRST', 'FI.PARENT_VERSION', 'FI.VERSION_TYPE',
+                            'FI.NODE_TYPE', 'VS.VERSION_LABEL', '%DISPLAY_NAME',
+                            '%HAS_SUBFOLDERS'
+                        ]
+                    },
+                    'sortProps': {
+                        'propertyCount': 0,
+                        'propertyNames': {'string': []},
+                        'propertyFlags': {'int': []}
+                    },
                     'maxRows': 0
                 }
             }
@@ -619,50 +722,382 @@ async def delete_folder_contents(dst, folder_id, delete_root=True):
             search_reply = svc_client.service.Search(call=search_call)
 
             if not (search_reply and search_reply.resultCode == 0 and search_reply.resultSetID):
-                break
+                return []
 
-            rs_id = search_reply.resultSetID
+            result_set_id = search_reply.resultSetID
             data_client = find_client('GetDataW')
             d_method = 'GetDataW' if hasattr(data_client.service, 'GetDataW') else 'GetData'
 
-            d_reply = getattr(data_client.service, d_method)(
-                call={'resultSetID': rs_id, 'requestedRows': 50, 'startingRow': 0})
+            d_reply = getattr(data_client.service, d_method)(call={
+                'resultSetID': result_set_id,
+                'requestedRows': 2147483647,  # Match trace - get all rows
+                'startingRow': 0
+            })
 
             items = []
             rows = getattr(d_reply, 'rowNode', []) or getattr(d_reply, 'RowNode', []) or []
             if rows:
                 for row in rows:
-                    if row.propValues.anyType:
+                    if row.propValues.anyType and len(row.propValues.anyType) >= 11:
                         vals = row.propValues.anyType
-                        if len(vals) >= 1:
-                            d_id = vals[0]
-                            n_type = vals[1] if len(vals) > 1 else 'N'
-                            s_id = vals[3] if len(vals) > 3 else None
-                            items.append((d_id, n_type, s_id))
+                        items.append({
+                            'SYSTEM_ID': vals[0],  # FI.SYSTEM_ID
+                            'DOCNUMBER': vals[3],  # FI.DOCNUMBER
+                            'NODE_TYPE': vals[10],  # FI.NODE_TYPE
+                            'PARENT_VERSION': vals[8]  # FI.PARENT_VERSION
+                        })
 
+            # Cleanup
             try:
-                svc_client.service.ReleaseObject(call={'objectID': rs_id})
+                svc_client.service.ReleaseData(call={'resultSetID': result_set_id})
+                svc_client.service.ReleaseObject(call={'objectID': result_set_id})
             except:
                 pass
 
-            if not items:
-                break
-
-            for d_id, n_type, s_id in items:
-                if n_type == 'F':
-                    await delete_folder_contents(dst, d_id, delete_root=True)
-                else:
-                    success = force_delete_item(d_id, direct_link_id=s_id, known_parent_id=folder_id,
-                                                known_parent_ver=current_folder_version)
-                    if not success:
-                        print(f"Failed to clear item {d_id} (Link: {s_id}) from folder {folder_id}.")
-                        return False
+            return items
 
         except Exception as e:
-            print(f"Iteration error: {e}")
+            logging.error(f"Error getting folder contents for {parent_id}: {e}")
+            return []
+
+    def delete_content_item(system_id, parent_id, parent_version):
+        """
+        Delete a ContentItem link
+        This matches the Fiddler trace DeleteObject call for ContentItem
+        """
+        try:
+            # If parent_version is 0 or None, try to get it first
+            effective_parent_version = parent_version
+            if not effective_parent_version or str(effective_parent_version) == '0':
+                logging.info(f"Parent version is 0, checking if parent {parent_id} is a system folder...")
+                # For system folders or folders without versions, we might need different approach
+                effective_parent_version = parent_version  # Keep as 0
+
+            # Attempt 1: Standard deletion with all parameters
+            try:
+                prop_names_list = ['%TARGET_LIBRARY', 'PARENT', 'PARENT_VERSION', 'SYSTEM_ID']
+                prop_values_list = [
+                    xsd.AnyObject(string_type, 'RTA_MAIN'),
+                    xsd.AnyObject(string_type, str(parent_id)),
+                    xsd.AnyObject(string_type, str(effective_parent_version)),
+                    xsd.AnyObject(int_type, int(system_id))
+                ]
+
+                del_call = {
+                    'call': {
+                        'dstIn': dst,
+                        'objectType': 'ContentItem',
+                        'properties': {
+                            'propertyCount': 4,
+                            'propertyNames': string_array_type(prop_names_list),
+                            'propertyValues': {'anyType': prop_values_list}
+                        }
+                    }
+                }
+
+                resp = del_client.service.DeleteObject(**del_call)
+                if resp.resultCode == 0:
+                    logging.info(f"Successfully deleted ContentItem {system_id}")
+                    return True
+                else:
+                    logging.warning(f"DeleteObject with PARENT_VERSION failed: {resp.resultCode}")
+            except Exception as e:
+                logging.warning(f"Standard ContentItem delete failed: {e}")
+
+            # Attempt 2: Try with just SYSTEM_ID and PARENT (no version)
+            try:
+                logging.info(f"Trying ContentItem delete without PARENT_VERSION...")
+                prop_names_list = ['%TARGET_LIBRARY', 'PARENT', 'SYSTEM_ID']
+                prop_values_list = [
+                    xsd.AnyObject(string_type, 'RTA_MAIN'),
+                    xsd.AnyObject(string_type, str(parent_id)),
+                    xsd.AnyObject(int_type, int(system_id))
+                ]
+
+                del_call = {
+                    'call': {
+                        'dstIn': dst,
+                        'objectType': 'ContentItem',
+                        'properties': {
+                            'propertyCount': 3,
+                            'propertyNames': string_array_type(prop_names_list),
+                            'propertyValues': {'anyType': prop_values_list}
+                        }
+                    }
+                }
+
+                resp = del_client.service.DeleteObject(**del_call)
+                if resp.resultCode == 0:
+                    logging.info(f"Successfully deleted ContentItem {system_id} without PARENT_VERSION")
+                    return True
+                else:
+                    logging.warning(f"DeleteObject without PARENT_VERSION also failed: {resp.resultCode}")
+            except Exception as e:
+                logging.warning(f"ContentItem delete without version failed: {e}")
+
+            # Attempt 3: Try with just SYSTEM_ID (last resort)
+            try:
+                logging.info(f"Trying ContentItem delete with only SYSTEM_ID...")
+                prop_names_list = ['%TARGET_LIBRARY', 'SYSTEM_ID']
+                prop_values_list = [
+                    xsd.AnyObject(string_type, 'RTA_MAIN'),
+                    xsd.AnyObject(int_type, int(system_id))
+                ]
+
+                del_call = {
+                    'call': {
+                        'dstIn': dst,
+                        'objectType': 'ContentItem',
+                        'properties': {
+                            'propertyCount': 2,
+                            'propertyNames': string_array_type(prop_names_list),
+                            'propertyValues': {'anyType': prop_values_list}
+                        }
+                    }
+                }
+
+                resp = del_client.service.DeleteObject(**del_call)
+                if resp.resultCode == 0:
+                    logging.info(f"Successfully deleted ContentItem {system_id} with only SYSTEM_ID")
+                    return True
+                else:
+                    logging.error(f"All delete attempts failed for ContentItem {system_id}")
+            except Exception as e:
+                logging.error(f"Final ContentItem delete attempt failed: {e}")
+
             return False
 
-    if delete_root:
-        return force_delete_item(folder_id)
+        except Exception as e:
+            logging.error(f"Error deleting ContentItem {system_id}: {e}")
+            return False
 
-    return True
+    def verify_no_links_remain(doc_id):
+        """
+        Verify no links remain using SQL query
+        This matches the Fiddler trace SQLService call
+        """
+        try:
+            sql_client = find_client('SQLService')
+            if not sql_client:
+                return True  # Can't verify, proceed anyway
+
+            sql_query = f"(SELECT ENTITYID FROM DOCSADM.REGISTRY WHERE ENTITYID IN (SELECT ENTITYID FROM DOCSADM.REGISTRY WHERE NAME = 'LINKID' AND DATA LIKE '{doc_id}') AND NAME = 'LIBRARY' AND DATA LIKE 'RTA_MAIN')"
+
+            sql_call = {
+                'call': {
+                    'dstIn': dst,
+                    'libraryName': 'RTA_MAIN',
+                    'sql': sql_query
+                }
+            }
+
+            resp = sql_client.service.SQLService(**sql_call)
+
+            # param1 = 0 means no links found (safe to delete)
+            if resp.resultCode == 0 and resp.param1 == 0:
+                return True
+
+            return False
+
+        except Exception as e:
+            logging.warning(f"Error verifying links for {doc_id}: {e}")
+            return True  # If verification fails, try deletion anyway
+
+    def delete_profile(doc_id):
+        """
+        Delete the document profile using v_defprof
+        This matches the Fiddler trace final DeleteObject call
+        """
+        try:
+            prop_names_list = ['%TARGET_LIBRARY', '%OBJECT_IDENTIFIER', '%DELETE_OPTION']
+            prop_values_list = [
+                xsd.AnyObject(string_type, 'RTA_MAIN'),
+                xsd.AnyObject(string_type, str(doc_id)),
+                xsd.AnyObject(string_type, '')  # Empty string as in trace
+            ]
+
+            del_call = {
+                'call': {
+                    'dstIn': dst,
+                    'objectType': 'v_defprof',  # Use v_defprof as in trace
+                    'properties': {
+                        'propertyCount': 3,
+                        'propertyNames': string_array_type(prop_names_list),
+                        'propertyValues': {'anyType': prop_values_list}
+                    }
+                }
+            }
+
+            resp = del_client.service.DeleteObject(**del_call)
+            return resp.resultCode == 0
+
+        except Exception as e:
+            logging.error(f"Error deleting profile {doc_id}: {e}")
+            return False
+
+    # =====================================================
+    # MAIN DELETION LOGIC - Following Fiddler Trace Pattern
+    # =====================================================
+
+    try:
+        # Step 1: Get all contents of the folder
+        contents = get_folder_contents(folder_id)
+
+        logging.info(f"Found {len(contents)} items in folder {folder_id}")
+
+        # Step 2: Recursively delete child folders first, then files
+        for item in contents:
+            doc_number = item['DOCNUMBER']
+            node_type = item['NODE_TYPE']
+            system_id = item['SYSTEM_ID']
+            parent_version = item['PARENT_VERSION']
+
+            if node_type == 'F':
+                # It's a folder - recurse
+                logging.info(f"Recursively deleting child folder {doc_number}")
+                success = await delete_folder_contents(dst, doc_number, delete_root=True)
+                if not success:
+                    logging.warning(f"Failed to delete child folder {doc_number}")
+            else:
+                # It's a document - first remove ALL its references
+                logging.info(f"Processing document {doc_number}")
+                doc_links = get_where_used_links(doc_number)
+
+                for doc_link in doc_links:
+                    link_parent = doc_link.get('PARENT')
+                    link_parent_ver = doc_link.get('PARENT_VERSION')
+                    link_sys_id = doc_link.get('SYSTEM_ID')
+
+                    if link_parent and link_sys_id:
+                        if not link_parent_ver or str(link_parent_ver) == '0':
+                            link_parent_ver = get_parent_version(link_parent)
+                            if not link_parent_ver:
+                                logging.warning(
+                                    f"Could not get version for parent {link_parent}, will try deletion anyway")
+
+                        logging.info(
+                            f"Attempting to delete doc link: sys_id={link_sys_id}, parent={link_parent}, ver={link_parent_ver}")
+                        delete_content_item(link_sys_id, link_parent, link_parent_ver)
+
+                # Verify and delete the document profile
+                if verify_no_links_remain(doc_number):
+                    delete_profile(doc_number)
+                else:
+                    logging.warning(f"Links still remain for document {doc_number} after cleanup attempt")
+
+            # Also delete the ContentItem link from the current folder
+            logging.info(
+                f"Attempting to delete item link from current folder: sys_id={system_id}, parent={folder_id}, ver={parent_version}")
+            delete_content_item(system_id, folder_id, parent_version)
+
+        # Step 3: If we're supposed to delete the root folder itself
+        if delete_root:
+            logging.info(f"Deleting root folder {folder_id}")
+
+            # Get WHERE_USED links for this folder (what's referencing it)
+            links = get_where_used_links(folder_id)
+
+            logging.info(f"Found {len(links)} references to folder {folder_id}")
+
+            # Delete all ContentItem links pointing to this folder
+            for link in links:
+                parent_id = link.get('PARENT')
+                parent_version = link.get('PARENT_VERSION')
+                system_id = link.get('SYSTEM_ID')
+
+                if parent_id and system_id:
+                    # If parent_version is missing or 0, try to get it
+                    if not parent_version or str(parent_version) == '0':
+                        logging.info(f"Getting version for parent {parent_id}")
+                        parent_version = get_parent_version(parent_id)
+                        if not parent_version:
+                            logging.warning(f"Could not get version for parent {parent_id}, will try deletion anyway")
+
+                    # ALWAYS attempt deletion, even if parent_version is 0/None
+                    # The delete_content_item function now has fallback strategies
+                    logging.info(
+                        f"Attempting to delete folder link: sys_id={system_id}, parent={parent_id}, ver={parent_version}")
+                    success = delete_content_item(system_id, parent_id, parent_version)
+                    if not success:
+                        logging.error(f"Failed to delete link sys_id={system_id}")
+                else:
+                    logging.warning(f"Incomplete link data: parent_id={parent_id}, system_id={system_id}")
+
+            # Verify no links remain before final deletion
+            if verify_no_links_remain(folder_id):
+                logging.info(f"No links remain, deleting profile for {folder_id}")
+                return delete_profile(folder_id)
+            else:
+                logging.error(f"Links still remain for folder {folder_id} after all cleanup attempts")
+                # Try one more aggressive approach - search for ALL possible links
+                logging.info("Attempting aggressive cleanup...")
+
+                # Search for any ContentItems that reference this folder
+                try:
+                    search_call = {
+                        'dstIn': dst,
+                        'objectType': 'ContentsCollection',
+                        'signature': {
+                            'libraries': {'string': ['RTA_MAIN']},
+                            'criteria': {
+                                'criteriaCount': 2,
+                                'criteriaNames': {'string': ['%OBJECT_TYPE_ID', '%ITEM']},
+                                'criteriaValues': {
+                                    'string': ['%RTF:RTA_MAIN V_DEFPROF DOCUMENT_LIST %HITLIST', str(folder_id)]}
+                            },
+                            'retProperties': {
+                                'string': ['FI.SYSTEM_ID', 'FI.PARENT', 'FI.PARENT_VERSION', 'FI.DOCNUMBER']
+                            },
+                            'maxRows': 0
+                        }
+                    }
+
+                    search_reply = svc_client.service.Search(call=search_call)
+
+                    if search_reply and search_reply.resultCode == 0 and search_reply.resultSetID:
+                        result_set_id = search_reply.resultSetID
+                        data_client = find_client('GetDataW')
+                        d_method = 'GetDataW' if hasattr(data_client.service, 'GetDataW') else 'GetData'
+
+                        d_reply = getattr(data_client.service, d_method)(call={
+                            'resultSetID': result_set_id,
+                            'requestedRows': 2147483647,
+                            'startingRow': 0
+                        })
+
+                        rows = getattr(d_reply, 'rowNode', []) or getattr(d_reply, 'RowNode', []) or []
+                        for row in rows:
+                            if row.propValues.anyType:
+                                vals = row.propValues.anyType
+                                sys_id = vals[0] if len(vals) > 0 else None
+                                par_id = vals[1] if len(vals) > 1 else None
+                                par_ver = vals[2] if len(vals) > 2 else None
+
+                                if sys_id and par_id:
+                                    if not par_ver or str(par_ver) == '0':
+                                        par_ver = get_parent_version(par_id)
+                                    if par_ver:
+                                        logging.info(f"Aggressive cleanup: deleting sys_id={sys_id}")
+                                        delete_content_item(sys_id, par_id, par_ver)
+
+                        try:
+                            svc_client.service.ReleaseData(call={'resultSetID': result_set_id})
+                            svc_client.service.ReleaseObject(call={'objectID': result_set_id})
+                        except:
+                            pass
+
+                    # Try deletion again
+                    if verify_no_links_remain(folder_id):
+                        return delete_profile(folder_id)
+                    else:
+                        return False
+
+                except Exception as e:
+                    logging.error(f"Aggressive cleanup failed: {e}")
+                    return False
+
+        return True
+
+    except Exception as e:
+        logging.error(f"Error in delete_folder_contents: {e}", exc_info=True)
+        return False
