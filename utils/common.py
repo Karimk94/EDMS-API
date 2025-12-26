@@ -1,5 +1,7 @@
 from fastapi import Request, HTTPException, status
 import re
+import wsdl_client
+import gc
 
 def verify_editor(request: Request):
     user = request.session.get("user")
@@ -50,3 +52,22 @@ def get_session_token(request: Request):
             detail="Unauthorized: Valid session token not found"
         )
     return token
+
+def find_active_soap_client():
+    """
+    Scans memory to find an active Zeep SOAP Client object.
+    Useful when the client instance is hidden in closures or unknown variable names.
+    """
+    for name, obj in vars(wsdl_client).items():
+        if hasattr(obj, 'service') and hasattr(obj.service, 'Search'):
+            return obj
+
+    try:
+        for obj in gc.get_objects():
+            if hasattr(obj, 'service') and hasattr(obj.service, 'Search'):
+                if hasattr(obj, 'wsdl') or hasattr(obj, 'transport'):
+                    return obj
+    except Exception:
+        pass
+
+    return None

@@ -4,6 +4,8 @@ from .base import get_soap_client, find_client_with_operation
 from .config import SMART_EDMS_ROOT_ID, DMS_USER
 from .utils import parse_binary_result_buffer
 from .documents import get_doc_version_info
+import os
+from zeep import Client, Settings, xsd
 
 def create_dms_folder(dst, folder_name, description="", parent_id=None, user_id=None):
     target_parent_id = parent_id if parent_id and str(parent_id).strip() else SMART_EDMS_ROOT_ID
@@ -378,3 +380,289 @@ async def get_root_folder_counts(dst):
     except Exception as e:
         logging.error(f"Error in get_root_folder_counts: {e}")
         return {'images': 0, 'videos': 0, 'files': 0}
+
+async def delete_folder_contents(dst, folder_id, delete_root=True):
+    """
+    Recursively empties a folder.
+    """
+    wsdl_url = os.getenv("WSDL_URL")
+    settings = Settings(strict=False, xml_huge_tree=True)
+
+    # --- Client Setup ---
+    base_client = Client(wsdl_url, settings=settings)
+
+    def find_client(op_name):
+        try:
+            for service in base_client.wsdl.services.values():
+                for port in service.ports.values():
+                    if op_name in port.binding.port_type.operations:
+                        return Client(wsdl_url, port_name=port.name, settings=settings)
+        except Exception:
+            pass
+        return base_client
+
+    svc_client = base_client if hasattr(base_client.service, 'Search') else find_client('Search')
+    del_client = base_client if hasattr(base_client.service, 'DeleteObject') else find_client('DeleteObject')
+
+    if not svc_client or not del_client:
+        return False
+
+    # --- Type Definitions ---
+    string_type = svc_client.get_type('{http://www.w3.org/2001/XMLSchema}string')
+    int_type = svc_client.get_type('{http://www.w3.org/2001/XMLSchema}int')
+    string_array_type = svc_client.get_type('{http://schemas.microsoft.com/2003/10/Serialization/Arrays}ArrayOfstring')
+
+    def get_current_version_id(doc_number):
+        if not doc_number or str(doc_number) == '0': return None
+
+        # Strategy A: GetDocSvr3
+        try:
+            call_data = {
+                'dstIn': dst,
+                'criteria': {
+                    'criteriaCount': 2,
+                    'criteriaNames': {'string': ['%TARGET_LIBRARY', '%DOCUMENT_NUMBER']},
+                    'criteriaValues': {'string': ['RTA_MAIN', str(doc_number)]}
+                }
+            }
+            reply = svc_client.service.GetDocSvr3(call=call_data)
+            if reply and reply.resultCode == 0 and reply.docProperties:
+                p_names = reply.docProperties.propertyNames.string
+                p_vals = reply.docProperties.propertyValues.anyType
+                for key in ['%VERSION_ID', 'VERSION_ID']:
+                    if key in p_names:
+                        val = p_vals[p_names.index(key)]
+                        if val and str(val) != '0': return val
+        except Exception:
+            pass
+
+        # Strategy B: VersionsSearch (Matches Trace)
+        try:
+            search_call = {
+                'dstIn': dst, 'objectType': 'VersionsSearch',
+                'signature': {
+                    'libraries': {'string': ['RTA_MAIN']},
+                    'criteria': {'criteriaCount': 1, 'criteriaNames': {'string': ['%OBJECT_IDENTIFIER']},
+                                 'criteriaValues': {'string': [str(doc_number)]}},
+                    'retProperties': {'string': ['VERSION_ID', 'VERSION', 'SUBVERSION']},
+                    'maxRows': 0  # Updated to 0 to match trace
+                }
+            }
+            s_reply = svc_client.service.Search(call=search_call)
+            if s_reply and s_reply.resultCode == 0 and s_reply.resultSetID:
+                d_client = find_client('GetDataW')
+                d_meth = 'GetDataW' if hasattr(d_client.service, 'GetDataW') else 'GetData'
+                d_reply = getattr(d_client.service, d_meth)(
+                    call={'resultSetID': s_reply.resultSetID, 'requestedRows': 1, 'startingRow': 0})
+
+                rows = getattr(d_reply, 'rowNode', []) or getattr(d_reply, 'RowNode', []) or []
+                try:
+                    svc_client.service.ReleaseObject(call={'objectID': s_reply.resultSetID})
+                except:
+                    pass
+
+                if rows and rows[0].propValues.anyType:
+                    return rows[0].propValues.anyType[0]
+        except Exception:
+            pass
+
+        return None
+
+    current_folder_version = get_current_version_id(folder_id)
+
+    def force_delete_item(item_id, direct_link_id=None, known_parent_id=None, known_parent_ver=None):
+        unlinked_current = False
+
+        # 1. UNLOCK
+        try:
+            u_p = ['%TARGET_LIBRARY', '%OBJECT_IDENTIFIER', '%STATUS']
+            u_v = [xsd.AnyObject(string_type, 'RTA_MAIN'), xsd.AnyObject(int_type, int(item_id)),
+                   xsd.AnyObject(string_type, '%UNLOCK')]
+            svc_client.service.UpdateObject(call={
+                'dstIn': dst, 'objectType': 'DEF_PROF',
+                'properties': {'propertyCount': 3, 'propertyNames': string_array_type(u_p),
+                               'propertyValues': {'anyType': u_v}}
+            })
+        except Exception:
+            pass
+
+        links_to_remove = []
+
+        # 2. IMMEDIATE UNLINK
+        if direct_link_id and known_parent_id and known_parent_ver:
+            links_to_remove.append({
+                'SYSTEM_ID': direct_link_id,
+                'PARENT': known_parent_id,
+                'PARENT_VERSION': known_parent_ver,
+                'IS_DIRECT': True
+            })
+        elif direct_link_id:
+            links_to_remove.append({'SYSTEM_ID': direct_link_id, 'IS_DIRECT': True})
+
+        # 3. GLOBAL DISCOVERY
+        try:
+            coll_names = string_array_type(['%TARGET_LIBRARY', 'DOCNUMBER', '%CONTENTS_DIRECTIVE'])
+            coll_values = {'anyType': [xsd.AnyObject(string_type, 'RTA_MAIN'),
+                                       xsd.AnyObject(string_type, str(item_id)),
+                                       xsd.AnyObject(string_type, '%CONTENTS_WHERE_USED')]}
+
+            coll_reply = svc_client.service.CreateObject(call={
+                'dstIn': dst, 'objectType': 'ContentsCollection',
+                'properties': {'propertyCount': 3, 'propertyNames': coll_names, 'propertyValues': coll_values}})
+
+            if coll_reply and coll_reply.resultCode == 0 and coll_reply.retProperties:
+                col_id = coll_reply.retProperties.propertyValues.anyType[0]
+                enum_client = find_client('NewEnum')
+                enum_reply = enum_client.service.NewEnum(call={'dstIn': dst, 'collectionID': col_id})
+
+                if enum_reply and enum_reply.resultCode == 0 and enum_reply.enumID:
+                    next_reply = enum_client.service.NextData(
+                        call={'dstIn': dst, 'enumID': enum_reply.enumID, 'elementCount': 100})
+
+                    if next_reply and next_reply.genericItemsData:
+                        g_data = next_reply.genericItemsData
+                        p_names = g_data.propertyNames.string
+                        rows = g_data.propertyRows.ArrayOfanyType
+
+                        idx_sys = p_names.index('SYSTEM_ID') if 'SYSTEM_ID' in p_names else -1
+                        idx_par = p_names.index('PARENT') if 'PARENT' in p_names else -1
+                        idx_ver = p_names.index('PARENT_VERSION') if 'PARENT_VERSION' in p_names else -1
+
+                        if idx_sys != -1 and rows:
+                            for row in rows:
+                                try:
+                                    s_id = row.anyType[idx_sys]
+                                    if not direct_link_id or str(s_id) != str(direct_link_id):
+                                        link = {'SYSTEM_ID': s_id}
+                                        parent_id = row.anyType[idx_par] if idx_par != -1 else None
+                                        p_ver = row.anyType[idx_ver] if idx_ver != -1 else None
+                                        if parent_id:
+                                            link['PARENT'] = parent_id
+                                            if not p_ver or str(p_ver) == '0':
+                                                p_ver = get_current_version_id(parent_id)
+                                            link['PARENT_VERSION'] = p_ver
+                                        links_to_remove.append(link)
+                                except:
+                                    pass
+                    try:
+                        enum_client.service.ReleaseObject(call={'objectID': enum_reply.enumID})
+                    except:
+                        pass
+                try:
+                    svc_client.service.ReleaseObject(call={'objectID': col_id})
+                except:
+                    pass
+        except Exception:
+            pass
+
+        # 4. EXECUTE LINK DELETION
+        for link in links_to_remove:
+            try:
+                p_n = ['%TARGET_LIBRARY', 'SYSTEM_ID']
+                p_v = [xsd.AnyObject(string_type, 'RTA_MAIN'), xsd.AnyObject(int_type, int(link['SYSTEM_ID']))]
+
+                if link.get('PARENT') and link.get('PARENT_VERSION'):
+                    p_n.append('PARENT')
+                    p_v.append(xsd.AnyObject(string_type, str(link['PARENT'])))
+                    p_n.append('PARENT_VERSION')
+                    p_v.append(xsd.AnyObject(string_type, str(link['PARENT_VERSION'])))
+
+                resp = del_client.service.DeleteObject(call={
+                    'dstIn': dst, 'objectType': 'ContentItem',
+                    'properties': {'propertyCount': len(p_n), 'propertyNames': string_array_type(p_n),
+                                   'propertyValues': {'anyType': p_v}}
+                })
+
+                if resp.resultCode == 0:
+                    if link.get('IS_DIRECT'):
+                        unlinked_current = True
+            except Exception:
+                pass
+
+        # 5. DELETE PROFILE (Global Destroy)
+        try:
+            # Using v_defprof and adding %DELETE_OPTION to match Fiddler trace
+            del_props = {'propertyCount': 3,
+                         'propertyNames': string_array_type(
+                             ['%TARGET_LIBRARY', '%OBJECT_IDENTIFIER', '%DELETE_OPTION']),
+                         'propertyValues': {'anyType': [
+                             xsd.AnyObject(string_type, 'RTA_MAIN'),
+                             xsd.AnyObject(int_type, int(item_id)),
+                             xsd.AnyObject(string_type, '')
+                         ]}}
+            resp = del_client.service.DeleteObject(
+                call={'dstIn': dst, 'objectType': 'v_defprof', 'properties': del_props})
+            if resp.resultCode == 0:
+                return True
+        except Exception:
+            pass
+
+        # Return success if we at least cleared it from the current folder
+        return unlinked_current
+
+    # --- Iteration Loop ---
+    while True:
+        try:
+            search_call = {
+                'dstIn': dst, 'objectType': 'ContentsCollection',
+                'signature': {
+                    'libraries': {'string': ['RTA_MAIN']},
+                    'criteria': {'criteriaCount': 1, 'criteriaNames': {'string': ['%ITEM']},
+                                 'criteriaValues': {'string': [str(folder_id)]}},
+                    'retProperties': {'string': ['FI.DOCNUMBER', 'FI.NODE_TYPE', '%DISPLAY_NAME', 'SYSTEM_ID']},
+                    'sortProps': {'propertyCount': 1, 'propertyNames': {'string': ['%DISPLAY_NAME']},
+                                  'propertyFlags': {'int': [1]}},
+                    'maxRows': 0
+                }
+            }
+
+            search_reply = svc_client.service.Search(call=search_call)
+
+            if not (search_reply and search_reply.resultCode == 0 and search_reply.resultSetID):
+                break
+
+            rs_id = search_reply.resultSetID
+            data_client = find_client('GetDataW')
+            d_method = 'GetDataW' if hasattr(data_client.service, 'GetDataW') else 'GetData'
+
+            d_reply = getattr(data_client.service, d_method)(
+                call={'resultSetID': rs_id, 'requestedRows': 50, 'startingRow': 0})
+
+            items = []
+            rows = getattr(d_reply, 'rowNode', []) or getattr(d_reply, 'RowNode', []) or []
+            if rows:
+                for row in rows:
+                    if row.propValues.anyType:
+                        vals = row.propValues.anyType
+                        if len(vals) >= 1:
+                            d_id = vals[0]
+                            n_type = vals[1] if len(vals) > 1 else 'N'
+                            s_id = vals[3] if len(vals) > 3 else None
+                            items.append((d_id, n_type, s_id))
+
+            try:
+                svc_client.service.ReleaseObject(call={'objectID': rs_id})
+            except:
+                pass
+
+            if not items:
+                break
+
+            for d_id, n_type, s_id in items:
+                if n_type == 'F':
+                    await delete_folder_contents(dst, d_id, delete_root=True)
+                else:
+                    success = force_delete_item(d_id, direct_link_id=s_id, known_parent_id=folder_id,
+                                                known_parent_ver=current_folder_version)
+                    if not success:
+                        print(f"Failed to clear item {d_id} (Link: {s_id}) from folder {folder_id}.")
+                        return False
+
+        except Exception as e:
+            print(f"Iteration error: {e}")
+            return False
+
+    if delete_root:
+        return force_delete_item(folder_id)
+
+    return True
