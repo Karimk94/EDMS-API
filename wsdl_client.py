@@ -985,7 +985,7 @@ def resolve_trustee_system_id(dst, sys_id):
                     if row_nodes and row_nodes[0].propValues.anyType:
                         val = row_nodes[0].propValues.anyType[0]
                         if val:
-                            logging.info(f"Found match in {obj_type}: {val}")
+                            # logging.info(f"Found match in {obj_type}: {val}")
                             return str(val)
             except Exception as e:
                 logging.debug(f"Lookup failed for {obj_type}: {e}")

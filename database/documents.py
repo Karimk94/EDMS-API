@@ -709,7 +709,7 @@ async def get_folder_system_ids(docnumbers):
     """
     try:
         if not docnumbers:
-            logging.info("No docnumbers provided")
+            # logging.info("No docnumbers provided")
             return {}
 
         # Validate and convert docnumbers
@@ -722,10 +722,10 @@ async def get_folder_system_ids(docnumbers):
                 continue
 
         if not valid_docnumbers:
-            logging.info("No valid docnumbers provided")
+            # logging.info("No valid docnumbers provided")
             return {}
 
-        logging.info(f"Looking up SYSTEM_IDs for {len(valid_docnumbers)} docnumbers: {valid_docnumbers}")
+        # logging.info(f"Looking up SYSTEM_IDs for {len(valid_docnumbers)} docnumbers: {valid_docnumbers}")
 
         conn = await get_async_connection()
         if not conn:
@@ -750,7 +750,7 @@ async def get_folder_system_ids(docnumbers):
 
                 # Create mapping dictionary
                 result = {str(row[0]): str(row[1]) for row in rows}
-                logging.info(f"Found {len(result)} SYSTEM_IDs")
+                # logging.info(f"Found {len(result)} SYSTEM_IDs")
 
                 return result
 
