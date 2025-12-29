@@ -108,7 +108,6 @@ async def api_delete_folder(folder_id: str, request: Request, force: bool = Fals
                 )
             else:
                 # User confirmed Force Delete
-                logging.info(f"Force deleting folder {folder_id} and all contents")
 
                 contents_deleted = await wsdl_client.delete_folder_contents(dst, folder_id, delete_root=True)
 

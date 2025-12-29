@@ -1,10 +1,11 @@
 import os
 import logging
-import zlib
-from zeep import xsd
 from zeep.exceptions import Fault
 from .base import get_soap_client, find_client_with_operation
 from .config import DMS_USER
+from zeep import xsd
+import traceback
+from lxml import etree
 
 def get_doc_version_info(dst, doc_number):
     try:
@@ -435,37 +436,81 @@ def delete_document(dst, doc_number, force=False):
 
 def rename_document(dst, doc_id, new_name):
     try:
-        svc_client = get_soap_client('BasicHttpBinding_IDMSvc')
-        string_type = svc_client.get_type('{http://www.w3.org/2001/XMLSchema}string')
-        int_type = svc_client.get_type('{http://www.w3.org/2001/XMLSchema}int')
-        string_array_type = svc_client.get_type(
-            '{http://schemas.microsoft.com/2003/10/Serialization/Arrays}ArrayOfstring')
 
-        prop_names = string_array_type(['%TARGET_LIBRARY', '%OBJECT_IDENTIFIER', 'DOCNAME'])
-        prop_values = {'anyType': [
+        print(f"Attempting to rename doc {doc_id} to '{new_name}'")
+        svc_client = get_soap_client('BasicHttpBinding_IDMSvc')
+
+        # 1. Fetch Namespace Factory & Types
+        try:
+            arr_ns = 'http://schemas.microsoft.com/2003/10/Serialization/Arrays'
+            xsd_ns = 'http://www.w3.org/2001/XMLSchema'
+
+            # Factory for strict WCF Arrays (Needed for propertyNames)
+            factory = svc_client.type_factory(arr_ns)
+
+            # CRITICAL: Fetch Strict WSDL Types
+            # Using generic xsd.String() creates xsi:type="xs:string".
+            # Some WCF servers strictly require the type bound to the WSDL context.
+            # Fetching these ensures we match the server's expected contract exactly.
+            string_type = svc_client.get_type(f'{{{xsd_ns}}}string')
+            int_type = svc_client.get_type(f'{{{xsd_ns}}}int')
+
+        except Exception as e:
+            print(f"Failed to load SOAP types: {e}")
+            raise
+
+        # 2. Build Property Names
+        # Use Factory: This reliably fixes the IndexOutOfRange error
+        names_list = ['%TARGET_LIBRARY', 'SYSTEM_ID', 'DISPLAYNAME']
+        prop_names = factory.ArrayOfstring(string=names_list)
+
+        # 3. Build Property Values
+        # Hybrid Strategy: Dict Wrapper + Strict WSDL Types
+        # - Strict Types: Ensure xsi:type matches the WSDL contract (d:string vs xs:string).
+        # - Dict Wrapper: {'anyType': ...} allows Zeep to serialize the sequence cleanly
+        #   without the Factory object overhead that often causes Unspecified Errors.
+        values_list = [
             xsd.AnyObject(string_type, 'RTA_MAIN'),
             xsd.AnyObject(int_type, int(doc_id)),
             xsd.AnyObject(string_type, new_name)
-        ]}
+        ]
+        prop_values = {'anyType': values_list}
 
-        update_call = {
-            'call': {
-                'dstIn': dst,
-                'objectType': 'DEF_PROF',
-                'properties': {
-                    'propertyCount': 3,
-                    'propertyNames': prop_names,
-                    'propertyValues': prop_values
-                }
+        # 4. Construct the Call Object
+        call_object = {
+            # Use xsd.Nil for explicit nil
+            'extProperties': xsd.Nil,
+            'dstIn': dst,
+            'objectType': 'ContentItem',
+            'properties': {
+                'propertyCount': 3,
+                'propertyNames': prop_names,
+                'propertyValues': prop_values
             }
         }
 
-        response = svc_client.service.UpdateObject(**update_call)
+        # 5. Debug & Execute
+        if etree:
+            try:
+                # Preview the XML to check namespaces and types
+                envelope = svc_client.create_message(svc_client.service, 'UpdateObject', call=call_object)
+                print("--- Generated XML Preview ---")
+                print(etree.tostring(envelope, pretty_print=True).decode())
+                print("-----------------------------")
+            except Exception as xml_e:
+                print(f"XML Preview failed: {xml_e}")
+
+        print("Sending UpdateObject request...")
+        response = svc_client.service.UpdateObject(call=call_object)
 
         if response.resultCode == 0:
+            print(f"Rename successful for {doc_id}")
             return True
         else:
+            print(f"Rename failed. ResultCode: {response.resultCode}")
             return False
 
-    except Exception:
+    except Exception as e:
+        print(f"Error in rename_document: {e}")
+        traceback.print_exc()
         return False
