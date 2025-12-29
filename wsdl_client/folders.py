@@ -305,6 +305,7 @@ async def list_folder_contents(dst, parent_id=None, app_source=None, scope=None,
                 for row in row_nodes:
                     try:
                         props = row.propValues.anyType
+
                         doc_id = props[0]
                         name_str = str(props[1] or props[3] or "Untitled")
                         node_type = props[2]
@@ -322,8 +323,31 @@ async def list_folder_contents(dst, parent_id=None, app_source=None, scope=None,
             search_client.service.ReleaseObject(call={'objectID': result_set_id})
         except Exception:
             pass
-    except Exception:
+    except Exception as e:
+        logging.error(f"Error in SOAP call: {e}")
         return items
+
+    folder_docnumbers = []
+    for item in items:
+        if item.get('type') == 'folder' and item.get('id') and item['id'].isdigit():
+            folder_docnumbers.append(item['id'])
+
+    if folder_docnumbers:
+        try:
+            system_id_map = await db_connector.get_folder_system_ids(folder_docnumbers)
+            logging.info(f"Found {len(system_id_map)} SYSTEM_IDs for {len(folder_docnumbers)} folders")
+
+            # Add system_id to folder items
+            for item in items:
+                if item.get('type') == 'folder' and item.get('id'):
+                    system_id = system_id_map.get(item['id'])
+                    if system_id:
+                        item['system_id'] = system_id
+                    else:
+                        # Log warning if system_id not found
+                        logging.warning(f"SYSTEM_ID not found in database for folder docnumber: {item['id']}")
+        except Exception as e:
+            logging.error(f"Error getting SYSTEM_IDs from database: {e}")
 
     ids_to_resolve = [item['id'] for item in items if item.get('media_type') == 'resolve']
     if ids_to_resolve:

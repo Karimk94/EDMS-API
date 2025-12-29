@@ -701,3 +701,65 @@ async def check_processing_status(docnumbers):
     finally:
         if conn:
             await conn.close()
+
+async def get_folder_system_ids(docnumbers):
+    """
+    Get SYSTEM_IDs for a list of docnumbers from the FOLDER_ITEM table.
+    Returns a dict mapping docnumber -> system_id
+    """
+    try:
+        if not docnumbers:
+            logging.info("No docnumbers provided")
+            return {}
+
+        # Validate and convert docnumbers
+        valid_docnumbers = []
+        for doc in docnumbers:
+            try:
+                if doc and str(doc).isdigit():
+                    valid_docnumbers.append(str(doc))
+            except:
+                continue
+
+        if not valid_docnumbers:
+            logging.info("No valid docnumbers provided")
+            return {}
+
+        logging.info(f"Looking up SYSTEM_IDs for {len(valid_docnumbers)} docnumbers: {valid_docnumbers}")
+
+        conn = await get_async_connection()
+        if not conn:
+            logging.error("Failed to get database connection for get_folder_system_ids")
+            return {}
+
+        try:
+            # Create placeholders for the IN clause
+            placeholders = ','.join([f":{i}" for i in range(len(valid_docnumbers))])
+            query = f"""
+                SELECT DOCNUMBER, SYSTEM_ID 
+                FROM FOLDER_ITEM 
+                WHERE DOCNUMBER IN ({placeholders})
+            """
+
+            # Create parameters dictionary
+            params = {str(i): doc_num for i, doc_num in enumerate(valid_docnumbers)}
+
+            async with conn.cursor() as cursor:
+                await cursor.execute(query, params)
+                rows = await cursor.fetchall()
+
+                # Create mapping dictionary
+                result = {str(row[0]): str(row[1]) for row in rows}
+                logging.info(f"Found {len(result)} SYSTEM_IDs")
+
+                return result
+
+        except oracledb.Error as e:
+            logging.error(f"Oracle error in get_folder_system_ids: {e}", exc_info=True)
+            return {}
+        finally:
+            await conn.close()
+
+    except Exception as e:
+        logging.error(f"Error in get_folder_system_ids: {e}", exc_info=True)
+        return {}
