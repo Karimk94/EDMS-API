@@ -3,8 +3,7 @@ import logging
 from zeep.exceptions import Fault
 from .base import get_soap_client, find_client_with_operation
 from .config import DMS_USER
-from zeep import xsd
-import traceback
+from zeep import xsd, Settings, Client
 from lxml import etree
 
 def get_doc_version_info(dst, doc_number):
@@ -435,50 +434,100 @@ def delete_document(dst, doc_number, force=False):
         return False, str(e)
 
 def rename_document(dst, doc_id, new_name):
+    """
+    Renames a document/folder by updating its DOCNAME in the Profile.
+    This updates the underlying document name.
+    """
     try:
-
-        print(f"Attempting to rename doc {doc_id} to '{new_name}'")
+        logging.info(f"Attempting to rename doc {doc_id} to '{new_name}'")
         svc_client = get_soap_client('BasicHttpBinding_IDMSvc')
 
-        # 1. Fetch Namespace Factory & Types
-        try:
-            arr_ns = 'http://schemas.microsoft.com/2003/10/Serialization/Arrays'
-            xsd_ns = 'http://www.w3.org/2001/XMLSchema'
+        string_type = svc_client.get_type('{http://www.w3.org/2001/XMLSchema}string')
+        int_type = svc_client.get_type('{http://www.w3.org/2001/XMLSchema}int')
+        string_array_type = svc_client.get_type(
+            '{http://schemas.microsoft.com/2003/10/Serialization/Arrays}ArrayOfstring')
 
-            # Factory for strict WCF Arrays (Needed for propertyNames)
-            factory = svc_client.type_factory(arr_ns)
+        # Update the Profile DOCNAME
+        prop_names = string_array_type([
+            '%TARGET_LIBRARY',
+            '%OBJECT_IDENTIFIER',
+            'DOCNAME'
+        ])
 
-            # CRITICAL: Fetch Strict WSDL Types
-            # Using generic xsd.String() creates xsi:type="xs:string".
-            # Some WCF servers strictly require the type bound to the WSDL context.
-            # Fetching these ensures we match the server's expected contract exactly.
-            string_type = svc_client.get_type(f'{{{xsd_ns}}}string')
-            int_type = svc_client.get_type(f'{{{xsd_ns}}}int')
-
-        except Exception as e:
-            print(f"Failed to load SOAP types: {e}")
-            raise
-
-        # 2. Build Property Names
-        # Use Factory: This reliably fixes the IndexOutOfRange error
-        names_list = ['%TARGET_LIBRARY', 'SYSTEM_ID', 'DISPLAYNAME']
-        prop_names = factory.ArrayOfstring(string=names_list)
-
-        # 3. Build Property Values
-        # Hybrid Strategy: Dict Wrapper + Strict WSDL Types
-        # - Strict Types: Ensure xsi:type matches the WSDL contract (d:string vs xs:string).
-        # - Dict Wrapper: {'anyType': ...} allows Zeep to serialize the sequence cleanly
-        #   without the Factory object overhead that often causes Unspecified Errors.
-        values_list = [
+        prop_values = {'anyType': [
             xsd.AnyObject(string_type, 'RTA_MAIN'),
             xsd.AnyObject(int_type, int(doc_id)),
             xsd.AnyObject(string_type, new_name)
-        ]
-        prop_values = {'anyType': values_list}
+        ]}
 
-        # 4. Construct the Call Object
+        call_data = {
+            'dstIn': dst,
+            'objectType': 'DEF_PROF',
+            'properties': {
+                'propertyCount': 3,
+                'propertyNames': prop_names,
+                'propertyValues': prop_values
+            }
+        }
+
+        logging.info("Sending UpdateObject request for Profile...")
+        response = svc_client.service.UpdateObject(call=call_data)
+
+        if response.resultCode == 0:
+            logging.info(f"Successfully renamed doc {doc_id} to '{new_name}'")
+            return True
+        else:
+            error_msg = getattr(response, 'errorDoc', 'Unknown error')
+            logging.error(f"Rename failed. ResultCode: {response.resultCode}, Error: {error_msg}")
+            return False
+
+    except Fault as f:
+        logging.error(f"SOAP Fault in rename_document: {f.message}", exc_info=True)
+        return False
+    except Exception as e:
+        logging.error(f"Error in rename_document: {e}", exc_info=True)
+        return False
+
+def rename_folder_display(dst, content_item_system_id, new_name):
+    """
+    Renames a folder's display name by updating its ContentItem.
+    Matches the exact SOAP structure from the working request.
+    """
+    try:
+        logging.info(f"Attempting to rename ContentItem {content_item_system_id} to '{new_name}'")
+
+        # Get fresh client
+        wsdl_url = os.getenv("WSDL_URL")
+        settings = Settings(strict=False, xml_huge_tree=True)
+        svc_client = Client(wsdl_url, port_name='BasicHttpBinding_IDMSvc', settings=settings)
+
+        # Define namespaces matching the working request
+        arr_ns = 'http://schemas.microsoft.com/2003/10/Serialization/Arrays'
+        xsd_ns = 'http://www.w3.org/2001/XMLSchema'
+
+        # Get type factory for Arrays
+        factory = svc_client.type_factory(arr_ns)
+
+        # Get strict types from WSDL
+        string_type = svc_client.get_type(f'{{{xsd_ns}}}string')
+        int_type = svc_client.get_type(f'{{{xsd_ns}}}int')
+
+        # Build property names using factory (this matches the working request)
+        prop_names = factory.ArrayOfstring(string=[
+            '%TARGET_LIBRARY',
+            'SYSTEM_ID',
+            'DISPLAYNAME'
+        ])
+
+        # Build property values - CRITICAL: Match exact type structure
+        prop_values = {'anyType': [
+            xsd.AnyObject(string_type, 'RTA_MAIN'),
+            xsd.AnyObject(int_type, int(content_item_system_id)),
+            xsd.AnyObject(string_type, new_name)
+        ]}
+
+        # Build the call object
         call_object = {
-            # Use xsd.Nil for explicit nil
             'extProperties': xsd.Nil,
             'dstIn': dst,
             'objectType': 'ContentItem',
@@ -489,28 +538,30 @@ def rename_document(dst, doc_id, new_name):
             }
         }
 
-        # 5. Debug & Execute
-        if etree:
-            try:
-                # Preview the XML to check namespaces and types
-                envelope = svc_client.create_message(svc_client.service, 'UpdateObject', call=call_object)
-                print("--- Generated XML Preview ---")
-                print(etree.tostring(envelope, pretty_print=True).decode())
-                print("-----------------------------")
-            except Exception as xml_e:
-                print(f"XML Preview failed: {xml_e}")
+        # Debug: Print XML preview
+        try:
+            envelope = svc_client.create_message(svc_client.service, 'UpdateObject', call=call_object)
+            logging.info("--- Generated XML ---")
+            logging.info(etree.tostring(envelope, pretty_print=True).decode())
+            logging.info("--------------------")
+        except Exception as xml_e:
+            logging.warning(f"Could not preview XML: {xml_e}")
 
-        print("Sending UpdateObject request...")
+        # Send request
+        logging.info("Sending UpdateObject request...")
         response = svc_client.service.UpdateObject(call=call_object)
 
         if response.resultCode == 0:
-            print(f"Rename successful for {doc_id}")
+            logging.info(f"Successfully renamed ContentItem {content_item_system_id} to '{new_name}'")
             return True
         else:
-            print(f"Rename failed. ResultCode: {response.resultCode}")
+            error_msg = getattr(response, 'errorDoc', '') or getattr(response, 'resultCode', 'Unknown')
+            logging.error(f"Rename failed. ResultCode: {response.resultCode}, Error: {error_msg}")
             return False
 
+    except Fault as f:
+        logging.error(f"SOAP Fault: {f.message}", exc_info=True)
+        return False
     except Exception as e:
-        print(f"Error in rename_document: {e}")
-        traceback.print_exc()
+        logging.error(f"Error in rename_folder_display: {e}", exc_info=True)
         return False

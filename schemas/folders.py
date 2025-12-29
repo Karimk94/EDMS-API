@@ -8,3 +8,4 @@ class CreateFolderRequest(BaseModel):
 
 class RenameFolderRequest(BaseModel):
     name: str
+    system_id: Optional[int] = None

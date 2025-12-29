@@ -74,14 +74,18 @@ async def api_rename_folder(folder_id: str, request: Request, data: RenameFolder
         raise HTTPException(status_code=500, detail="Failed to authenticate")
 
     try:
-        # Assuming sync SOAP call
-        success = wsdl_client.rename_document(dst, folder_id, data.name)
+        if hasattr(data, 'system_id') and data.system_id:
+            success = wsdl_client.rename_folder_display(dst, data.system_id, data.name)
+        else:
+            success = wsdl_client.rename_document(dst, folder_id, data.name)
+
         if success:
             return {"message": "Renamed", "id": folder_id}
         else:
             raise HTTPException(status_code=500, detail="Failed to rename")
-    except AttributeError:
-        raise HTTPException(status_code=500, detail="Rename function not implemented in WSDL client")
+    except Exception as e:
+        logging.error(f"Error in rename: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
 
 @router.delete('/api/folders/{folder_id}')
 async def api_delete_folder(folder_id: str, request: Request, force: bool = False):
