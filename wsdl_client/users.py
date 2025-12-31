@@ -4,7 +4,6 @@ import zlib
 from zeep import xsd
 from zeep.exceptions import Fault
 from .base import get_soap_client, find_client_with_operation
-from .config import DMS_USER
 from .utils import parse_user_result_buffer
 
 def resolve_trustee_system_id(dst, sys_id):
@@ -472,7 +471,7 @@ def search_users_in_group(dst, group_id, search_term, library='RTA_MAIN'):
                     'criteria': {
                         'criteriaCount': 2,
                         'criteriaNames': {'string': ['GROUP_ID', 'DISABLED']},
-                        'criteriaValues': {'string': [group_id, 'N']}
+                        'criteriaValues': {'string': [group_id, 'N']}  # ← Only non-disabled users
                     },
                     'retProperties': {
                         'string': ['USER_ID', 'FULL_NAME', 'PEOPLE_SYSTEM_ID']
@@ -489,6 +488,7 @@ def search_users_in_group(dst, group_id, search_term, library='RTA_MAIN'):
 
         search_reply = svc_client.service.Search(**search_call)
         if not (search_reply and search_reply.resultCode == 0 and search_reply.resultSetID):
+            logging.warning(f"Search failed for group {group_id}")
             return []
 
         result_set_id = search_reply.resultSetID
@@ -500,6 +500,7 @@ def search_users_in_group(dst, group_id, search_term, library='RTA_MAIN'):
         data_reply = getattr(data_client.service, method_name)(**get_data_call)
 
         members = []
+        all_raw_members = []  # ← DEBUG: Capture everything
 
         # Helper to clean text
         def clean_text(text):
@@ -512,15 +513,19 @@ def search_users_in_group(dst, group_id, search_term, library='RTA_MAIN'):
             container = data_reply.resultSetData
             if hasattr(container, 'resultBuffer') and container.resultBuffer:
                 parsed_items = parse_user_result_buffer(container.resultBuffer)
+
+                # ← DEBUG: Log ALL parsed items before filtering
+                logging.info(f"Raw parsed items from buffer ({len(parsed_items)}): {parsed_items}")
+
                 for p in parsed_items:
                     c_name = clean_text(p.get('full_name'))
                     c_id = clean_text(p.get('user_id'))
 
-                    # Filtering Logic:
-                    # 1. Must have ID and Name
-                    # 2. ID should NOT be purely numeric (system accounts often are numeric strings in some views)
-                    # 3. Match search term if provided
-                    if c_name and c_id and not c_id.isdigit():
+                    # ← DEBUG: Log each item before filter
+                    all_raw_members.append({'id': c_id, 'name': c_name})
+
+                    # ORIGINAL FILTER (might be too aggressive)
+                    if c_name and c_id and not c_id.isdigit():  # ← This removes numeric IDs!
                         if not search_term or (
                                 search_term.lower() in c_name.lower() or
                                 search_term.lower() in c_id.lower()):
@@ -532,6 +537,9 @@ def search_users_in_group(dst, group_id, search_term, library='RTA_MAIN'):
         if not members:
             row_nodes = getattr(data_reply, 'rowNode', None) or getattr(data_reply, 'RowNode', None)
             if row_nodes:
+                # ← DEBUG: Log row count
+                logging.info(f"Found {len(row_nodes)} rows in XML format")
+
                 for row in row_nodes:
                     vals = row.propValues.anyType
                     if vals:
@@ -541,11 +549,18 @@ def search_users_in_group(dst, group_id, search_term, library='RTA_MAIN'):
                         c_id = clean_text(raw_id)
                         c_name = clean_text(raw_name)
 
-                        # Filtering Logic (same as above)
+                        # ← DEBUG: Log each row
+                        all_raw_members.append({'id': c_id, 'name': c_name})
+
+                        # ORIGINAL FILTER
                         if c_id and c_name and not c_id.isdigit():
                             if not search_term or (
                                     search_term.lower() in c_name.lower() or search_term.lower() in c_id.lower()):
                                 members.append({'user_id': c_id, 'full_name': c_name})
+
+        # ← DEBUG: Log what was filtered out
+        logging.info(f"Group {group_id} - Raw members: {all_raw_members}")
+        logging.info(f"Group {group_id} - After filtering: {members}")
 
         try:
             svc_client.service.ReleaseData(call={'resultSetID': result_set_id})
@@ -839,3 +854,146 @@ def get_all_groups(dst, library='RTA_MAIN'):
     except Exception as e:
         logging.error(f"Error getting groups: {e}")
         return []
+
+def get_user_security_from_dms(dst, username, library='RTA_MAIN'):
+    """
+    Fetches a user's security/privilege information from DMS.
+    Uses multiple fallback strategies based on working queries.
+    """
+    try:
+        svc_client = get_soap_client('BasicHttpBinding_IDMSvc')
+
+        # Strategy 1: v_peoplegroups (PROVEN WORKING from search_users_in_group)
+        try:
+            search_call = {
+                'call': {
+                    'dstIn': dst,
+                    'objectType': 'v_peoplegroups',
+                    'signature': {
+                        'libraries': {'string': [library]},
+                        'criteria': {
+                            'criteriaCount': 2,
+                            'criteriaNames': {'string': ['USER_ID', 'DISABLED']},
+                            'criteriaValues': {'string': [username, 'N']}
+                        },
+                        'retProperties': {
+                            'string': [
+                                'USER_ID',
+                                'FULL_NAME',
+                                'GROUP_ID',
+                                'PEOPLE_SYSTEM_ID'
+                            ]
+                        },
+                        'maxRows': 1
+                    }
+                }
+            }
+
+            search_reply = svc_client.service.Search(**search_call)
+
+            if search_reply and search_reply.resultCode == 0 and search_reply.resultSetID:
+                result_set_id = search_reply.resultSetID
+                data_client = find_client_with_operation('GetDataW') or svc_client
+                method_name = 'GetDataW' if hasattr(data_client.service, 'GetDataW') else 'GetData'
+
+                get_data_call = {'call': {'resultSetID': result_set_id, 'requestedRows': 1, 'startingRow': 0}}
+                data_reply = getattr(data_client.service, method_name)(**get_data_call)
+
+                try:
+                    svc_client.service.ReleaseData(call={'resultSetID': result_set_id})
+                    svc_client.service.ReleaseObject(call={'objectID': result_set_id})
+                except:
+                    pass
+
+                row_nodes = getattr(data_reply, 'rowNode', None) or getattr(data_reply, 'RowNode', None)
+
+                if row_nodes and row_nodes[0].propValues.anyType:
+                    vals = row_nodes[0].propValues.anyType
+                    group_id = vals[2] if len(vals) > 2 else None
+
+                    # Determine security level from group
+                    security_level = determine_security_from_group(group_id)
+
+                    return {
+                        'user_id': vals[0] if len(vals) > 0 else username,
+                        'full_name': vals[1] if len(vals) > 1 else username,
+                        'group_id': group_id,
+                        'security_level': security_level,
+                        'people_system_id': vals[3] if len(vals) > 3 else None
+                    }
+        except Exception as e:
+            logging.debug(f"v_peoplegroups lookup failed: {e}")
+
+        # Strategy 2: Check if user exists in any admin/power groups
+        try:
+            admin_groups = ['DOCS_ADMINS', 'ADMINISTRATORS', 'ADMIN', 'POWER_USERS', 'SUPERVISORS','SUPERVISOR']
+            editor_groups = ['DOCS_EDITORS', 'EDITORS', 'CONTRIBUTORS']
+
+            user_groups = get_groups_for_user(dst, username, library)
+
+            if user_groups:
+                group_ids = [g.get('group_id', '').upper() for g in user_groups]
+
+                # Check for admin
+                for admin_grp in admin_groups:
+                    if admin_grp in group_ids:
+                        return {
+                            'user_id': username,
+                            'full_name': username,
+                            'group_id': admin_grp,
+                            'security_level': 9  # Admin
+                        }
+
+                # Check for editor
+                for editor_grp in editor_groups:
+                    if editor_grp in group_ids:
+                        return {
+                            'user_id': username,
+                            'full_name': username,
+                            'group_id': editor_grp,
+                            'security_level': 5  # Editor
+                        }
+
+                # Default to viewer if in any group
+                return {
+                    'user_id': username,
+                    'full_name': username,
+                    'group_id': group_ids[0] if group_ids else None,
+                    'security_level': 0  # Viewer
+                }
+        except Exception as e:
+            logging.debug(f"Group-based security lookup failed: {e}")
+
+        # Strategy 3: Fallback - just confirm user exists
+        logging.warning(f"Could not determine security level for {username}, defaulting to Viewer")
+        return {
+            'user_id': username,
+            'full_name': username,
+            'group_id': None,
+            'security_level': 0  # Default to Viewer
+        }
+
+    except Exception as e:
+        logging.error(f"Error getting user security from DMS: {e}", exc_info=True)
+        return None
+
+def determine_security_from_group(group_id):
+    """
+    Maps a DMS group to a security level.
+    Customize this based on your organization's group structure.
+    """
+    if not group_id:
+        return 0
+
+    group_upper = str(group_id).upper()
+
+    # Admin groups (level 9)
+    if any(x in group_upper for x in ['ADMIN', 'SUPERUSER', 'SYSADMIN', 'ROOT', 'SUPERVISOR']):
+        return 9
+
+    # Editor groups (level 5)
+    if any(x in group_upper for x in ['EDITOR', 'CONTRIBUTOR', 'POWER', 'MANAGER']):
+        return 5
+
+    # Default to Viewer (level 0)
+    return 0

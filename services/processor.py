@@ -211,3 +211,43 @@ def get_session_token(request: Request):
 def get_current_username(request: Request):
     user = request.session.get('user')
     return user['username'] if user else None
+
+def determine_security_from_groups(user_groups):
+    """
+    Determines security level based on DMS group membership.
+    Returns: 9 (Admin), 5 (Editor), or 0 (Viewer)
+    """
+    if not user_groups:
+        return 0
+
+    group_ids = [g.get('group_id', '').upper() for g in user_groups]
+
+    # Define your organization's security groups
+    ADMIN_GROUPS = {
+        'DOCS_ADMINS',
+        'ADMINISTRATORS',
+        'ADMIN',
+        'SYSADMIN',
+        # Add more admin groups here
+    }
+
+    EDITOR_GROUPS = {
+        'DOCS_EDITORS',
+        'DOCS_USERS',  # ← Your user is in this group
+        'TIBCO_GROUP',  # ← Your user is in this group
+        'CONTRIBUTORS',
+        'POWER_USERS'
+    }
+
+    # Check for admin privileges
+    for group_id in group_ids:
+        if group_id in ADMIN_GROUPS:
+            return 9
+
+    # Check for editor privileges
+    for group_id in group_ids:
+        if group_id in EDITOR_GROUPS:
+            return 5
+
+    # Default to viewer
+    return 0

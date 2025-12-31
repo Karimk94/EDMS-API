@@ -1,5 +1,4 @@
 import logging
-from zeep import xsd
 from .base import get_soap_client, find_client_with_operation
 from .config import SMART_EDMS_ROOT_ID, DMS_USER
 from .utils import parse_binary_result_buffer
@@ -335,7 +334,7 @@ async def list_folder_contents(dst, parent_id=None, app_source=None, scope=None,
     if folder_docnumbers:
         try:
             system_id_map = await db_connector.get_folder_system_ids(folder_docnumbers)
-            logging.info(f"Found {len(system_id_map)} SYSTEM_IDs for {len(folder_docnumbers)} folders")
+            # logging.info(f"Found {len(system_id_map)} SYSTEM_IDs for {len(folder_docnumbers)} folders")
 
             # Add system_id to folder items
             for item in items:
@@ -343,9 +342,9 @@ async def list_folder_contents(dst, parent_id=None, app_source=None, scope=None,
                     system_id = system_id_map.get(item['id'])
                     if system_id:
                         item['system_id'] = system_id
-                    else:
+                    # else:
                         # Log warning if system_id not found
-                        logging.warning(f"SYSTEM_ID not found in database for folder docnumber: {item['id']}")
+                        # logging.warning(f"SYSTEM_ID not found in database for folder docnumber: {item['id']}")
         except Exception as e:
             logging.error(f"Error getting SYSTEM_IDs from database: {e}")
 

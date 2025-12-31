@@ -4,6 +4,7 @@ import wsdl_client
 from schemas.auth import LoginRequest, LangUpdateRequest, ThemeUpdateRequest, GroupMember, TrusteeResponse, Group
 from typing import List
 from services import processor
+import logging
 
 router = APIRouter()
 
@@ -11,12 +12,34 @@ router = APIRouter()
 async def login(request: Request, creds: LoginRequest):
     dst = wsdl_client.dms_user_login(creds.username, creds.password)
     if dst:
-        user_details = await db_connector.get_user_details(creds.username)
-        if user_details is None or 'security_level' not in user_details:
-            raise HTTPException(status_code=401, detail="User not authorized for this application")
+        # Get user's groups from DMS (proven working query)
+        try:
+            user_groups = wsdl_client.get_groups_for_user(dst, creds.username)
+            logging.info(f"User {creds.username} belongs to groups: {[g.get('group_id') for g in user_groups]}")
 
-        # Store the DMS token in the user object
-        user_details['token'] = dst
+            security_level = processor.determine_security_from_groups(user_groups)
+            security_str = {9: 'Admin', 5: 'Editor', 0: 'Viewer'}.get(security_level, 'Viewer')
+        except Exception as e:
+            logging.error(f"Could not get DMS groups for {creds.username}: {e}")
+            # Fallback to DB
+            db_user = await db_connector.get_user_details(creds.username)
+            if not db_user or 'security_level' not in db_user:
+                raise HTTPException(status_code=401, detail="User not authorized")
+            security_str = db_user.get('security_level', 'Viewer')
+            security_level = processor.get_security_level_int(security_str)
+
+        # Get preferences from DB (lang, theme)
+        db_prefs = await db_connector.get_user_details(creds.username)
+
+        user_details = {
+            'username': creds.username,
+            'token': dst,
+            'security_level': security_str,
+            'dms_security_level': security_level,  # Numeric for logic
+            'lang': db_prefs.get('lang', 'en') if db_prefs else 'en',
+            'theme': db_prefs.get('theme', 'light') if db_prefs else 'light'
+        }
+
         request.session['user'] = user_details
         return {"message": "Login successful", "user": user_details}
     else:
@@ -97,26 +120,27 @@ def get_doc_trustees(doc_id: str, request: Request):
 def get_groups(request: Request):
     token = processor.get_session_token(request)
     user = request.session.get('user')
+    username = user.get('username') if user else None
 
-    # Get raw security level from user session
-    raw_level = user.get('security_level', 0) if user else 0
+    if not username:
+        raise HTTPException(status_code=401, detail="Not authenticated")
 
-    # Convert to integer using helper
-    try:
-        security_level = int(raw_level)
-    except ValueError:
-        security_level = processor.get_security_level_int(raw_level)
+    # Get user's groups from DMS (this already works!)
+    user_groups = wsdl_client.get_groups_for_user(token, username)
 
-    username = user.get('username')
+    # Determine security level from their groups
+    security_level = processor.determine_security_from_groups(user_groups)
 
-    # If admin (level 9), show all groups. Otherwise, show only user's groups.
+    # Update session with DMS-based security
+    if user:
+        user['dms_security_level'] = security_level
+        request.session['user'] = user
+
+    # If admin (9), show all groups. Otherwise, show only user's groups.
     if security_level >= 9:
-        groups = wsdl_client.get_all_groups(token)
+        return wsdl_client.get_all_groups(token)
     else:
-        # Falls back to get_all_groups inside wsdl_client if user-search fails
-        groups = wsdl_client.get_groups_for_user(token, username)
-
-    return groups
+        return user_groups
 
 @router.get("/api/groups/search_members", response_model=dict)
 def search_group_members(
