@@ -471,10 +471,10 @@ def search_users_in_group(dst, group_id, search_term, library='RTA_MAIN'):
                     'criteria': {
                         'criteriaCount': 2,
                         'criteriaNames': {'string': ['GROUP_ID', 'DISABLED']},
-                        'criteriaValues': {'string': [group_id, 'N']}  # ← Only non-disabled users
+                        'criteriaValues': {'string': [group_id, 'N']}
                     },
                     'retProperties': {
-                        'string': ['USER_ID', 'FULL_NAME', 'PEOPLE_SYSTEM_ID']
+                        'string': ['USER_ID', 'FULL_NAME']
                     },
                     'sortProps': {
                         'propertyCount': 1,
@@ -487,6 +487,7 @@ def search_users_in_group(dst, group_id, search_term, library='RTA_MAIN'):
         }
 
         search_reply = svc_client.service.Search(**search_call)
+
         if not (search_reply and search_reply.resultCode == 0 and search_reply.resultSetID):
             logging.warning(f"Search failed for group {group_id}")
             return []
@@ -500,67 +501,97 @@ def search_users_in_group(dst, group_id, search_term, library='RTA_MAIN'):
         data_reply = getattr(data_client.service, method_name)(**get_data_call)
 
         members = []
-        all_raw_members = []  # ← DEBUG: Capture everything
+        all_raw_members = []
+        seen_ids = set()
 
-        # Helper to clean text
         def clean_text(text):
             if not text:
                 return ""
             return re.sub(r'[\x00-\x1f\x7f]', '', str(text)).strip()
 
-        # 1. Try Parsing Binary Buffer
-        if hasattr(data_reply, 'resultSetData') and data_reply.resultSetData:
+        def is_system_id(val):
+            """Check if value is a numeric system ID (>5 digits)."""
+            return val and val.isdigit() and len(val) > 5
+
+        def is_valid_username(val):
+            """Check if value could be a valid username."""
+            if not val or len(val) <= 1:
+                return False
+            if is_system_id(val):
+                return False
+            # Single special chars are not usernames
+            if len(val) == 1 and not val.isalnum():
+                return False
+            return True
+
+        def extract_user_info(v0, v1):
+            """Extract user_id and full_name from two values."""
+            # Case 1: v0 is system_id, v1 is username
+            if is_system_id(v0) and is_valid_username(v1):
+                return v1, v1
+
+            # Case 2: v0 is empty, v1 has data
+            if not v0 and is_valid_username(v1):
+                return v1, v1
+
+            # Case 3: v0 has username, v1 has full_name (ideal case)
+            if is_valid_username(v0) and v1 and ' ' in v1:
+                return v0, v1
+
+            # Case 4: v0 has username, v1 is empty or same
+            if is_valid_username(v0):
+                return v0, v1 if v1 else v0
+
+            # Case 5: v0 looks like full_name (has space), v1 is empty
+            if v0 and ' ' in v0 and not v1:
+                return v0, v0
+
+            return None, None
+
+        def add_member(user_id, full_name):
+            if not user_id or user_id in seen_ids:
+                return
+            if search_term:
+                search_lower = search_term.lower()
+                if search_lower not in user_id.lower() and search_lower not in (full_name or '').lower():
+                    return
+            seen_ids.add(user_id)
+            members.append({'user_id': user_id, 'full_name': full_name or user_id})
+
+        # Process XML RowNode
+        row_nodes = getattr(data_reply, 'rowNode', None) or getattr(data_reply, 'RowNode', None)
+
+        if row_nodes:
+            for row in row_nodes:
+                vals = row.propValues.anyType if hasattr(row, 'propValues') else []
+                if vals:
+                    v0 = clean_text(vals[0] if len(vals) > 0 else None)
+                    v1 = clean_text(vals[1] if len(vals) > 1 else None)
+
+                    all_raw_members.append({'v0': v0, 'v1': v1})
+
+                    user_id, full_name = extract_user_info(v0, v1)
+                    if user_id:
+                        add_member(user_id, full_name)
+
+        # Fallback: Binary Buffer
+        if not members and hasattr(data_reply, 'resultSetData') and data_reply.resultSetData:
             container = data_reply.resultSetData
             if hasattr(container, 'resultBuffer') and container.resultBuffer:
                 parsed_items = parse_user_result_buffer(container.resultBuffer)
-
-                # ← DEBUG: Log ALL parsed items before filtering
-                logging.info(f"Raw parsed items from buffer ({len(parsed_items)}): {parsed_items}")
-
                 for p in parsed_items:
-                    c_name = clean_text(p.get('full_name'))
-                    c_id = clean_text(p.get('user_id'))
+                    v0 = clean_text(p.get('user_id'))
+                    v1 = clean_text(p.get('full_name'))
+                    all_raw_members.append({'v0': v0, 'v1': v1})
+                    user_id, full_name = extract_user_info(v0, v1)
+                    if user_id:
+                        add_member(user_id, full_name)
 
-                    # ← DEBUG: Log each item before filter
-                    all_raw_members.append({'id': c_id, 'name': c_name})
-
-                    # ORIGINAL FILTER (might be too aggressive)
-                    if c_name and c_id and not c_id.isdigit():  # ← This removes numeric IDs!
-                        if not search_term or (
-                                search_term.lower() in c_name.lower() or
-                                search_term.lower() in c_id.lower()):
-                            p['full_name'] = c_name
-                            p['user_id'] = c_id
-                            members.append(p)
-
-        # 2. Try XML RowNode (Fallback)
-        if not members:
-            row_nodes = getattr(data_reply, 'rowNode', None) or getattr(data_reply, 'RowNode', None)
-            if row_nodes:
-                # ← DEBUG: Log row count
-                logging.info(f"Found {len(row_nodes)} rows in XML format")
-
-                for row in row_nodes:
-                    vals = row.propValues.anyType
-                    if vals:
-                        raw_id = vals[0]
-                        raw_name = vals[1]
-
-                        c_id = clean_text(raw_id)
-                        c_name = clean_text(raw_name)
-
-                        # ← DEBUG: Log each row
-                        all_raw_members.append({'id': c_id, 'name': c_name})
-
-                        # ORIGINAL FILTER
-                        if c_id and c_name and not c_id.isdigit():
-                            if not search_term or (
-                                    search_term.lower() in c_name.lower() or search_term.lower() in c_id.lower()):
-                                members.append({'user_id': c_id, 'full_name': c_name})
-
-        # ← DEBUG: Log what was filtered out
-        logging.info(f"Group {group_id} - Raw members: {all_raw_members}")
-        logging.info(f"Group {group_id} - After filtering: {members}")
+        # DEBUG logs
+        logging.info(f"[DEBUG] Group {group_id} - Raw count: {len(all_raw_members)}")
+        logging.info(f"[DEBUG] Group {group_id} - Raw (first 20): {all_raw_members[:20]}")
+        logging.info(f"[DEBUG] Group {group_id} - Final count: {len(members)}")
+        logging.info(f"[DEBUG] Group {group_id} - Final (first 30): {members[:30]}")
 
         try:
             svc_client.service.ReleaseData(call={'resultSetID': result_set_id})
@@ -571,7 +602,7 @@ def search_users_in_group(dst, group_id, search_term, library='RTA_MAIN'):
         return members
 
     except Exception as e:
-        logging.error(f"Error searching group users: {e}")
+        logging.error(f"Error searching group users: {e}", exc_info=True)
         return []
 
 def get_groups_for_user(dst, username, library='RTA_MAIN'):
@@ -997,3 +1028,62 @@ def determine_security_from_group(group_id):
 
     # Default to Viewer (level 0)
     return 0
+
+
+def debug_user_in_group(dst, username, group_id, library='RTA_MAIN'):
+    """Debug why a specific user doesn't appear in group search"""
+    try:
+        svc_client = get_soap_client('BasicHttpBinding_IDMSvc')
+
+        # Search 1: Without DISABLED filter
+        search_call = {
+            'call': {
+                'dstIn': dst,
+                'objectType': 'v_peoplegroups',
+                'signature': {
+                    'libraries': {'string': [library]},
+                    'criteria': {
+                        'criteriaCount': 2,
+                        'criteriaNames': {'string': ['GROUP_ID', 'USER_ID']},
+                        'criteriaValues': {'string': [group_id, username]}
+                    },
+                    'retProperties': {
+                        'string': ['USER_ID', 'FULL_NAME', 'GROUP_ID', 'DISABLED']
+                    },
+                    'maxRows': 10
+                }
+            }
+        }
+
+        search_reply = svc_client.service.Search(**search_call)
+        logging.info(
+            f"[DEBUG USER] Search for {username} in {group_id} - resultCode: {getattr(search_reply, 'resultCode', 'N/A')}")
+
+        if search_reply and search_reply.resultCode == 0 and search_reply.resultSetID:
+            result_set_id = search_reply.resultSetID
+
+            data_client = find_client_with_operation('GetDataW') or svc_client
+            method_name = 'GetDataW' if hasattr(data_client.service, 'GetDataW') else 'GetData'
+
+            get_data_call = {'call': {'resultSetID': result_set_id, 'requestedRows': 10, 'startingRow': 0}}
+            data_reply = getattr(data_client.service, method_name)(**get_data_call)
+
+            row_nodes = getattr(data_reply, 'rowNode', None) or getattr(data_reply, 'RowNode', None)
+
+            if row_nodes:
+                logging.info(f"[DEBUG USER] Found {len(row_nodes)} records for {username}:")
+                for idx, row in enumerate(row_nodes):
+                    vals = row.propValues.anyType if hasattr(row, 'propValues') else []
+                    logging.info(f"[DEBUG USER] Row {idx}: {vals}")
+            else:
+                logging.info(f"[DEBUG USER] No records found for {username} in {group_id}")
+
+            try:
+                svc_client.service.ReleaseData(call={'resultSetID': result_set_id})
+            except:
+                pass
+        else:
+            logging.info(f"[DEBUG USER] Search returned no results")
+
+    except Exception as e:
+        logging.error(f"[DEBUG USER] Error: {e}")
