@@ -15,7 +15,7 @@ async def login(request: Request, creds: LoginRequest):
         # Get user's groups from DMS (proven working query)
         try:
             user_groups = wsdl_client.get_groups_for_user(dst, creds.username)
-            logging.info(f"User {creds.username} belongs to groups: {[g.get('group_id') for g in user_groups]}")
+            # logging.info(f"User {creds.username} belongs to groups: {[g.get('group_id') for g in user_groups]}")
 
             security_level = processor.determine_security_from_groups(user_groups)
             security_str = {9: 'Admin', 5: 'Editor', 0: 'Viewer'}.get(security_level, 'Viewer')

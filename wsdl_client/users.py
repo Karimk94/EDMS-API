@@ -588,10 +588,10 @@ def search_users_in_group(dst, group_id, search_term, library='RTA_MAIN'):
                         add_member(user_id, full_name)
 
         # DEBUG logs
-        logging.info(f"[DEBUG] Group {group_id} - Raw count: {len(all_raw_members)}")
-        logging.info(f"[DEBUG] Group {group_id} - Raw (first 20): {all_raw_members[:20]}")
-        logging.info(f"[DEBUG] Group {group_id} - Final count: {len(members)}")
-        logging.info(f"[DEBUG] Group {group_id} - Final (first 30): {members[:30]}")
+        # logging.info(f"[DEBUG] Group {group_id} - Raw count: {len(all_raw_members)}")
+        # logging.info(f"[DEBUG] Group {group_id} - Raw (first 20): {all_raw_members[:20]}")
+        # logging.info(f"[DEBUG] Group {group_id} - Final count: {len(members)}")
+        # logging.info(f"[DEBUG] Group {group_id} - Final (first 30): {members[:30]}")
 
         try:
             svc_client.service.ReleaseData(call={'resultSetID': result_set_id})

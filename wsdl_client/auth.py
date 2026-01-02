@@ -44,7 +44,7 @@ def dms_user_login(username, password):
 
         if response and response.resultCode == 0 and response.DSTOut:
             dst = response.DSTOut
-            logging.info(f"[DEBUG LOGIN] Login successful for {username}")
+            # logging.info(f"[DEBUG LOGIN] Login successful for {username}")
 
             # DEBUG: Check why user doesn't appear in group search
             try:
