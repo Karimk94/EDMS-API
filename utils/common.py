@@ -2,6 +2,11 @@ from fastapi import Request, HTTPException, status
 import re
 import wsdl_client
 import gc
+import smtplib
+import os
+import logging
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 
 def verify_editor(request: Request):
     user = request.session.get("user")
@@ -71,3 +76,39 @@ def find_active_soap_client():
         pass
 
     return None
+
+def send_otp_email(to_email: str, otp: str):
+    """
+    Sends an OTP verification email using SMTP.
+    Requires environment variables: SMTP_SERVER, SMTP_PORT, SMTP_USERNAME, SMTP_PASSWORD
+    """
+    smtp_server = os.getenv("SMTP_SERVER")
+    smtp_port = int(os.getenv("SMTP_PORT"))
+    smtp_user = os.getenv("SMTP_USER")
+    smtp_password = os.getenv("SMTP_PASSWORD")
+    from_email = os.getenv("SMTP_SENDER_EMAIL")
+
+    if not smtp_user or not smtp_password:
+        logging.warning(f"SMTP credentials not configured. Mocking OTP for {to_email}: {otp}")
+        return
+
+    subject = "Smart EDMS - Document Access Verification"
+    body = f"Your verification code is: {otp}\n\nThis code expires in 10 minutes."
+
+    msg = MIMEMultipart()
+    msg['From'] = from_email
+    msg['To'] = to_email
+    msg['Subject'] = subject
+    msg.attach(MIMEText(body, 'plain'))
+
+    try:
+        server = smtplib.SMTP(smtp_server, smtp_port)
+        server.starttls()
+        server.login(smtp_user, smtp_password)
+        text = msg.as_string()
+        server.sendmail(from_email, to_email, text)
+        server.quit()
+        logging.info(f"OTP email sent to {to_email}")
+    except Exception as e:
+        logging.error(f"Failed to send email to {to_email}: {e}")
+        raise HTTPException(status_code=500, detail="Failed to send verification email. Please contact support.")

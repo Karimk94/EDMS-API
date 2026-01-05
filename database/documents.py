@@ -763,3 +763,65 @@ async def get_folder_system_ids(docnumbers):
     except Exception as e:
         logging.error(f"Error in get_folder_system_ids: {e}", exc_info=True)
         return {}
+
+async def get_document_by_id(doc_id):
+    """Fetches a single document's metadata by ID for sharing purposes."""
+    conn = await get_async_connection()
+    if not conn: return None
+
+    dst = dms_system_login()
+    if not dst:
+        if conn: await conn.close()
+        return None
+
+    try:
+        async with conn.cursor() as cursor:
+            # Basic metadata fetch
+            sql = """
+            SELECT p.DOCNUMBER, p.ABSTRACT, p.AUTHOR, p.RTADOCDATE, p.DOCNAME
+            FROM PROFILE p
+            WHERE p.DOCNUMBER = :doc_id
+            """
+            await cursor.execute(sql, {'doc_id': doc_id})
+            row = await cursor.fetchone()
+
+            if not row:
+                return None
+
+            doc_id, abstract, author, doc_date, docname = row
+
+            # Media info retrieval
+            thumbnail_path = None
+            media_type = 'image'
+
+            try:
+                # Async call to resolve media type/filename
+                original_filename, media_type, file_ext = await get_media_info_from_dms(dst, doc_id)
+                cached_thumbnail_file = f"{doc_id}.jpg"
+                cached_path = os.path.join(thumbnail_cache_dir, cached_thumbnail_file)
+
+                if os.path.exists(cached_path):
+                    thumbnail_path = f"cache/{cached_thumbnail_file}"
+                else:
+                    # Sync call for content retrieval (WSDL)
+                    media_bytes = get_media_content_from_dms(dst, doc_id)
+                    if media_bytes:
+                        thumbnail_path = create_thumbnail(doc_id, media_type, file_ext, media_bytes)
+            except Exception as e:
+                logging.error(f"Error getting media info for {doc_id}: {e}")
+
+            return {
+                "doc_id": doc_id,
+                "title": abstract or "",
+                "docname": docname or "",
+                "author": author or "N/A",
+                "date": doc_date.strftime('%Y-%m-%d %H:%M:%S') if doc_date else "N/A",
+                "thumbnail_url": thumbnail_path or "",
+                "media_type": media_type
+            }
+
+    except Exception as e:
+        logging.error(f"Error fetching document {doc_id}: {e}")
+        return None
+    finally:
+        await conn.close()

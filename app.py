@@ -6,7 +6,7 @@ from starlette.middleware.sessions import SessionMiddleware
 from dotenv import load_dotenv
 
 # Import Routers
-from routes import auth, documents, media, tags, events, folders, favorites, memories
+from routes import auth, documents, media, tags, events, folders, favorites, memories, sharing
 
 # Load environment variables
 load_dotenv()
@@ -47,6 +47,7 @@ app.include_router(events.router)
 app.include_router(folders.router)
 app.include_router(favorites.router)
 app.include_router(memories.router)
+app.include_router(sharing.router)
 
 @app.get("/")
 def health_check():

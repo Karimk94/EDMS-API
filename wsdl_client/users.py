@@ -1,6 +1,5 @@
 import logging
 import re
-import zlib
 from zeep import xsd
 from zeep.exceptions import Fault
 from .base import get_soap_client, find_client_with_operation
