@@ -6,6 +6,9 @@ from schemas.sharing import ShareLinkCreateRequest, ShareAccessRequest, ShareVer
 import logging
 import os
 import random
+from fastapi.responses import StreamingResponse
+import io
+import wsdl_client
 
 from utils.common import send_otp_email
 
@@ -131,4 +134,78 @@ async def verify_access_otp(token: str, req: ShareVerifyRequest):
         raise
     except Exception as e:
         logging.error(f"OTP verification error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.get('/api/share/download/{token}')
+async def download_shared_document(token: str, viewer_email: str):
+    """
+    Downloads a shared document after OTP verification.
+    Uses system DMS credentials to fetch the document.
+    """
+    try:
+        # 1. Verify the share link is valid
+        share_info = await sharing_db.get_share_details(token)
+        if not share_info:
+            raise HTTPException(status_code=404, detail="Link is invalid or expired")
+
+        # 2. Verify the viewer has verified access via OTP
+        has_access = await sharing_db.check_viewer_access(token, viewer_email)
+        if not has_access:
+            raise HTTPException(status_code=403, detail="Access not verified. Please complete OTP verification first.")
+
+        # 3. Get document ID from share info
+        doc_id = share_info['document_id']
+
+        # 4. Login with system credentials
+        dst = wsdl_client.dms_system_login()
+        if not dst:
+            raise HTTPException(status_code=500, detail="Failed to authenticate with DMS")
+
+        # 5. Get document info and content
+        filename, media_type, file_ext = await db_connector.get_media_info_from_dms(dst, doc_id)
+        if not filename:
+            raise HTTPException(status_code=404, detail="Document not found")
+
+        # Ensure filename has extension
+        if file_ext and not filename.lower().endswith(file_ext.lower()):
+            filename = f"{filename}{file_ext}"
+
+        file_bytes = db_connector.get_media_content_from_dms(dst, doc_id)
+        if not file_bytes:
+            raise HTTPException(status_code=500, detail="Failed to retrieve document content")
+
+        # 6. Determine mime type
+        mimetype = 'application/octet-stream'
+        if media_type == 'pdf':
+            mimetype = "application/pdf"
+        elif media_type == 'image':
+            ext = file_ext.replace('.', '') if file_ext else 'jpeg'
+            mimetype = f"image/{ext}"
+        elif media_type == 'video':
+            ext = file_ext.replace('.', '') if file_ext else 'mp4'
+            mimetype = f"video/{ext}"
+        elif media_type == 'text':
+            mimetype = "text/plain"
+        elif media_type == 'excel':
+            mimetype = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        elif media_type == 'powerpoint':
+            mimetype = "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+
+        # 7. Log the download
+        await sharing_db.log_share_access(share_info['share_id'], viewer_email)
+
+        # 8. Return the file
+        return StreamingResponse(
+            io.BytesIO(file_bytes),
+            media_type=mimetype,
+            headers={
+                "Content-Disposition": f'attachment; filename="{filename}"',
+                "Access-Control-Expose-Headers": "Content-Disposition"
+            }
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logging.error(f"Share download error: {e}")
         raise HTTPException(status_code=500, detail=str(e))

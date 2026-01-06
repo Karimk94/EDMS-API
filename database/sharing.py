@@ -238,3 +238,45 @@ async def verify_otp(token, email, otp_code):
         return False
     finally:
         await conn.close()
+
+async def check_viewer_access(token: str, viewer_email: str, hours_valid: int = 24) -> bool:
+    """
+    Checks if a viewer has verified access within the valid time window.
+    """
+    try:
+        # First get the share_id from the token
+        share_info = await get_share_details(token)
+        if not share_info:
+            return False
+
+        share_id = share_info['share_id']
+
+        conn = await get_async_connection()
+        if not conn:
+            return False
+
+        try:
+            # Check for access within the last X hours
+            query = """
+                SELECT COUNT(*) as access_count 
+                FROM lkp_share_logs 
+                WHERE share_id = :share_id 
+                AND LOWER(viewer_email) = LOWER(:viewer_email)
+                AND access_date >= SYSDATE - :hours_valid/24
+            """
+
+            async with conn.cursor() as cursor:
+                await cursor.execute(query, {
+                    'share_id': share_id,
+                    'viewer_email': viewer_email,
+                    'hours_valid': hours_valid
+                })
+                row = await cursor.fetchone()
+
+                return row is not None and row[0] > 0
+        finally:
+            await conn.close()
+
+    except Exception as e:
+        logging.error(f"Error checking viewer access: {e}")
+        return False
