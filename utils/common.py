@@ -8,6 +8,7 @@ import logging
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from datetime import datetime
+import base64
 
 def verify_editor(request: Request):
     user = request.session.get("user")
@@ -90,12 +91,10 @@ def get_otp_email_template(otp: str, recipient_email: str, validity_minutes: int
     Returns:
         HTML string for the email body
     """
-    import base64
 
     # Get configurable values from environment or use defaults
     company_name = os.getenv("COMPANY_NAME")
     support_email = os.getenv("SUPPORT_EMAIL")
-    company_website = os.getenv("COMPANY_WEBSITE")
     primary_color = os.getenv("EMAIL_PRIMARY_COLOR")
 
     # Build logo as base64 data URI from local file
@@ -169,22 +168,21 @@ def get_otp_email_template(otp: str, recipient_email: str, validity_minutes: int
                     logging.error(f"  [ERROR] Failed to load from {alt_path}: {e}")
     # === END LOGO PATH RESOLUTION ===
 
-    current_year = datetime.now().year
     current_datetime = datetime.now().strftime("%B %d, %Y at %I:%M %p")
 
-    # Logo section - embed base64 image if available
+    # Logo section
     logo_section = ""
     if logo_base64_src:
         logo_section = f'''
-            <div style="text-align: center; margin-bottom: 10px;">
-                <img src="{logo_base64_src}" alt="{company_name} Logo" style="max-width: 180px; max-height: 80px; height: auto;">
+            <div style="text-align: center; margin-bottom: 2px;">
+                <img src="{logo_base64_src}" alt="{company_name} Logo" style="max-width: 140px; max-height: 50px; height: auto;">
             </div>
         '''
     else:
-        # Fallback to text-based logo if no image file found
+        # Fallback to text-based logo
         logo_section = f'''
-            <div style="text-align: center; margin-bottom: 10px;">
-                <h1 style="color: {primary_color}; margin: 0; font-size: 28px; font-weight: 700;">{company_name}</h1>
+            <div style="text-align: center; margin-bottom: 2px;">
+                <h1 style="color: #ffffff; margin: 0; font-size: 20px; font-weight: 700;">{company_name}</h1>
             </div>
         '''
 
@@ -194,106 +192,65 @@ def get_otp_email_template(otp: str, recipient_email: str, validity_minutes: int
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Document Access Verification</title>
+    <title>Verification Code</title>
 </head>
-<body style="margin: 0; padding: 0; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: #f4f7fa; line-height: 1.6;">
+<body style="margin: 0; padding: 0; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: #f4f7fa; line-height: 1.4;">
     <table role="presentation" style="width: 100%; border-collapse: collapse;">
         <tr>
-            <td align="center" style="padding: 0px 10px;">
-                <table role="presentation" style="width: 100%; max-width: 600px; border-collapse: collapse; background-color: #ffffff; border-radius: 12px; box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);">
+            <td align="center" style="padding: 10px;">
+                <table role="presentation" style="width: 100%; max-width: 480px; border-collapse: collapse; background-color: #ffffff; border-radius: 8px; box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1); overflow: hidden;">
 
-                    <!-- Header Section -->
+                    <!-- Compact Header Section: Reduced top padding to move logo up -->
                     <tr>
-                        <td style="padding: 10px 40px 0px 10px; background: linear-gradient(135deg, {primary_color} 0%, #004499 100%); border-radius: 12px 12px 0 0;">
-                            {logo_section.replace(f'color: {primary_color}', 'color: #ffffff')}
-                            <h1 style="color: #333333; margin: 0; font-size: 24px; font-weight: 600; text-align: center;">
+                        <td style="padding: 6px 15px 10px 15px; background: linear-gradient(135deg, {primary_color} 0%, #004499 100%); text-align: center;">
+                            {logo_section}
+                            <h2 style="color: #444444; margin: 0; font-size: 18px; font-weight: 600; letter-spacing: 0.5px; opacity: 0.95;">
                                 Document Access Verification
-                            </h1>
+                            </h2>
                         </td>
                     </tr>
 
                     <!-- Main Content -->
                     <tr>
-                        <td style="padding: 40px;">
-                            <p style="color: #333333; font-size: 16px; margin: 0 0 20px 0;">
-                                Hello,
-                            </p>
-                            <p style="color: #555555; font-size: 15px; margin: 0 0 25px 0;">
-                                You have requested access to a shared document. Please use the verification code below to complete your access request:
+                        <td style="padding: 20px 25px;">
+                            <p style="color: #444444; font-size: 14px; margin: 0 0 15px 0; text-align: center;">
+                                Please use the verification code below to complete your request.
                             </p>
 
-                            <!-- OTP Code Box -->
-                            <div style="background: linear-gradient(135deg, #f8f9fa 0%, #e9ecef 100%); border: 2px dashed {primary_color}; border-radius: 12px; padding: 30px; text-align: center; margin: 30px 0;">
-                                <p style="color: #666666; font-size: 14px; margin: 0 0 10px 0; text-transform: uppercase; letter-spacing: 2px;">
-                                    Your Verification Code
-                                </p>
-                                <p style="color: {primary_color}; font-size: 42px; font-weight: 700; margin: 0; letter-spacing: 8px; font-family: 'Courier New', monospace;">
-                                    {otp}
-                                </p>
+                            <!-- OTP Code Box: Fixed selection issues with inline-block and tight line-height -->
+                            <div style="background-color: #f8f9fa; border: 1px solid #dee2e6; border-radius: 6px; padding: 12px; text-align: center; margin: 0 0 15px 0;">
+                                <span style="display: inline-block; color: {primary_color}; font-size: 28px; font-weight: 700; letter-spacing: 4px; font-family: 'Courier New', monospace; line-height: 1; margin: 0;">{otp}</span>
                             </div>
 
                             <!-- Expiry Warning -->
-                            <div style="background-color: #fff3cd; border-left: 4px solid #ffc107; border-radius: 0 8px 8px 0; padding: 15px 20px; margin: 25px 0;">
-                                <p style="color: #856404; font-size: 14px; margin: 0;">
-                                    <strong>⏰ Important:</strong> This code will expire in <strong>{validity_minutes} minutes</strong>. Please enter it promptly to access your document.
+                            <div style="background-color: #fff3cd; border-radius: 4px; padding: 8px 12px; margin-bottom: 15px; text-align: center;">
+                                <p style="color: #856404; font-size: 12px; margin: 0;">
+                                    <strong>⏰ Expires in {validity_minutes} mins.</strong>
+                                </p>
+                            </div>
+
+                            <!-- Security Notice -->
+                            <div style="background-color: #f8d7da; border-left: 3px solid #dc3545; border-radius: 4px; padding: 8px 12px; margin-bottom: 15px;">
+                                <p style="color: #721c24; font-size: 11px; margin: 0; line-height: 1.4;">
+                                    <strong>🔒 Security Notice:</strong> If you did not request this, please ignore this email. Do not share this code.
                                 </p>
                             </div>
 
                             <!-- Request Details -->
-                            <div style="background-color: #f8f9fa; border-radius: 8px; padding: 20px; margin: 25px 0;">
-                                <h3 style="color: #333333; font-size: 16px; margin: 0 0 15px 0; border-bottom: 1px solid #dee2e6; padding-bottom: 10px;">
-                                    📋 Request Details
-                                </h3>
-                                <table style="width: 100%; font-size: 14px;">
-                                    <tr>
-                                        <td style="color: #666666; padding: 5px 0; width: 40%;">Email Address:</td>
-                                        <td style="color: #333333; padding: 5px 0; font-weight: 500;">{recipient_email}</td>
-                                    </tr>
-                                    <tr>
-                                        <td style="color: #666666; padding: 5px 0;">Request Time:</td>
-                                        <td style="color: #333333; padding: 5px 0; font-weight: 500;">{current_datetime}</td>
-                                    </tr>
-                                    <tr>
-                                        <td style="color: #666666; padding: 5px 0;">Valid For:</td>
-                                        <td style="color: #333333; padding: 5px 0; font-weight: 500;">{validity_minutes} minutes</td>
-                                    </tr>
-                                </table>
-                            </div>
-
-                            <!-- Security Notice -->
-                            <div style="background-color: #f8d7da; border-left: 4px solid #dc3545; border-radius: 0 8px 8px 0; padding: 15px 20px; margin: 25px 0;">
-                                <p style="color: #721c24; font-size: 13px; margin: 0;">
-                                    <strong>🔒 Security Notice:</strong> If you did not request this verification code, please ignore this email. Do not share this code with anyone. Our team will never ask you for this code.
+                            <div style="border-top: 1px solid #eeeeee; padding-top: 12px; margin-top: 5px;">
+                                <p style="color: #666666; font-size: 11px; margin: 0;">
+                                    <strong>Request for:</strong> {recipient_email} <span style="float: right;">{current_datetime}</span>
                                 </p>
                             </div>
-
-                            <p style="color: #555555; font-size: 14px; margin: 25px 0 0 0;">
-                                If you have any questions or need assistance, please contact our support team at 
-                                <a href="mailto:{support_email}" style="color: {primary_color}; text-decoration: none;">{support_email}</a>
-                            </p>
                         </td>
                     </tr>
 
-                    <!-- Footer -->
+                    <!-- Minimal Footer -->
                     <tr>
-                        <td style="padding: 30px 40px; background-color: #f8f9fa; border-radius: 0 0 12px 12px; border-top: 1px solid #e9ecef;">
-                            <table role="presentation" style="width: 100%;">
-                                <tr>
-                                    <td style="text-align: center;">
-                                        <p style="color: #666666; font-size: 14px; margin: 0 0 10px 0;">
-                                            Thank you for using {company_name}
-                                        </p>
-                                        <p style="color: #999999; font-size: 12px; margin: 0 0 15px 0;">
-                                            <a href="{company_website}" style="color: {primary_color}; text-decoration: none;">{company_website}</a>
-                                        </p>
-                                        <hr style="border: none; border-top: 1px solid #dee2e6; margin: 20px 0;">
-                                        <p style="color: #999999; font-size: 11px; margin: 0;">
-                                            © {current_year} {company_name}. All rights reserved.<br>
-                                            This is an automated message. Please do not reply directly to this email.
-                                        </p>
-                                    </td>
-                                </tr>
-                            </table>
+                        <td style="padding: 10px; background-color: #f8f9fa; border-top: 1px solid #e9ecef; text-align: center;">
+                            <p style="color: #999999; font-size: 11px; margin: 0;">
+                                Need help? <a href="mailto:{support_email}" style="color: {primary_color}; text-decoration: none;">{support_email}</a>
+                            </p>
                         </td>
                     </tr>
 
@@ -370,8 +327,7 @@ def send_otp_email(to_email: str, otp: str, validity_minutes: int = 5):
         logging.warning(f"SMTP credentials not configured. Mocking OTP for {to_email}: {otp}")
         return
 
-    company_name = os.getenv("COMPANY_NAME")
-    subject = f"{company_name} - Document Access Verification Code"
+    subject = "Document Access Verification Code"
 
     # Create multipart message for both HTML and plain text
     msg = MIMEMultipart('alternative')
@@ -399,7 +355,6 @@ def send_otp_email(to_email: str, otp: str, validity_minutes: int = 5):
         server.login(smtp_user, smtp_password)
         server.sendmail(from_email, to_email, msg.as_string())
         server.quit()
-        logging.info(f"OTP email sent successfully to {to_email}")
     except smtplib.SMTPAuthenticationError as e:
         logging.error(f"SMTP Authentication failed: {e}")
         raise HTTPException(status_code=500, detail="Email service authentication failed. Please contact support.")

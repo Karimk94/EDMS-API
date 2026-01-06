@@ -95,8 +95,8 @@ async def request_access_otp(token: str, req: ShareAccessRequest):
 
         return {"message": "OTP sent to your email.", "email": req.viewer_email}
 
-    except HTTPException:
-        raise
+    except HTTPException as ex:
+        raise ex
     except Exception as e:
         logging.error(f"OTP request error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
