@@ -6,11 +6,13 @@ from schemas.sharing import ShareLinkCreateRequest, ShareAccessRequest, ShareVer
 import logging
 import os
 import random
+from datetime import datetime
 from fastapi.responses import StreamingResponse
 import io
 import wsdl_client
 
 from utils.common import send_otp_email
+from utils.watermark import apply_watermark_to_image, apply_watermark_to_pdf, apply_watermark_to_video
 
 router = APIRouter()
 ALLOWED_DOMAIN = "@rta.ae"
@@ -141,6 +143,7 @@ async def download_shared_document(token: str, viewer_email: str):
     """
     Downloads a shared document after OTP verification.
     Uses system DMS credentials to fetch the document.
+    Applies watermark with viewer_email based on file type.
     """
     try:
         # 1. Verify the share link is valid
@@ -174,16 +177,19 @@ async def download_shared_document(token: str, viewer_email: str):
         if not file_bytes:
             raise HTTPException(status_code=500, detail="Failed to retrieve document content")
 
-        # 6. Determine mime type
+        # 6. Create watermark text using viewer_email
+        watermark_text = f"{viewer_email} | {doc_id} | {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+
+        # 7. Determine mime type and apply watermark based on media type
         mimetype = 'application/octet-stream'
-        if media_type == 'pdf':
-            mimetype = "application/pdf"
-        elif media_type == 'image':
-            ext = file_ext.replace('.', '') if file_ext else 'jpeg'
-            mimetype = f"image/{ext}"
+        processed_bytes = file_bytes
+
+        if media_type == 'image':
+            processed_bytes, mimetype = apply_watermark_to_image(file_bytes, watermark_text)
+        elif media_type == 'pdf':
+            processed_bytes, mimetype = apply_watermark_to_pdf(file_bytes, watermark_text)
         elif media_type == 'video':
-            ext = file_ext.replace('.', '') if file_ext else 'mp4'
-            mimetype = f"video/{ext}"
+            processed_bytes, mimetype = apply_watermark_to_video(file_bytes, watermark_text, filename)
         elif media_type == 'text':
             mimetype = "text/plain"
         elif media_type == 'excel':
@@ -191,12 +197,12 @@ async def download_shared_document(token: str, viewer_email: str):
         elif media_type == 'powerpoint':
             mimetype = "application/vnd.openxmlformats-officedocument.presentationml.presentation"
 
-        # 7. Log the download
+        # 8. Log the download
         await sharing_db.log_share_access(share_info['share_id'], viewer_email)
 
-        # 8. Return the file
+        # 9. Return the watermarked file
         return StreamingResponse(
-            io.BytesIO(file_bytes),
+            io.BytesIO(processed_bytes),
             media_type=mimetype,
             headers={
                 "Content-Disposition": f'attachment; filename="{filename}"',

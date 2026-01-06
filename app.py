@@ -2,6 +2,7 @@ import logging
 import os
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from starlette.middleware.sessions import SessionMiddleware
 from dotenv import load_dotenv
 
@@ -18,6 +19,21 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
 
 app = FastAPI(title="EDMS Middleware API")
+
+# --- Static Files Setup ---
+# Create static directory if it doesn't exist
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+STATIC_DIR = os.path.join(BASE_DIR, 'static')
+STATIC_IMAGES_DIR = os.path.join(STATIC_DIR, 'images')
+
+if not os.path.exists(STATIC_DIR):
+    os.makedirs(STATIC_DIR)
+if not os.path.exists(STATIC_IMAGES_DIR):
+    os.makedirs(STATIC_IMAGES_DIR)
+
+# Mount static files directory
+# Files in /static will be accessible at /static/...
+app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 # --- Security & Middleware ---
 
