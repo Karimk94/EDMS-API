@@ -10,6 +10,7 @@ import logging
 #     token VARCHAR(64) NOT NULL UNIQUE,
 #     docnumber INT NOT NULL, -- Matches your Documents table
 #     created_by int NOT NULL, -- system_id of the person from PEOPLE table that can be retrieved by email
+#     target_email VARCHAR(255) NULL, -- If set, only this email can access (must be @rta.ae)
 #     create_date DATETIME DEFAULT GETDATE(),
 #     expiry DATETIME NULL,
 #     is_active BIT DEFAULT 1
@@ -31,29 +32,43 @@ import logging
 #     is_used NUMBER(1) DEFAULT 0
 # );
 
-async def create_share_link(document_id, created_by, expiry_date=None):
+ALLOWED_DOMAIN = "@rta.ae"
+
+async def create_share_link(document_id, created_by, expiry_date=None, target_email=None):
     """
     Creates a new share token for a document (Async).
+
+    Args:
+        document_id: The document ID to share
+        created_by: The user system_id creating the share
+        expiry_date: Optional expiry date for the link
+        target_email: Optional specific email that can access (must be @rta.ae domain)
     """
     conn = await get_async_connection()
     if not conn:
         raise Exception("Database connection failed")
 
+    # Validate target_email domain if provided
+    if target_email:
+        target_email = target_email.strip().lower()
+        if not target_email.endswith(ALLOWED_DOMAIN.lower()):
+            raise ValueError(f"Target email must be from {ALLOWED_DOMAIN} domain")
+
     token = str(uuid.uuid4())
 
     # Oracle uses :placeholder syntax
     query = """
-        INSERT INTO lkp_document_share (system_id, token, docnumber, created_by, expiry, create_date, is_active, disabled)
-        VALUES ((SELECT NVL(MAX(SYSTEM_ID), 0) + 1 FROM lkp_document_share), :token, :doc_id, :created_by, :expiry, SYSDATE, 1, 0)
+        INSERT INTO lkp_document_share (system_id, token, docnumber, created_by, target_email, expiry, create_date, is_active, disabled)
+        VALUES ((SELECT NVL(MAX(SYSTEM_ID), 0) + 1 FROM lkp_document_share), :token, :doc_id, :created_by, :target_email, :expiry, SYSDATE, 1, 0)
     """
 
     try:
         async with conn.cursor() as cursor:
-            # Handle expiry date formatting if needed, or pass as datetime object
             await cursor.execute(query, {
                 'token': token,
                 'doc_id': document_id,
                 'created_by': created_by,
+                'target_email': target_email,
                 'expiry': expiry_date
             })
             await conn.commit()
@@ -72,7 +87,7 @@ async def get_share_details(token):
     if not conn: return None
 
     query = """
-        SELECT system_id, docnumber, created_by, expiry, is_active 
+        SELECT system_id, docnumber, created_by, target_email, expiry, is_active 
         FROM lkp_document_share 
         WHERE token = :token
     """
@@ -83,7 +98,7 @@ async def get_share_details(token):
             row = await cursor.fetchone()
 
             if row:
-                share_id, doc_id, created_by, expiry, is_active = row
+                share_id, doc_id, created_by, target_email, expiry, is_active = row
 
                 # Check expiration
                 if expiry and expiry < datetime.now():
@@ -96,6 +111,7 @@ async def get_share_details(token):
                     "share_id": share_id,
                     "document_id": doc_id,
                     "created_by": created_by,
+                    "target_email": target_email,  # Will be None if not restricted
                     "expiry_date": expiry
                 }
             return None
@@ -175,7 +191,7 @@ async def get_system_id_by_username(username: str) -> int | None:
     finally:
         await conn.close()
 
-async def save_otp(token, email, otp_code, validity_minutes=10):
+async def save_otp(token, email, otp_code, validity_minutes=5):
     """Saves an OTP to the database with an expiry time."""
     conn = await get_async_connection()
     if not conn: return False
@@ -213,7 +229,7 @@ async def verify_otp(token, email, otp_code):
                 SELECT system_id 
                 FROM lkp_share_otp 
                 WHERE share_token = :token 
-                AND email = :email 
+                AND LOWER(email) = LOWER(:email)
                 AND otp_code = :otp 
                 AND is_used = 0 
                 AND expiry_date > SYSDATE
@@ -280,3 +296,31 @@ async def check_viewer_access(token: str, viewer_email: str, hours_valid: int = 
     except Exception as e:
         logging.error(f"Error checking viewer access: {e}")
         return False
+
+async def validate_target_email_access(token: str, viewer_email: str) -> tuple[bool, str | None]:
+    """
+    Validates if the viewer email is allowed to access the shared document.
+
+    Returns:
+        tuple: (is_allowed, error_message)
+        - If target_email is set, only that email can access
+        - If target_email is None, any @rta.ae email can access
+    """
+    share_info = await get_share_details(token)
+    if not share_info:
+        return False, "Link is invalid or expired"
+
+    target_email = share_info.get('target_email')
+    viewer_email_lower = viewer_email.strip().lower()
+
+    # Check domain restriction first
+    if not viewer_email_lower.endswith(ALLOWED_DOMAIN.lower()):
+        return False, f"Access restricted to {ALLOWED_DOMAIN} emails only."
+
+    # If target_email is set, check if it matches
+    if target_email:
+        target_email_lower = target_email.strip().lower()
+        if viewer_email_lower != target_email_lower:
+            return False, "This link is restricted to a specific recipient. Please contact the sender if you believe this is an error."
+
+    return True, None

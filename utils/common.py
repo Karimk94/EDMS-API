@@ -367,3 +367,283 @@ def send_otp_email(to_email: str, otp: str, validity_minutes: int = 5):
     except Exception as e:
         logging.error(f"Unexpected error sending email to {to_email}: {e}")
         raise HTTPException(status_code=500, detail="Failed to send verification email. Please contact support.")
+
+def get_share_link_email_template(
+        share_link: str,
+        document_name: str,
+        sharer_name: str,
+        recipient_email: str,
+        expiry_date: datetime = None
+) -> str:
+    """
+    Generates an HTML email template for share link notification.
+    """
+    company_name = os.getenv("COMPANY_NAME")
+    support_email = os.getenv("SUPPORT_EMAIL")
+    primary_color = os.getenv("EMAIL_PRIMARY_COLOR")
+
+    # Build logo as base64
+    logo_base64_src = ""
+    logo_filename = os.getenv("COMPANY_LOGO_FILENAME")
+    current_file = os.path.abspath(__file__)
+    current_dir = os.path.dirname(current_file)
+    base_dir = os.path.dirname(current_dir)
+    logo_path = os.path.join(base_dir, 'static', 'images', logo_filename)
+
+    if os.path.exists(logo_path):
+        try:
+            ext = os.path.splitext(logo_filename)[1].lower()
+            mime_types = {
+                '.png': 'image/png',
+                '.jpg': 'image/jpeg',
+                '.jpeg': 'image/jpeg',
+                '.gif': 'image/gif',
+                '.svg': 'image/svg+xml',
+                '.webp': 'image/webp'
+            }
+            mime_type = mime_types.get(ext, 'image/png')
+            with open(logo_path, 'rb') as img_file:
+                logo_bytes = img_file.read()
+                logo_base64 = base64.b64encode(logo_bytes).decode('utf-8')
+                logo_base64_src = f"data:{mime_type};base64,{logo_base64}"
+        except Exception as e:
+            logging.error(f"Could not load logo: {e}")
+
+    # Logo section
+    logo_section = ""
+    if logo_base64_src:
+        logo_section = f'''
+            <div style="text-align: center; margin-bottom: 2px;">
+                <img src="{logo_base64_src}" alt="{company_name} Logo" style="max-width: 140px; max-height: 50px; height: auto;">
+            </div>
+        '''
+    else:
+        logo_section = f'''
+            <div style="text-align: center; margin-bottom: 2px;">
+                <h1 style="color: #ffffff; margin: 0; font-size: 20px; font-weight: 700;">{company_name}</h1>
+            </div>
+        '''
+
+    current_datetime = datetime.now().strftime("%B %d, %Y at %I:%M %p")
+
+    # Format expiry date if provided
+    expiry_section = ""
+    if expiry_date:
+        if isinstance(expiry_date, str):
+            try:
+                expiry_date = datetime.fromisoformat(expiry_date.replace('Z', '+00:00'))
+            except:
+                pass
+        if isinstance(expiry_date, datetime):
+            expiry_formatted = expiry_date.strftime("%B %d, %Y")
+            expiry_section = f'''
+                <div style="background-color: #fff3cd; border-radius: 4px; padding: 8px 12px; margin-bottom: 15px; text-align: center;">
+                    <p style="color: #856404; font-size: 12px; margin: 0;">
+                        <strong>⏰ This link expires on {expiry_formatted}</strong>
+                    </p>
+                </div>
+            '''
+
+    html_template = f'''
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Document Shared With You</title>
+</head>
+<body style="margin: 0; padding: 0; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: #f4f7fa; line-height: 1.4;">
+    <table role="presentation" style="width: 100%; border-collapse: collapse;">
+        <tr>
+            <td align="center">
+                <table role="presentation" style="width: 100%; max-width: 520px; border-collapse: collapse; background-color: #ffffff; border-radius: 8px; box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1); overflow: hidden;">
+
+                    <!-- Header -->
+                    <tr>
+                        <td style="padding: 0px 15px 10px 0px; background: linear-gradient(135deg, {primary_color} 0%, #004499 100%); text-align: center;">
+                            {logo_section}
+                            <h2 style="color: #444444; margin: 0; font-size: 18px; font-weight: 600; letter-spacing: 0.5px; opacity: 0.95;">
+                                Document Shared With You
+                            </h2>
+                        </td>
+                    </tr>
+
+                    <!-- Main Content -->
+                    <tr>
+                        <td style="padding: 25px;">
+                            <p style="color: #444444; font-size: 14px; margin: 0 0 20px 0;">
+                                Hello,
+                            </p>
+
+                            <p style="color: #444444; font-size: 14px; margin: 0 0 20px 0;">
+                                <strong>{sharer_name}</strong> has shared a document with you:
+                            </p>
+
+                            <!-- Document Info Box -->
+                            <div style="background-color: #f8f9fa; border: 1px solid #dee2e6; border-radius: 6px; padding: 15px; margin: 0 0 20px 0;">
+                                <div style="display: flex; align-items: center;">
+                                    <span style="font-size: 24px; margin-right: 12px;">📄</span>
+                                    <div>
+                                        <p style="color: #333333; font-size: 16px; font-weight: 600; margin: 0;">{document_name}</p>
+                                        <p style="color: #666666; font-size: 12px; margin: 4px 0 0 0;">Shared on {current_datetime}</p>
+                                    </div>
+                                </div>
+                            </div>
+
+                            {expiry_section}
+
+                            <!-- Access Button -->
+                            <div style="text-align: center; margin: 25px 0;">
+                                <a href="{share_link}" style="display: inline-block; background-color: {primary_color}; color: #ffffff; text-decoration: none; padding: 14px 35px; border-radius: 6px; font-size: 14px; font-weight: 600; box-shadow: 0 2px 4px rgba(0, 102, 204, 0.3);">
+                                    Access Document
+                                </a>
+                            </div>
+
+                            <p style="color: #666666; font-size: 12px; margin: 20px 0 0 0; text-align: center;">
+                                Or copy this link: <br/>
+                                <a href="{share_link}" style="color: {primary_color}; word-break: break-all;">{share_link}</a>
+                            </p>
+
+                            <!-- Security Notice -->
+                            <div style="background-color: #e8f4fd; border-left: 3px solid {primary_color}; border-radius: 4px; padding: 10px 12px; margin-top: 25px;">
+                                <p style="color: #0056b3; font-size: 11px; margin: 0; line-height: 1.5;">
+                                    <strong>🔒 Secure Access:</strong> You will need to verify your email address ({recipient_email}) with a one-time code to access this document.
+                                </p>
+                            </div>
+                        </td>
+                    </tr>
+
+                    <!-- Footer -->
+                    <tr>
+                        <td style="padding: 15px; background-color: #f8f9fa; border-top: 1px solid #e9ecef; text-align: center;">
+                            <p style="color: #999999; font-size: 11px; margin: 0;">
+                                Questions? Contact <a href="mailto:{support_email}" style="color: {primary_color}; text-decoration: none;">{support_email}</a>
+                            </p>
+                            <p style="color: #cccccc; font-size: 10px; margin: 8px 0 0 0;">
+                                This is an automated message from {company_name}
+                            </p>
+                        </td>
+                    </tr>
+
+                </table>
+            </td>
+        </tr>
+    </table>
+</body>
+</html>
+'''
+    return html_template
+
+def get_share_link_plain_text(
+        share_link: str,
+        document_name: str,
+        sharer_name: str,
+        recipient_email: str,
+        expiry_date: datetime = None
+) -> str:
+    """
+    Generates a plain text fallback for share link email.
+    """
+    company_name = os.getenv("COMPANY_NAME", "Smart EDMS")
+    support_email = os.getenv("SUPPORT_EMAIL", "support@rta.ae")
+    current_datetime = datetime.now().strftime("%B %d, %Y at %I:%M %p")
+
+    expiry_text = ""
+    if expiry_date:
+        if isinstance(expiry_date, str):
+            try:
+                expiry_date = datetime.fromisoformat(expiry_date.replace('Z', '+00:00'))
+            except:
+                pass
+        if isinstance(expiry_date, datetime):
+            expiry_text = f"\n⏰ This link expires on: {expiry_date.strftime('%B %d, %Y')}\n"
+
+    plain_text = f"""
+{company_name} - Document Shared With You
+{'=' * 50}
+
+Hello,
+
+{sharer_name} has shared a document with you.
+
+DOCUMENT: {document_name}
+SHARED ON: {current_datetime}
+{expiry_text}
+ACCESS LINK:
+{share_link}
+
+🔒 SECURE ACCESS:
+You will need to verify your email address ({recipient_email}) with a one-time code to access this document.
+
+If you have any questions, please contact our support team at {support_email}
+
+---
+This is an automated message from {company_name}
+"""
+    return plain_text
+
+def send_share_link_email(
+        to_email: str,
+        share_link: str,
+        document_name: str,
+        sharer_name: str,
+        expiry_date: datetime = None
+):
+    """
+    Sends a share link notification email to the target recipient.
+    """
+    smtp_server = os.getenv("SMTP_SERVER")
+    smtp_port = int(os.getenv("SMTP_PORT"))
+    smtp_user = os.getenv("SMTP_USER")
+    smtp_password = os.getenv("SMTP_PASSWORD")
+    from_email = os.getenv("SMTP_SENDER_EMAIL")
+    sender_name = os.getenv("SMTP_SENDER_NAME")
+
+    if not smtp_user or not smtp_password:
+        logging.warning(f"SMTP credentials not configured. Share link email to {to_email} not sent.")
+        return
+
+    subject = f"Document Shared: {document_name}"
+
+    # Create multipart message
+    msg = MIMEMultipart('alternative')
+    msg['From'] = f"{sender_name} <{from_email}>"
+    msg['To'] = to_email
+    msg['Subject'] = subject
+    msg['X-Priority'] = '1'
+    msg['X-Mailer'] = 'Smart EDMS Notification System'
+
+    # Generate email content
+    plain_text_content = get_share_link_plain_text(
+        share_link, document_name, sharer_name, to_email, expiry_date
+    )
+    html_content = get_share_link_email_template(
+        share_link, document_name, sharer_name, to_email, expiry_date
+    )
+
+    # Attach both versions
+    part1 = MIMEText(plain_text_content, 'plain', 'utf-8')
+    part2 = MIMEText(html_content, 'html', 'utf-8')
+
+    msg.attach(part1)
+    msg.attach(part2)
+
+    try:
+        server = smtplib.SMTP(smtp_server, smtp_port)
+        server.starttls()
+        server.login(smtp_user, smtp_password)
+        server.sendmail(from_email, to_email, msg.as_string())
+        server.quit()
+        # logging.info(f"Share link email sent successfully to {to_email}")
+    except smtplib.SMTPAuthenticationError as e:
+        logging.error(f"SMTP Authentication failed: {e}")
+        raise Exception("Email service authentication failed")
+    except smtplib.SMTPRecipientsRefused as e:
+        logging.error(f"Recipient refused: {e}")
+        raise Exception("Invalid email address")
+    except smtplib.SMTPException as e:
+        logging.error(f"SMTP error sending share link email to {to_email}: {e}")
+        raise Exception("Failed to send share link email")
+    except Exception as e:
+        logging.error(f"Unexpected error sending share link email to {to_email}: {e}")
+        raise Exception("Failed to send share link email")
