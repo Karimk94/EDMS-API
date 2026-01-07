@@ -1,5 +1,5 @@
 from pydantic import BaseModel, field_validator, model_validator, Field
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 from datetime import datetime
 
 ALLOWED_DOMAIN = "@rta.ae"
@@ -49,7 +49,8 @@ class ShareLinkResponse(BaseModel):
 class ShareInfoResponse(BaseModel):
     """Response model for share link info (public endpoint)."""
     is_restricted: bool
-    target_email_hint: Optional[str] = None
+    target_email: Optional[str] = None  # Full email for auto-OTP
+    target_email_hint: Optional[str] = None  # Masked for display
     expiry_date: Optional[datetime] = None
     share_type: str = "file"
 
@@ -97,7 +98,7 @@ class ShareVerifyRequest(BaseModel):
         return v
 
 class SharedFolderContentsRequest(BaseModel):
-    """Request model for getting shared folder contents (Query parameters)."""
+    """Request model for getting shared folder contents."""
     viewer_email: str
     parent_id: Optional[str] = Field(default=None, description="Parent folder ID for navigation")
 
@@ -108,3 +109,38 @@ class SharedFolderContentsRequest(BaseModel):
         if not v.endswith(ALLOWED_DOMAIN.lower()):
             raise ValueError(f"Email must be from {ALLOWED_DOMAIN} domain")
         return v
+
+class SharedDocumentDownloadRequest(BaseModel):
+    """Request model for downloading a shared document."""
+    viewer_email: str
+    doc_id: Optional[str] = Field(default=None, description="Document ID (required for folder shares)")
+
+    @field_validator('viewer_email')
+    @classmethod
+    def validate_viewer_email(cls, v):
+        v = v.strip().lower()
+        if not v.endswith(ALLOWED_DOMAIN.lower()):
+            raise ValueError(f"Email must be from {ALLOWED_DOMAIN} domain")
+        return v
+
+class FolderItem(BaseModel):
+    """Model for a folder or file item."""
+    id: str
+    name: str
+    type: str  # 'folder' or 'file'
+    media_type: str
+    system_id: Optional[str] = None
+
+class BreadcrumbItem(BaseModel):
+    """Model for a breadcrumb navigation item."""
+    id: str
+    name: str
+
+class SharedFolderContentsResponse(BaseModel):
+    """Response model for shared folder contents."""
+    folder_id: str
+    folder_name: str
+    root_folder_id: str
+    is_root: bool
+    breadcrumbs: List[BreadcrumbItem]
+    contents: List[FolderItem]

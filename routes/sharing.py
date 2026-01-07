@@ -1,9 +1,15 @@
-from fastapi import APIRouter, HTTPException, Depends, Request, Query
+from fastapi import APIRouter, HTTPException, Header, Request, Query, Depends
 import db_connector
 from database import sharing as sharing_db
 from database import documents as documents_db
 from database import folders as folders_db
-from schemas.sharing import ShareLinkCreateRequest, ShareAccessRequest, ShareVerifyRequest, SharedFolderContentsRequest
+from schemas.sharing import (
+    ShareLinkCreateRequest,
+    ShareAccessRequest,
+    ShareVerifyRequest,
+    SharedFolderContentsRequest,
+    SharedDocumentDownloadRequest
+)
 import logging
 import os
 import random
@@ -143,18 +149,21 @@ async def get_share_info(token: str):
     """
     Returns basic share link info (without requiring authentication).
     Used by frontend to determine if email is pre-set and share type.
+    For restricted shares, returns full target_email to enable auto-OTP.
     """
     try:
         share_info = await sharing_db.get_share_details(token)
         if not share_info:
             raise HTTPException(status_code=404, detail="Link is invalid or expired")
 
-        # Return limited info - don't expose full target_email, just whether it's restricted
         target_email = share_info.get('target_email')
         share_type = share_info.get('share_type', 'file')
 
+        # For restricted shares, return full email to enable auto-OTP
+        # This is safe because the link is only sent to that specific email
         return {
             "is_restricted": target_email is not None,
+            "target_email": target_email,  # Full email for auto-OTP
             "target_email_hint": target_email[:3] + "***" + target_email[
                 target_email.index('@'):] if target_email else None,
             "expiry_date": share_info.get('expiry_date'),
@@ -266,14 +275,17 @@ async def verify_access_otp(token: str, req: ShareVerifyRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.get('/api/share/folder-contents/{token}')
-async def get_shared_folder_contents(token: str, params: SharedFolderContentsRequest = Depends()):
+async def get_shared_folder_contents(
+        token: str,
+        req: SharedFolderContentsRequest = Depends()
+):
     """
     Returns the contents of a shared folder.
     Supports navigation within subfolders.
     """
     try:
-        # Pydantic validator handles strip() and lower()
-        viewer_email = params.viewer_email
+        viewer_email = req.viewer_email
+        parent_id = req.parent_id
 
         # 1. Validate email access
         is_allowed, error_message = await sharing_db.validate_target_email_access(token, viewer_email)
@@ -294,16 +306,16 @@ async def get_shared_folder_contents(token: str, params: SharedFolderContentsReq
         if not has_access:
             raise HTTPException(status_code=403, detail="Access not verified. Please complete OTP verification first.")
 
-        # 5. Get the root shared folder ID
-        root_folder_id = share_info['folder_id']
+        # 5. Get the root shared folder ID (convert to string for consistent comparisons)
+        root_folder_id = str(share_info['folder_id'])
 
         # 6. Determine which folder to list
         # If parent_id is provided, verify it's within the shared folder hierarchy
-        current_folder_id = params.parent_id if params.parent_id else root_folder_id
+        current_folder_id = str(parent_id) if parent_id else root_folder_id
 
         # Security check: Ensure the requested folder is within the shared folder hierarchy
-        if params.parent_id and params.parent_id != root_folder_id:
-            is_subfolder = await folders_db.verify_folder_in_hierarchy(root_folder_id, params.parent_id)
+        if parent_id and str(parent_id) != root_folder_id:
+            is_subfolder = await folders_db.verify_folder_in_hierarchy(root_folder_id, str(parent_id))
             if not is_subfolder:
                 raise HTTPException(status_code=403, detail="Access denied. Folder is outside shared scope.")
 
@@ -318,7 +330,7 @@ async def get_shared_folder_contents(token: str, params: SharedFolderContentsReq
             "folder_id": current_folder_id,
             "folder_name": folder_info.get('name', 'Shared Folder') if folder_info else 'Shared Folder',
             "root_folder_id": root_folder_id,
-            "is_root": current_folder_id == root_folder_id,
+            "is_root": str(current_folder_id) == str(root_folder_id),
             "breadcrumbs": breadcrumbs,
             "contents": contents
         }
@@ -330,7 +342,10 @@ async def get_shared_folder_contents(token: str, params: SharedFolderContentsReq
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.get('/api/share/download/{token}')
-async def download_shared_document(token: str, viewer_email: str, doc_id: str = Query(default=None)):
+async def download_shared_document(
+        token: str,
+        req: SharedDocumentDownloadRequest = Depends()
+):
     """
     Downloads a shared document after OTP verification.
     Uses system DMS credentials to fetch the document.
@@ -339,7 +354,8 @@ async def download_shared_document(token: str, viewer_email: str, doc_id: str = 
     For folder shares, doc_id parameter specifies which file to download.
     """
     try:
-        viewer_email = viewer_email.strip().lower()
+        viewer_email = req.viewer_email
+        doc_id = req.doc_id
 
         # 1. Validate email access
         is_allowed, error_message = await sharing_db.validate_target_email_access(token, viewer_email)
@@ -365,8 +381,8 @@ async def download_shared_document(token: str, viewer_email: str, doc_id: str = 
                 raise HTTPException(status_code=400, detail="doc_id is required for folder share downloads")
 
             # Verify the document is within the shared folder hierarchy
-            root_folder_id = share_info['folder_id']
-            is_in_folder = await folders_db.verify_document_in_folder(root_folder_id, doc_id)
+            root_folder_id = str(share_info['folder_id'])
+            is_in_folder = await folders_db.verify_document_in_folder(root_folder_id, str(doc_id))
             if not is_in_folder:
                 raise HTTPException(status_code=403, detail="Document is outside shared folder scope")
 
