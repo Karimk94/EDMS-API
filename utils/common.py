@@ -82,14 +82,7 @@ def find_active_soap_client():
 def get_otp_email_template(otp: str, recipient_email: str, validity_minutes: int = 5) -> str:
     """
     Generates an HTML email template for OTP verification.
-
-    Args:
-        otp: The one-time password code
-        recipient_email: The email address of the recipient
-        validity_minutes: How long the OTP is valid for
-
-    Returns:
-        HTML string for the email body
+    Includes CSS improvements for easier text selection since JS copy buttons are blocked in emails.
     """
 
     # Get configurable values from environment or use defaults
@@ -217,9 +210,10 @@ def get_otp_email_template(otp: str, recipient_email: str, validity_minutes: int
                                 Please use the verification code below to complete your request.
                             </p>
 
-                            <!-- OTP Code Box: Fixed selection issues with inline-block and tight line-height -->
-                            <div style="background-color: #f8f9fa; border: 1px solid #dee2e6; border-radius: 6px; padding: 12px; text-align: center; margin: 0 0 15px 0;">
-                                <span style="display: inline-block; color: {primary_color}; font-size: 28px; font-weight: 700; letter-spacing: 4px; font-family: 'Courier New', monospace; line-height: 1; margin: 0;">{otp}</span>
+                            <!-- OTP Code Box (Updated for better visibility) -->
+                            <div style="background-color: #f8f9fa; border: 1px solid #dee2e6; border-radius: 6px; padding: 15px; text-align: center; margin: 0 0 15px 0;">
+                                <span style="display: block; font-size: 10px; color: #888; text-transform: uppercase; margin-bottom: 5px; letter-spacing: 1px;">Verification Code</span>
+                                <span style="display: inline-block; color: {primary_color}; font-size: 28px; font-weight: 700; letter-spacing: 4px; font-family: 'Courier New', monospace; line-height: 1; margin: 0; padding: 8px 15px; background-color: #ffffff; border: 1px dashed #ccc; border-radius: 4px; cursor: text; -webkit-user-select: all; user-select: all;">{otp}</span>
                             </div>
 
                             <!-- Expiry Warning -->
