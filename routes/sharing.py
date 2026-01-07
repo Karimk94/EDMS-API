@@ -1,8 +1,9 @@
-from fastapi import APIRouter, HTTPException, Header, Request
+from fastapi import APIRouter, HTTPException, Depends, Request, Query
 import db_connector
 from database import sharing as sharing_db
 from database import documents as documents_db
-from schemas.sharing import ShareLinkCreateRequest, ShareAccessRequest, ShareVerifyRequest
+from database import folders as folders_db
+from schemas.sharing import ShareLinkCreateRequest, ShareAccessRequest, ShareVerifyRequest, SharedFolderContentsRequest
 import logging
 import os
 import random
@@ -20,11 +21,15 @@ ALLOWED_DOMAIN = "@rta.ae"
 @router.post('/api/share/generate')
 async def generate_share_link(request: Request, req: ShareLinkCreateRequest):
     """
-    Generates a shareable link for a document.
+    Generates a shareable link for a document or folder.
 
     Supports two modes:
     1. Open mode (target_email=None): Any @rta.ae email can access
     2. Restricted mode (target_email set): Only the specified email can access
+
+    Supports two share types:
+    1. File share (share_type='file'): Shares a single document
+    2. Folder share (share_type='folder'): Shares a folder and its contents
     """
     try:
         try:
@@ -62,12 +67,31 @@ async def generate_share_link(request: Request, req: ShareLinkCreateRequest):
                     detail=f"Target email must be from {ALLOWED_DOMAIN} domain"
                 )
 
+        # Determine share type
+        share_type = getattr(req, 'share_type', 'file') or 'file'
+
+        # Validate based on share type
+        if share_type == 'folder':
+            if not req.folder_id:
+                raise HTTPException(status_code=400, detail="folder_id is required for folder shares")
+            document_id = None
+            folder_id = req.folder_id
+            item_name = req.item_name or 'Folder'
+        else:
+            if not req.document_id:
+                raise HTTPException(status_code=400, detail="document_id is required for file shares")
+            document_id = req.document_id
+            folder_id = None
+            item_name = None
+
         # Create Share Link with optional target_email
         token = await sharing_db.create_share_link(
-            req.document_id,
-            user_id,
-            req.expiry_date,
-            target_email
+            document_id=document_id,
+            folder_id=folder_id,
+            created_by=user_id,
+            expiry_date=req.expiry_date,
+            target_email=target_email,
+            share_type=share_type
         )
 
         base_url = os.getenv('FRONTEND_URL', 'http://localhost:3000')
@@ -76,9 +100,13 @@ async def generate_share_link(request: Request, req: ShareLinkCreateRequest):
         # Send email to target recipient for restricted shares
         if target_email:
             try:
-                # Get document name for the email
-                document = await documents_db.get_document_by_id(req.document_id)
-                document_name = document.get('docname', document.get('title', 'Document')) if document else 'Document'
+                # Get item name for the email
+                if share_type == 'folder':
+                    document_name = item_name or 'Shared Folder'
+                else:
+                    document = await documents_db.get_document_by_id(document_id)
+                    document_name = document.get('docname',
+                                                 document.get('title', 'Document')) if document else 'Document'
 
                 # Get sharer's name/email for the email
                 sharer_name = user_info.get('full_name') or user_info.get('email') or username
@@ -90,9 +118,7 @@ async def generate_share_link(request: Request, req: ShareLinkCreateRequest):
                     sharer_name=sharer_name,
                     expiry_date=req.expiry_date
                 )
-                # logging.info(f"Share link email sent to {target_email} for document {req.document_id}")
             except Exception as email_error:
-                # Log error but don't fail the share generation
                 logging.error(f"Failed to send share link email to {target_email}: {email_error}")
 
         return {
@@ -100,7 +126,8 @@ async def generate_share_link(request: Request, req: ShareLinkCreateRequest):
             "link": link,
             "expiry_date": req.expiry_date,
             "target_email": target_email,
-            "share_mode": "restricted" if target_email else "open"
+            "share_mode": "restricted" if target_email else "open",
+            "share_type": share_type
         }
 
     except HTTPException:
@@ -115,7 +142,7 @@ async def generate_share_link(request: Request, req: ShareLinkCreateRequest):
 async def get_share_info(token: str):
     """
     Returns basic share link info (without requiring authentication).
-    Used by frontend to determine if email is pre-set.
+    Used by frontend to determine if email is pre-set and share type.
     """
     try:
         share_info = await sharing_db.get_share_details(token)
@@ -124,12 +151,14 @@ async def get_share_info(token: str):
 
         # Return limited info - don't expose full target_email, just whether it's restricted
         target_email = share_info.get('target_email')
+        share_type = share_info.get('share_type', 'file')
 
         return {
             "is_restricted": target_email is not None,
             "target_email_hint": target_email[:3] + "***" + target_email[
                 target_email.index('@'):] if target_email else None,
-            "expiry_date": share_info.get('expiry_date')
+            "expiry_date": share_info.get('expiry_date'),
+            "share_type": share_type
         }
 
     except HTTPException:
@@ -182,6 +211,7 @@ async def request_access_otp(token: str, req: ShareAccessRequest):
 async def verify_access_otp(token: str, req: ShareVerifyRequest):
     """
     Step 2: Verifies OTP via Database.
+    Returns document info for file shares, or folder info for folder shares.
     """
     try:
         viewer_email = req.viewer_email.strip().lower()
@@ -204,17 +234,30 @@ async def verify_access_otp(token: str, req: ShareVerifyRequest):
 
         await sharing_db.log_share_access(share_info['share_id'], viewer_email)
 
-        document = await documents_db.get_document_by_id(share_info['document_id'])
-        if not document:
-            raise HTTPException(status_code=404, detail="Document not found")
+        share_type = share_info.get('share_type', 'file')
 
-        stats = await sharing_db.get_access_stats(token)
+        if share_type == 'folder':
+            # Return folder info
+            folder_id = share_info.get('folder_id')
+            return {
+                "share_type": "folder",
+                "folder_id": folder_id,
+                "shared_by": share_info['created_by']
+            }
+        else:
+            # Return document info (existing behavior)
+            document = await documents_db.get_document_by_id(share_info['document_id'])
+            if not document:
+                raise HTTPException(status_code=404, detail="Document not found")
 
-        return {
-            "document": document,
-            "shared_by": share_info['created_by'],
-            "access_stats": stats
-        }
+            stats = await sharing_db.get_access_stats(token)
+
+            return {
+                "share_type": "file",
+                "document": document,
+                "shared_by": share_info['created_by'],
+                "access_stats": stats
+            }
 
     except HTTPException:
         raise
@@ -222,12 +265,78 @@ async def verify_access_otp(token: str, req: ShareVerifyRequest):
         logging.error(f"OTP verification error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+@router.get('/api/share/folder-contents/{token}')
+async def get_shared_folder_contents(token: str, params: SharedFolderContentsRequest = Depends()):
+    """
+    Returns the contents of a shared folder.
+    Supports navigation within subfolders.
+    """
+    try:
+        # Pydantic validator handles strip() and lower()
+        viewer_email = params.viewer_email
+
+        # 1. Validate email access
+        is_allowed, error_message = await sharing_db.validate_target_email_access(token, viewer_email)
+        if not is_allowed:
+            raise HTTPException(status_code=403, detail=error_message)
+
+        # 2. Verify the share link is valid
+        share_info = await sharing_db.get_share_details(token)
+        if not share_info:
+            raise HTTPException(status_code=404, detail="Link is invalid or expired")
+
+        # 3. Verify this is a folder share
+        if share_info.get('share_type') != 'folder':
+            raise HTTPException(status_code=400, detail="This is not a folder share")
+
+        # 4. Verify the viewer has verified access via OTP
+        has_access = await sharing_db.check_viewer_access(token, viewer_email)
+        if not has_access:
+            raise HTTPException(status_code=403, detail="Access not verified. Please complete OTP verification first.")
+
+        # 5. Get the root shared folder ID
+        root_folder_id = share_info['folder_id']
+
+        # 6. Determine which folder to list
+        # If parent_id is provided, verify it's within the shared folder hierarchy
+        current_folder_id = params.parent_id if params.parent_id else root_folder_id
+
+        # Security check: Ensure the requested folder is within the shared folder hierarchy
+        if params.parent_id and params.parent_id != root_folder_id:
+            is_subfolder = await folders_db.verify_folder_in_hierarchy(root_folder_id, params.parent_id)
+            if not is_subfolder:
+                raise HTTPException(status_code=403, detail="Access denied. Folder is outside shared scope.")
+
+        # 7. Get folder info and contents
+        folder_info = await folders_db.get_folder_by_id(current_folder_id)
+        contents = await folders_db.get_folder_contents(current_folder_id)
+
+        # Build breadcrumb path
+        breadcrumbs = await folders_db.build_breadcrumb_path(root_folder_id, current_folder_id)
+
+        return {
+            "folder_id": current_folder_id,
+            "folder_name": folder_info.get('name', 'Shared Folder') if folder_info else 'Shared Folder',
+            "root_folder_id": root_folder_id,
+            "is_root": current_folder_id == root_folder_id,
+            "breadcrumbs": breadcrumbs,
+            "contents": contents
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logging.error(f"Folder contents error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 @router.get('/api/share/download/{token}')
-async def download_shared_document(token: str, viewer_email: str):
+async def download_shared_document(token: str, viewer_email: str, doc_id: str = Query(default=None)):
     """
     Downloads a shared document after OTP verification.
     Uses system DMS credentials to fetch the document.
     Applies watermark with viewer_email based on file type.
+
+    For folder shares, doc_id parameter specifies which file to download.
     """
     try:
         viewer_email = viewer_email.strip().lower()
@@ -247,8 +356,24 @@ async def download_shared_document(token: str, viewer_email: str):
         if not has_access:
             raise HTTPException(status_code=403, detail="Access not verified. Please complete OTP verification first.")
 
-        # 4. Get document ID from share info
-        doc_id = share_info['document_id']
+        # 4. Determine document ID based on share type
+        share_type = share_info.get('share_type', 'file')
+
+        if share_type == 'folder':
+            # For folder shares, doc_id must be provided
+            if not doc_id:
+                raise HTTPException(status_code=400, detail="doc_id is required for folder share downloads")
+
+            # Verify the document is within the shared folder hierarchy
+            root_folder_id = share_info['folder_id']
+            is_in_folder = await folders_db.verify_document_in_folder(root_folder_id, doc_id)
+            if not is_in_folder:
+                raise HTTPException(status_code=403, detail="Document is outside shared folder scope")
+
+            document_id = doc_id
+        else:
+            # For file shares, use the document_id from share_info
+            document_id = share_info['document_id']
 
         # 5. Login with system credentials
         dst = wsdl_client.dms_system_login()
@@ -256,7 +381,7 @@ async def download_shared_document(token: str, viewer_email: str):
             raise HTTPException(status_code=500, detail="Failed to authenticate with DMS")
 
         # 6. Get document info and content
-        filename, media_type, file_ext = await db_connector.get_media_info_from_dms(dst, doc_id)
+        filename, media_type, file_ext = await db_connector.get_media_info_from_dms(dst, document_id)
         if not filename:
             raise HTTPException(status_code=404, detail="Document not found")
 
@@ -264,12 +389,12 @@ async def download_shared_document(token: str, viewer_email: str):
         if file_ext and not filename.lower().endswith(file_ext.lower()):
             filename = f"{filename}{file_ext}"
 
-        file_bytes = db_connector.get_media_content_from_dms(dst, doc_id)
+        file_bytes = db_connector.get_media_content_from_dms(dst, document_id)
         if not file_bytes:
             raise HTTPException(status_code=500, detail="Failed to retrieve document content")
 
         # 7. Create watermark text using viewer_email
-        watermark_text = f"{viewer_email} | {doc_id} | {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+        watermark_text = f"{viewer_email} | {document_id} | {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
 
         # 8. Determine mime type and apply watermark based on media type
         mimetype = 'application/octet-stream'

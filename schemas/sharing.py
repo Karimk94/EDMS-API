@@ -1,5 +1,5 @@
-from pydantic import BaseModel, field_validator
-from typing import Optional
+from pydantic import BaseModel, field_validator, model_validator, Field
+from typing import Optional, Dict, Any
 from datetime import datetime
 
 ALLOWED_DOMAIN = "@rta.ae"
@@ -7,14 +7,13 @@ ALLOWED_DOMAIN = "@rta.ae"
 class ShareLinkCreateRequest(BaseModel):
     """
     Request model for creating a share link.
-
-    Supports two sharing modes:
-    1. Open mode (target_email=None): Any user with @rta.ae email can access
-    2. Restricted mode (target_email set): Only the specified email can access
     """
-    document_id: int
+    document_id: Optional[int] = None
+    folder_id: Optional[int] = None
+    share_type: Optional[str] = 'file'  # 'file' or 'folder'
+    item_name: Optional[str] = None
     expiry_date: Optional[datetime] = None
-    target_email: Optional[str] = None  # Must be @rta.ae domain if provided
+    target_email: Optional[str] = None
 
     @field_validator('target_email')
     @classmethod
@@ -23,9 +22,20 @@ class ShareLinkCreateRequest(BaseModel):
             v = v.strip().lower()
             if not v.endswith(ALLOWED_DOMAIN.lower()):
                 raise ValueError(f"Target email must be from {ALLOWED_DOMAIN} domain")
-            if '@' not in v or len(v) < 8:  # Minimum: a@rta.ae
+            if '@' not in v or len(v) < 8:
                 raise ValueError("Invalid email format")
         return v
+
+    @model_validator(mode='after')
+    def validate_ids_based_on_type(self):
+        share_type = self.share_type or 'file'
+        if share_type == 'folder':
+            if not self.folder_id:
+                raise ValueError("folder_id is required for folder shares")
+        else:
+            if not self.document_id:
+                raise ValueError("document_id is required for file shares")
+        return self
 
 class ShareLinkResponse(BaseModel):
     """Response model for a created share link."""
@@ -33,13 +43,15 @@ class ShareLinkResponse(BaseModel):
     link: str
     expiry_date: Optional[datetime]
     target_email: Optional[str] = None
-    share_mode: str = "open"  # "open" or "restricted"
+    share_mode: str = "open"
+    share_type: str = "file"
 
 class ShareInfoResponse(BaseModel):
     """Response model for share link info (public endpoint)."""
     is_restricted: bool
-    target_email_hint: Optional[str] = None  # Masked email like "abc***@rta.ae"
+    target_email_hint: Optional[str] = None
     expiry_date: Optional[datetime] = None
+    share_type: str = "file"
 
 class ShareAccessRequest(BaseModel):
     """Request model for requesting OTP access to a shared document."""
@@ -56,9 +68,12 @@ class ShareAccessRequest(BaseModel):
         return v
 
 class ShareAccessResponse(BaseModel):
-    """Response model for successful document access."""
-    document: dict
-    access_stats: dict
+    """Response model for successful document/folder access."""
+    share_type: str
+    shared_by: Optional[str] = None
+    document: Optional[Dict[str, Any]] = None
+    folder_id: Optional[int] = None
+    access_stats: Optional[Dict[str, Any]] = None
 
 class ShareVerifyRequest(BaseModel):
     """Request model for verifying OTP access."""
@@ -79,4 +94,17 @@ class ShareVerifyRequest(BaseModel):
         v = v.strip()
         if not v.isdigit() or len(v) != 6:
             raise ValueError("OTP must be a 6-digit number")
+        return v
+
+class SharedFolderContentsRequest(BaseModel):
+    """Request model for getting shared folder contents (Query parameters)."""
+    viewer_email: str
+    parent_id: Optional[str] = Field(default=None, description="Parent folder ID for navigation")
+
+    @field_validator('viewer_email')
+    @classmethod
+    def validate_viewer_email(cls, v):
+        v = v.strip().lower()
+        if not v.endswith(ALLOWED_DOMAIN.lower()):
+            raise ValueError(f"Email must be from {ALLOWED_DOMAIN} domain")
         return v
