@@ -5,18 +5,479 @@ from zeep.exceptions import Fault
 from .base import get_soap_client, find_client_with_operation
 from .utils import parse_user_result_buffer
 
+def is_valid_group_id(gid):
+    """
+    Validates that a group ID is a legitimate identifier.
+    Filters out control characters, binary garbage, and other invalid entries.
+    """
+    if not gid:
+        return False
+
+    # Must be a string
+    if not isinstance(gid, str):
+        gid = str(gid)
+
+    # Must have reasonable length (at least 2 chars, not too long)
+    if len(gid) < 2 or len(gid) > 100:
+        return False
+
+    # Check for control characters (ASCII 0-31 and 127)
+    for char in gid:
+        code = ord(char)
+        if code < 32 or code == 127:
+            return False
+        # Also filter out unusual Unicode ranges that are likely garbage
+        # Allow basic Latin, Latin Extended, and common symbols
+        if code > 0x024F and code < 0x0370:  # Skip some unusual ranges
+            pass  # Allow Greek, Cyrillic, etc.
+        if code > 0x07FF:  # Skip very high Unicode (likely binary garbage)
+            return False
+
+    # Must contain at least one alphanumeric character
+    has_alnum = any(c.isalnum() for c in gid)
+    if not has_alnum:
+        return False
+
+    # Whitespace-only is invalid
+    if gid.strip() == '':
+        return False
+
+    return True
+
+def get_all_groups(dst, library='RTA_MAIN'):
+    """
+    Fetches all available groups using multiple strategies.
+
+    Based on Fiddler trace analysis:
+    - v_peoplegroups is successfully queried with GROUP_ID + LAST_UPDATE criteria
+    - Groups like RTA_ADS_CORRESP exist but may not show in simple queries
+
+    Strategy: Query v_peoplegroups with wide date range and extract distinct GROUP_IDs
+
+    Note: The DMS server filters results based on the authenticated user's session (DST).
+    Users with admin/supervisor access will see all groups, while regular users may only
+    see groups they have permission to view.
+    """
+    groups = []
+    seen_ids = set()
+
+    def add_group(gid, gname=None, gdesc=""):
+        # Clean the group ID
+        if gid:
+            gid = str(gid).strip()
+
+        # Validate the group ID
+        if not is_valid_group_id(gid):
+            return
+
+        if gid not in seen_ids:
+            seen_ids.add(gid)
+            # Also validate/clean the group name
+            if gname:
+                gname = str(gname).strip()
+                if not is_valid_group_id(gname):
+                    gname = gid  # Fall back to group_id if name is invalid
+            else:
+                gname = gid
+
+            groups.append({
+                'group_id': gid,
+                'group_name': gname,
+                'description': gdesc if gdesc else ''
+            })
+
+    svc_client = get_soap_client('BasicHttpBinding_IDMSvc')
+    data_client = find_client_with_operation('GetDataW') or svc_client
+    method_name = 'GetDataW' if hasattr(data_client.service, 'GetDataW') else 'GetData'
+
+    def fetch_and_release(result_set_id, extract_func):
+        """Helper to fetch results and release resources"""
+        results = []
+        try:
+            d_resp = getattr(data_client.service, method_name)(
+                call={'resultSetID': result_set_id, 'requestedRows': 2000, 'startingRow': 0})
+
+            # Try binary buffer first
+            if hasattr(d_resp, 'resultSetData') and d_resp.resultSetData:
+                container = d_resp.resultSetData
+                if hasattr(container, 'resultBuffer') and container.resultBuffer:
+                    parsed = parse_user_result_buffer(container.resultBuffer)
+                    if parsed:
+                        results.extend(extract_func(parsed, 'buffer'))
+
+            # Try row nodes
+            row_nodes = getattr(d_resp, 'rowNode', None) or getattr(d_resp, 'RowNode', None)
+            if row_nodes:
+                results.extend(extract_func(row_nodes, 'rows'))
+
+        except Exception as e:
+            logging.debug(f"Error fetching results: {e}")
+        finally:
+            try:
+                svc_client.service.ReleaseData(call={'resultSetID': result_set_id})
+            except:
+                pass
+            try:
+                svc_client.service.ReleaseObject(call={'objectID': result_set_id})
+            except:
+                pass
+        return results
+
+    # ==========================================================================
+    # STRATEGY 1: Query v_peoplegroups with wide date range (PROVEN WORKING)
+    # Extract distinct GROUP_ID values - this matches the Fiddler trace pattern
+    # ==========================================================================
+    try:
+        # logging.info("Strategy 1: Extracting distinct groups from v_peoplegroups...")
+
+        # Use very wide date range to get ALL records
+        search_call = {
+            'call': {
+                'dstIn': dst,
+                'objectType': 'v_peoplegroups',
+                'signature': {
+                    'libraries': {'string': [library]},
+                    'criteria': {
+                        'criteriaCount': 1,
+                        'criteriaNames': {'string': ['LAST_UPDATE']},
+                        'criteriaValues': {'string': ['1900-01-01 00:00:00 TO 3000-01-01 00:00:00']}
+                    },
+                    'retProperties': {'string': ['GROUP_ID']},
+                    'sortProps': {
+                        'propertyCount': 1,
+                        'propertyNames': {'string': ['GROUP_ID']},
+                        'propertyFlags': {'int': [1]}
+                    },
+                    'maxRows': 0  # No limit
+                }
+            }
+        }
+
+        resp = svc_client.service.Search(**search_call)
+        if resp and resp.resultCode == 0 and resp.resultSetID:
+            def extract_group_ids(data, data_type):
+                extracted = []
+                if data_type == 'buffer':
+                    for p in data:
+                        gid = p.get('user_id') or p.get('full_name')  # GROUP_ID might be in first field
+                        if gid:
+                            extracted.append({'group_id': gid})
+                else:
+                    for row in data:
+                        vals = row.propValues.anyType if hasattr(row, 'propValues') else []
+                        if vals and vals[0]:
+                            extracted.append({'group_id': str(vals[0]).strip()})
+                return extracted
+
+            results = fetch_and_release(resp.resultSetID, extract_group_ids)
+            for r in results:
+                add_group(r['group_id'], r['group_id'])
+
+            # logging.info(f"Strategy 1 (v_peoplegroups) found {len(results)} records, {len(seen_ids)} distinct groups")
+    except Exception as e:
+        logging.debug(f"Strategy 1 failed: {e}")
+
+    # ==========================================================================
+    # STRATEGY 2: Try v_groups with LAST_UPDATE range
+    # ==========================================================================
+    try:
+        # logging.info("Strategy 2: Querying v_groups...")
+        search_call = {
+            'call': {
+                'dstIn': dst,
+                'objectType': 'v_groups',
+                'signature': {
+                    'libraries': {'string': [library]},
+                    'criteria': {
+                        'criteriaCount': 1,
+                        'criteriaNames': {'string': ['LAST_UPDATE']},
+                        'criteriaValues': {'string': ['1900-01-01 00:00:00 TO 3000-01-01 00:00:00']}
+                    },
+                    'retProperties': {'string': ['GROUP_ID', 'FULL_NAME', 'DESCRIPTION']},
+                    'sortProps': {
+                        'propertyCount': 1,
+                        'propertyNames': {'string': ['GROUP_ID']},
+                        'propertyFlags': {'int': [1]}
+                    },
+                    'maxRows': 0
+                }
+            }
+        }
+
+        resp = svc_client.service.Search(**search_call)
+        if resp and resp.resultCode == 0 and resp.resultSetID:
+            def extract_groups(data, data_type):
+                extracted = []
+                if data_type == 'rows':
+                    for row in data:
+                        vals = row.propValues.anyType if hasattr(row, 'propValues') else []
+                        if vals:
+                            extracted.append({
+                                'group_id': str(vals[0]).strip() if vals[0] else None,
+                                'group_name': str(vals[1]).strip() if len(vals) > 1 and vals[1] else None,
+                                'description': str(vals[2]).strip() if len(vals) > 2 and vals[2] else ''
+                            })
+                return extracted
+
+            results = fetch_and_release(resp.resultSetID, extract_groups)
+            for r in results:
+                if r['group_id']:
+                    add_group(r['group_id'], r.get('group_name'), r.get('description', ''))
+
+            # logging.info(f"Strategy 2 (v_groups) found {len(results)} groups")
+    except Exception as e:
+        logging.debug(f"Strategy 2 failed: {e}")
+
+    # ==========================================================================
+    # STRATEGY 3: Try v_usergroups
+    # ==========================================================================
+    try:
+        # logging.info("Strategy 3: Querying v_usergroups...")
+        search_call = {
+            'call': {
+                'dstIn': dst,
+                'objectType': 'v_usergroups',
+                'signature': {
+                    'libraries': {'string': [library]},
+                    'criteria': {
+                        'criteriaCount': 1,
+                        'criteriaNames': {'string': ['LAST_UPDATE']},
+                        'criteriaValues': {'string': ['1900-01-01 00:00:00 TO 3000-01-01 00:00:00']}
+                    },
+                    'retProperties': {'string': ['GROUP_ID', 'FULL_NAME', 'DESCRIPTION']},
+                    'sortProps': {
+                        'propertyCount': 1,
+                        'propertyNames': {'string': ['GROUP_ID']},
+                        'propertyFlags': {'int': [1]}
+                    },
+                    'maxRows': 0
+                }
+            }
+        }
+
+        resp = svc_client.service.Search(**search_call)
+        if resp and resp.resultCode == 0 and resp.resultSetID:
+            def extract_groups(data, data_type):
+                extracted = []
+                if data_type == 'rows':
+                    for row in data:
+                        vals = row.propValues.anyType if hasattr(row, 'propValues') else []
+                        if vals:
+                            extracted.append({
+                                'group_id': str(vals[0]).strip() if vals[0] else None,
+                                'group_name': str(vals[1]).strip() if len(vals) > 1 and vals[1] else None,
+                                'description': str(vals[2]).strip() if len(vals) > 2 and vals[2] else ''
+                            })
+                return extracted
+
+            results = fetch_and_release(resp.resultSetID, extract_groups)
+            for r in results:
+                if r['group_id']:
+                    add_group(r['group_id'], r.get('group_name'), r.get('description', ''))
+
+            # logging.info(f"Strategy 3 (v_usergroups) found {len(results)} groups")
+    except Exception as e:
+        logging.debug(f"Strategy 3 failed: {e}")
+
+    # ==========================================================================
+    # STRATEGY 4: Try v_nativegroups
+    # ==========================================================================
+    try:
+        # logging.info("Strategy 4: Querying v_nativegroups...")
+        search_call = {
+            'call': {
+                'dstIn': dst,
+                'objectType': 'v_nativegroups',
+                'signature': {
+                    'libraries': {'string': [library]},
+                    'criteria': {
+                        'criteriaCount': 1,
+                        'criteriaNames': {'string': ['LAST_UPDATE']},
+                        'criteriaValues': {'string': ['1900-01-01 00:00:00 TO 3000-01-01 00:00:00']}
+                    },
+                    'retProperties': {'string': ['GROUP_ID', 'FULL_NAME', 'DESCRIPTION']},
+                    'sortProps': {
+                        'propertyCount': 1,
+                        'propertyNames': {'string': ['GROUP_ID']},
+                        'propertyFlags': {'int': [1]}
+                    },
+                    'maxRows': 0
+                }
+            }
+        }
+
+        resp = svc_client.service.Search(**search_call)
+        if resp and resp.resultCode == 0 and resp.resultSetID:
+            def extract_groups(data, data_type):
+                extracted = []
+                if data_type == 'rows':
+                    for row in data:
+                        vals = row.propValues.anyType if hasattr(row, 'propValues') else []
+                        if vals:
+                            extracted.append({
+                                'group_id': str(vals[0]).strip() if vals[0] else None,
+                                'group_name': str(vals[1]).strip() if len(vals) > 1 and vals[1] else None,
+                                'description': str(vals[2]).strip() if len(vals) > 2 and vals[2] else ''
+                            })
+                return extracted
+
+            results = fetch_and_release(resp.resultSetID, extract_groups)
+            for r in results:
+                if r['group_id']:
+                    add_group(r['group_id'], r.get('group_name'), r.get('description', ''))
+
+            # logging.info(f"Strategy 4 (v_nativegroups) found {len(results)} groups")
+    except Exception as e:
+        logging.debug(f"Strategy 4 failed: {e}")
+
+    # ==========================================================================
+    # STRATEGY 5: Try wildcard search on v_groups with GROUP_ID
+    # ==========================================================================
+    try:
+        # logging.info("Strategy 5: Wildcard search on v_groups...")
+        for wildcard in ['*', '%', '?*']:
+            search_call = {
+                'call': {
+                    'dstIn': dst,
+                    'objectType': 'v_groups',
+                    'signature': {
+                        'libraries': {'string': [library]},
+                        'criteria': {
+                            'criteriaCount': 1,
+                            'criteriaNames': {'string': ['GROUP_ID']},
+                            'criteriaValues': {'string': [wildcard]}
+                        },
+                        'retProperties': {'string': ['GROUP_ID', 'FULL_NAME', 'DESCRIPTION']},
+                        'sortProps': {
+                            'propertyCount': 1,
+                            'propertyNames': {'string': ['GROUP_ID']},
+                            'propertyFlags': {'int': [1]}
+                        },
+                        'maxRows': 0
+                    }
+                }
+            }
+
+            resp = svc_client.service.Search(**search_call)
+            if resp and resp.resultCode == 0 and resp.resultSetID:
+                def extract_groups(data, data_type):
+                    extracted = []
+                    if data_type == 'rows':
+                        for row in data:
+                            vals = row.propValues.anyType if hasattr(row, 'propValues') else []
+                            if vals:
+                                extracted.append({
+                                    'group_id': str(vals[0]).strip() if vals[0] else None,
+                                    'group_name': str(vals[1]).strip() if len(vals) > 1 and vals[1] else None,
+                                    'description': str(vals[2]).strip() if len(vals) > 2 and vals[2] else ''
+                                })
+                    return extracted
+
+                results = fetch_and_release(resp.resultSetID, extract_groups)
+                new_found = 0
+                for r in results:
+                    if r['group_id'] and r['group_id'] not in seen_ids:
+                        add_group(r['group_id'], r.get('group_name'), r.get('description', ''))
+                        new_found += 1
+
+                # logging.info(f"Strategy 5 (wildcard '{wildcard}') found {new_found} new groups")
+                if new_found > 0:
+                    break
+    except Exception as e:
+        logging.debug(f"Strategy 5 failed: {e}")
+
+    # ==========================================================================
+    # STRATEGY 6: Search v_peoplegroups with wildcard on GROUP_ID (different approach)
+    # ==========================================================================
+    try:
+        # logging.info("Strategy 6: v_peoplegroups with GROUP_ID wildcard...")
+        search_call = {
+            'call': {
+                'dstIn': dst,
+                'objectType': 'v_peoplegroups',
+                'signature': {
+                    'libraries': {'string': [library]},
+                    'criteria': {
+                        'criteriaCount': 1,
+                        'criteriaNames': {'string': ['GROUP_ID']},
+                        'criteriaValues': {'string': ['*']}
+                    },
+                    'retProperties': {'string': ['GROUP_ID']},
+                    'sortProps': {
+                        'propertyCount': 1,
+                        'propertyNames': {'string': ['GROUP_ID']},
+                        'propertyFlags': {'int': [1]}
+                    },
+                    'maxRows': 0
+                }
+            }
+        }
+
+        resp = svc_client.service.Search(**search_call)
+        if resp and resp.resultCode == 0 and resp.resultSetID:
+            def extract_group_ids(data, data_type):
+                extracted = []
+                if data_type == 'buffer':
+                    for p in data:
+                        gid = p.get('user_id') or p.get('full_name')
+                        if gid:
+                            extracted.append({'group_id': gid})
+                else:
+                    for row in data:
+                        vals = row.propValues.anyType if hasattr(row, 'propValues') else []
+                        if vals and vals[0]:
+                            extracted.append({'group_id': str(vals[0]).strip()})
+                return extracted
+
+            results = fetch_and_release(resp.resultSetID, extract_group_ids)
+            new_found = 0
+            for r in results:
+                if r['group_id'] and r['group_id'] not in seen_ids:
+                    add_group(r['group_id'], r['group_id'])
+                    new_found += 1
+
+            # logging.info(f"Strategy 6 found {new_found} new groups")
+    except Exception as e:
+        logging.debug(f"Strategy 6 failed: {e}")
+
+    # logging.info(f"Total groups found across all strategies: {len(groups)}")
+
+    # Sort groups alphabetically
+    groups.sort(key=lambda x: x['group_id'].lower() if x['group_id'] else '')
+
+    return groups
+
+def search_groups(dst, name_pattern='', library='RTA_MAIN'):
+    """
+    Searches for groups matching a pattern.
+    If no pattern or wildcard, returns all groups.
+    """
+    if not name_pattern or name_pattern in ['*', '%', '']:
+        return get_all_groups(dst, library)
+
+    # Get all groups and filter
+    all_groups = get_all_groups(dst, library)
+
+    pattern_lower = name_pattern.lower()
+    filtered = [
+        g for g in all_groups
+        if pattern_lower in g['group_id'].lower() or
+           pattern_lower in (g.get('group_name') or '').lower()
+    ]
+
+    return filtered
+
 def resolve_trustee_system_id(dst, sys_id):
     """
     Resolves a numeric System ID to a textual User ID or Group ID.
     Returns: (text_id, flag) where flag is 2 for User, 1 for Group.
     """
-    logging.info(f"Resolving System ID: {sys_id}")
+    # logging.info(f"Resolving System ID: {sys_id}")
     try:
         svc_client = get_soap_client('BasicHttpBinding_IDMSvc')
         data_client = find_client_with_operation('GetDataW') or svc_client
         method_name = 'GetDataW' if hasattr(data_client.service, 'GetDataW') else 'GetData'
 
-        # Helper to perform a quick search and fetch one value
         def quick_lookup(obj_type, criteria_field, return_field):
             logging.debug(f"Lookup: {obj_type} where {criteria_field} = {sys_id}")
             try:
@@ -50,7 +511,7 @@ def resolve_trustee_system_id(dst, sys_id):
                     if row_nodes and row_nodes[0].propValues.anyType:
                         val = row_nodes[0].propValues.anyType[0]
                         if val:
-                            logging.info(f"Found match in {obj_type}: {val}")
+                            # logging.info(f"Found match in {obj_type}: {val}")
                             return str(val)
             except Exception as e:
                 logging.debug(f"Lookup failed for {obj_type}: {e}")
@@ -58,64 +519,31 @@ def resolve_trustee_system_id(dst, sys_id):
 
         # 1. Search Groups (v_groups)
         group_id = quick_lookup('v_groups', 'SYSTEM_ID', 'GROUP_ID')
-        if group_id: return group_id, 1
+        if group_id:
+            return group_id, 1
 
         # 2. Search Users (v_peoples)
         user_id = quick_lookup('v_peoples', 'SYSTEM_ID', 'USER_ID')
-        if user_id: return user_id, 2
+        if user_id:
+            return user_id, 2
 
         user_id_pid = quick_lookup('v_peoples', 'PEOPLE_ID', 'USER_ID')
-        if user_id_pid: return user_id_pid, 2
+        if user_id_pid:
+            return user_id_pid, 2
 
         # 3. Search Specialized Groups
         ug_id = quick_lookup('v_usergroups', 'SYSTEM_ID', 'GROUP_ID')
-        if ug_id: return ug_id, 1
+        if ug_id:
+            return ug_id, 1
 
         ng_id = quick_lookup('v_nativegroups', 'SYSTEM_ID', 'GROUP_ID')
-        if ng_id: return ng_id, 1
+        if ng_id:
+            return ng_id, 1
 
         # 4. Search Users (Legacy)
         user_id_psid = quick_lookup('v_peoples', 'PEOPLE_SYSTEM_ID', 'USER_ID')
-        if user_id_psid: return user_id_psid, 2
-
-        # 5. Search DEF_PROF (Profile lookup) - Check both %OBJECT_IDENTIFIER and DOCNUMBER
-        # Users/Groups are documents. DOCNAME contains the UserID/GroupID.
-        for field in ['%OBJECT_IDENTIFIER', 'DOCNUMBER']:
-            logging.debug(f"Lookup: DEF_PROF where {field} = {sys_id}")
-            try:
-                search_call = {
-                    'call': {
-                        'dstIn': dst,
-                        'objectType': 'DEF_PROF',
-                        'signature': {
-                            'libraries': {'string': ['RTA_MAIN']},
-                            'criteria': {
-                                'criteriaCount': 1,
-                                'criteriaNames': {'string': [field]},
-                                'criteriaValues': {'string': [str(sys_id)]}
-                            },
-                            'retProperties': {'string': ['DOCNAME', 'TYPE_ID']},
-                            'maxRows': 1
-                        }
-                    }
-                }
-                resp = svc_client.service.Search(**search_call)
-                if resp and resp.resultCode == 0 and resp.resultSetID:
-                    d_resp = getattr(data_client.service, method_name)(
-                        call={'resultSetID': resp.resultSetID, 'requestedRows': 1, 'startingRow': 0})
-                    svc_client.service.ReleaseObject(call={'objectID': resp.resultSetID})
-
-                    row_nodes = getattr(d_resp, 'rowNode', None) or getattr(d_resp, 'RowNode', None)
-                    if row_nodes and row_nodes[0].propValues.anyType:
-                        docname = row_nodes[0].propValues.anyType[0]
-                        type_id = str(row_nodes[0].propValues.anyType[1] or "").upper()
-
-                        if docname:
-                            flag = 1 if ('GROUP' in type_id) else 2
-                            logging.info(f"Found profile match: {docname} (Type: {type_id}, Flag: {flag})")
-                            return str(docname), flag
-            except Exception as e:
-                logging.debug(f"Lookup failed for DEF_PROF ({field}): {e}")
+        if user_id_psid:
+            return user_id_psid, 2
 
     except Exception as e:
         logging.error(f"Error resolving system ID {sys_id}: {e}")
@@ -124,7 +552,7 @@ def resolve_trustee_system_id(dst, sys_id):
 
 def set_trustees(dst, doc_id, library, trustees, security_enabled="1"):
     try:
-        logging.info(f"Setting trustees for doc_id: {doc_id} in library: {library}. Raw count: {len(trustees)}")
+        # logging.info(f"Setting trustees for doc_id: {doc_id} in library: {library}. Raw count: {len(trustees)}")
         svc_client = get_soap_client('BasicHttpBinding_IDMSvc')
 
         # Define types
@@ -199,8 +627,7 @@ def set_trustees(dst, doc_id, library, trustees, security_enabled="1"):
             current_flags = [x['flag'] for x in candidate_list]
             current_rights = [x['rights'] for x in candidate_list]
 
-            logging.info(
-                f"Trustee Payload (Attempt {attempts}) -> Names: {current_names} | Flags: {current_flags} | Rights: {current_rights}")
+            # logging.info(f"Trustee Payload (Attempt {attempts}) -> Names: {current_names} | Flags: {current_flags} | Rights: {current_rights}")
 
             call_data = {
                 'dstIn': dst,
@@ -242,11 +669,10 @@ def set_trustees(dst, doc_id, library, trustees, security_enabled="1"):
                     # 1. Try to resolve numeric IDs
                     for item in candidate_list:
                         if item['name'].isdigit():
-                            logging.info(f"Resolving ID {item['name']}...")
+                            # logging.info(f"Resolving ID {item['name']}...")
                             resolved_name, resolved_flag = resolve_trustee_system_id(dst, item['name'])
                             if resolved_name:
-                                logging.info(
-                                    f"Resolved {item['name']} -> {resolved_name} (Type: {'User' if resolved_flag == 2 else 'Group'})")
+                                # logging.info(f"Resolved {item['name']} -> {resolved_name} (Type: {'User' if resolved_flag == 2 else 'Group'})")
                                 item['name'] = resolved_name
                                 item['flag'] = resolved_flag
                                 changed_any = True
@@ -255,7 +681,6 @@ def set_trustees(dst, doc_id, library, trustees, security_enabled="1"):
 
                     # 2. If no resolution, fallback to swapping inferred flags
                     if not changed_any:
-                        # a) Forced Numeric Swap (User -> Group)
                         for item in candidate_list:
                             if item['name'].isdigit() and item['flag'] == 2:
                                 item['flag'] = 1
@@ -264,7 +689,6 @@ def set_trustees(dst, doc_id, library, trustees, security_enabled="1"):
                         if changed_any:
                             logging.info("Forced swap of numeric trustee from User to Group.")
                         else:
-                            # b) Generic Inferred Swap
                             for item in candidate_list:
                                 if item['inferred'] and item['flag'] == 2:
                                     item['flag'] = 1
@@ -316,7 +740,6 @@ def get_object_trustees(dst, doc_id, library='RTA_MAIN'):
 
             if response.resultCode == 0 and response.trustees:
                 trustees = []
-                # Safely access properties with defaults
                 t_names = response.trustees.trusteeNames.string if (
                         response.trustees.trusteeNames and hasattr(response.trustees.trusteeNames,
                                                                    'string')) else []
@@ -325,10 +748,7 @@ def get_object_trustees(dst, doc_id, library='RTA_MAIN'):
                 t_rights = response.trustees.trusteeRights.int if (
                         response.trustees.trusteeRights and hasattr(response.trustees.trusteeRights, 'int')) else []
 
-                # Ensure count is an int
                 count = response.trustees.trusteeCount if response.trustees.trusteeCount is not None else 0
-
-                # Ensure we don't go out of bounds if arrays are shorter than count for some reason
                 limit = min(count, len(t_names), len(t_flags), len(t_rights))
 
                 for i in range(limit):
@@ -346,17 +766,15 @@ def get_object_trustees(dst, doc_id, library='RTA_MAIN'):
 def get_group_members(dst, group_id, library='RTA_MAIN'):
     """
     Retrieves the members of a group by searching v_peoplegroups.
-    Replicates Fiddler Trace 43.
+    Uses the pattern from Fiddler trace: GROUP_ID + LAST_UPDATE with date range.
     """
     try:
         svc_client = get_soap_client('BasicHttpBinding_IDMSvc')
 
-        # Trace 43 uses v_peoplegroups with GROUP_ID and LAST_UPDATE
+        # Pattern from Fiddler: Use GROUP_ID and LAST_UPDATE with wide date range
         criteria_names = ['GROUP_ID', 'LAST_UPDATE']
-        # Using a wide date range to ensure full retrieval (Trace uses a specific delta)
         criteria_values = [str(group_id), '1900-01-01 00:00:00 TO 3000-01-01 00:00:00']
 
-        # Trace 43 Return Properties
         ret_props = ['USER_ID', 'FULL_NAME', 'PEOPLE_SYSTEM_ID', 'Disabled', 'ALLOW_LOGIN']
 
         search_call = {
@@ -403,7 +821,7 @@ def get_group_members(dst, group_id, library='RTA_MAIN'):
 
         members = []
 
-        # Use utility parser for binary result buffer (common in v_peoplegroups)
+        # Use utility parser for binary result buffer
         if hasattr(data_reply, 'resultSetData') and data_reply.resultSetData:
             container = data_reply.resultSetData
             if hasattr(container, 'resultBuffer') and container.resultBuffer:
@@ -437,274 +855,18 @@ def get_group_members(dst, group_id, library='RTA_MAIN'):
         logging.error(f"Error getting group members: {e}")
         return []
 
-def get_group_trustees(dst, object_identifier, library='RTA_MAIN'):
-    """
-    Retrieves trustees using GetTrustees on v_defprof.
-    Replicates Fiddler Trace 5 & 25 (GetTrustees).
-
-    :param object_identifier: The %OBJECT_IDENTIFIER (Numeric System ID) of the group.
-                              Example: '19685986' from Trace 1.
-    """
-    try:
-        svc_client = get_soap_client('BasicHttpBinding_IDMSvc')
-        string_type = svc_client.get_type('{http://www.w3.org/2001/XMLSchema}string')
-        string_array_type = svc_client.get_type(
-            '{http://schemas.microsoft.com/2003/10/Serialization/Arrays}ArrayOfstring')
-
-        prop_names = string_array_type(['%TARGET_LIBRARY', '%OBJECT_IDENTIFIER'])
-        prop_values = {'anyType': [
-            xsd.AnyObject(string_type, library),
-            xsd.AnyObject(string_type, str(object_identifier))
-        ]}
-
-        call_data = {
-            'dstIn': dst,
-            'objectType': 'v_defprof',  # Trace 5 explicitly uses v_defprof
-            'properties': {
-                'propertyCount': 2,
-                'propertyNames': prop_names,
-                'propertyValues': prop_values
-            }
-        }
-
-        response = svc_client.service.GetTrustees(call=call_data)
-
-        if response.resultCode == 0 and response.trustees:
-            trustees = []
-            # Zeep helper: safely extract list or empty
-            t_names = response.trustees.trusteeNames.string if (
-                    response.trustees.trusteeNames and hasattr(response.trustees.trusteeNames, 'string')) else []
-            t_flags = response.trustees.trusteeFlags.int if (
-                    response.trustees.trusteeFlags and hasattr(response.trustees.trusteeFlags, 'int')) else []
-            t_rights = response.trustees.trusteeRights.int if (
-                    response.trustees.trusteeRights and hasattr(response.trustees.trusteeRights, 'int')) else []
-
-            count = response.trustees.trusteeCount if response.trustees.trusteeCount is not None else 0
-            limit = min(count, len(t_names), len(t_flags), len(t_rights))
-
-            for i in range(limit):
-                trustees.append({
-                    'username': t_names[i],
-                    'flag': t_flags[i],
-                    'rights': t_rights[i]
-                })
-            return trustees
-
-        return []
-    except Exception as e:
-        logging.error(f"Error getting group trustees: {e}")
-        return []
-
-def search_groups(dst, name_pattern, library='RTA_MAIN'):
-    """
-    Searches for groups.
-    Combines strategies to ensure all types of groups (System, Native, Profiled) are found.
-    Replicates search logic implied by "more groups in file explorer".
-    """
-    groups = []
-    seen_ids = set()
-
-    svc_client = get_soap_client('BasicHttpBinding_IDMSvc')
-
-    if not name_pattern:
-        name_pattern = "*"
-        search_val = "*"
-    elif '*' not in name_pattern and '%' not in name_pattern:
-        search_val = f"*{name_pattern}*"
-    else:
-        search_val = name_pattern
-
-    def add_group(gid, gname, gdesc=""):
-        if gid and gid not in seen_ids:
-            seen_ids.add(gid)
-            groups.append({
-                'group_id': gid,
-                'group_name': gname if gname else gid,
-                'description': gdesc
-            })
-
-    # Strategy 1: v_groups (Standard System Groups)
-    try:
-        # Use empty criteria if search is generic wildcard to "List All"
-        if search_val in ['*', '%']:
-            criteria = {
-                'criteriaCount': 0,
-                'criteriaNames': {'string': []},
-                'criteriaValues': {'string': []}
-            }
-        else:
-            criteria = {
-                'criteriaCount': 1,
-                'criteriaNames': {'string': ['GROUP_ID']},
-                'criteriaValues': {'string': [search_val]}
-            }
-
-        search_call = {
-            'call': {
-                'dstIn': dst,
-                'objectType': 'v_groups',
-                'signature': {
-                    'libraries': {'string': [library]},
-                    'criteria': criteria,
-                    'retProperties': {'string': ['GROUP_ID', 'FULL_NAME', 'DESCRIPTION']},
-                    'maxRows': 0
-                }
-            }
-        }
-
-        # Execute generic search helper (assumed internal pattern)
-        resp = svc_client.service.Search(**search_call)
-
-        # If wildcard failed with empty criteria (sometimes happens), try fallback to %
-        if (not resp or resp.resultCode != 0) and search_val == '*':
-            search_call['call']['signature']['criteria'] = {
-                'criteriaCount': 1,
-                'criteriaNames': {'string': ['GROUP_ID']},
-                'criteriaValues': {'string': ['%']}
-            }
-            resp = svc_client.service.Search(**search_call)
-
-        if resp and resp.resultCode == 0 and resp.resultSetID:
-            # fetch data...
-            data_client = find_client_with_operation('GetDataW') or svc_client
-            method_name = 'GetDataW' if hasattr(data_client.service, 'GetDataW') else 'GetData'
-            d_resp = getattr(data_client.service, method_name)(
-                call={'resultSetID': resp.resultSetID, 'requestedRows': 500, 'startingRow': 0})
-
-            # Binary parse or RowNodes
-            row_nodes = getattr(d_resp, 'rowNode', None) or getattr(d_resp, 'RowNode', None)
-            if row_nodes:
-                for row in row_nodes:
-                    vals = row.propValues.anyType
-                    if vals: add_group(vals[0], vals[1] if len(vals) > 1 else None, vals[2] if len(vals) > 2 else None)
-
-            try:
-                svc_client.service.ReleaseObject(call={'objectID': resp.resultSetID})
-            except:
-                pass
-    except Exception as e:
-        logging.debug(f"v_groups search error: {e}")
-
-    # Strategy 2: v_usergroups (Custom User Groups)
-    try:
-        search_call['call']['objectType'] = 'v_usergroups'
-        # Reset criteria for v_usergroups (usually requires wildcards even for list all)
-        search_call['call']['signature']['criteria'] = {
-            'criteriaCount': 1,
-            'criteriaNames': {'string': ['GROUP_ID']},
-            'criteriaValues': {'string': [search_val]}
-        }
-
-        resp = svc_client.service.Search(**search_call)
-        if resp and resp.resultCode == 0 and resp.resultSetID:
-            data_client = find_client_with_operation('GetDataW') or svc_client
-            method_name = 'GetDataW' if hasattr(data_client.service, 'GetDataW') else 'GetData'
-            d_resp = getattr(data_client.service, method_name)(
-                call={'resultSetID': resp.resultSetID, 'requestedRows': 500, 'startingRow': 0})
-
-            row_nodes = getattr(d_resp, 'rowNode', None) or getattr(d_resp, 'RowNode', None)
-            if row_nodes:
-                for row in row_nodes:
-                    vals = row.propValues.anyType
-                    if vals: add_group(vals[0], vals[1] if len(vals) > 1 else None)
-            try:
-                svc_client.service.ReleaseObject(call={'objectID': resp.resultSetID})
-            except:
-                pass
-    except Exception as e:
-        logging.debug(f"v_usergroups search error: {e}")
-
-    # Strategy 3: v_peoplegroups (Distinct groups with members)
-    # This acts as a fallback for groups that exist but aren't in the definitions views
-    try:
-        search_call['call']['objectType'] = 'v_peoplegroups'
-        # We only want distinct GROUP_IDs
-        search_call['call']['signature']['retProperties']['string'] = ['GROUP_ID']
-        # Use basic search val
-        search_call['call']['signature']['criteria']['criteriaValues']['string'] = [search_val]
-
-        resp = svc_client.service.Search(**search_call)
-        if resp and resp.resultCode == 0 and resp.resultSetID:
-            data_client = find_client_with_operation('GetDataW') or svc_client
-            method_name = 'GetDataW' if hasattr(data_client.service, 'GetDataW') else 'GetData'
-            d_resp = getattr(data_client.service, method_name)(
-                call={'resultSetID': resp.resultSetID, 'requestedRows': 500, 'startingRow': 0})
-
-            row_nodes = getattr(d_resp, 'rowNode', None) or getattr(d_resp, 'RowNode', None)
-            if row_nodes:
-                for row in row_nodes:
-                    vals = row.propValues.anyType
-                    if vals and vals[0]: add_group(vals[0], vals[0])  # Name same as ID in this view
-            try:
-                svc_client.service.ReleaseObject(call={'objectID': resp.resultSetID})
-            except:
-                pass
-    except Exception as e:
-        logging.debug(f"v_peoplegroups search error: {e}")
-
-    # Strategy 4: Profiled Groups (DEF_PROF) - Matches Trace 1 pattern
-    # Only if pattern is numeric (searching by ID) OR as a general text search
-    if name_pattern.replace('*', '').replace('%', ''):  # Only if pattern has content
-        try:
-            # Trace 1: DOCNUM search
-            criteria_field = 'DOCNUM' if name_pattern.isdigit() else 'DOCNAME'
-
-            search_call = {
-                'call': {
-                    'dstIn': dst,
-                    'objectType': 'DEF_PROF',
-                    'signature': {
-                        'libraries': {'string': [library]},
-                        'criteria': {
-                            'criteriaCount': 1,
-                            'criteriaNames': {'string': [criteria_field]},
-                            'criteriaValues': {'string': [search_val if criteria_field == 'DOCNAME' else name_pattern]}
-                        },
-                        'retProperties': {'string': ['DOCNUM', 'DOCNAME', 'TYPE_ID']},
-                        'maxRows': 0
-                    }
-                }
-            }
-
-            resp = svc_client.service.Search(**search_call)
-            if resp and resp.resultCode == 0 and resp.resultSetID:
-                data_client = find_client_with_operation('GetDataW') or svc_client
-                method_name = 'GetDataW' if hasattr(data_client.service, 'GetDataW') else 'GetData'
-                d_resp = getattr(data_client.service, method_name)(
-                    call={'resultSetID': resp.resultSetID, 'requestedRows': 500, 'startingRow': 0})
-
-                row_nodes = getattr(d_resp, 'rowNode', None) or getattr(d_resp, 'RowNode', None)
-                if row_nodes:
-                    for row in row_nodes:
-                        vals = row.propValues.anyType
-                        # vals: [0]=DOCNUM, [1]=DOCNAME, [2]=TYPE_ID
-                        if vals:
-                            doc_num = vals[0]
-                            doc_name = vals[1]
-                            type_id = vals[2] if len(vals) > 2 else ""
-                            # Heuristic: If type contains group-ish text or if we are searching explicitly
-                            # For now, we add if unique. 'P' type is generic profile.
-                            add_group(doc_name, f"{doc_name} ({doc_num})", f"Type: {type_id}")
-
-                try:
-                    svc_client.service.ReleaseObject(call={'objectID': resp.resultSetID})
-                except:
-                    pass
-        except Exception as e:
-            logging.debug(f"DEF_PROF search error: {e}")
-
-    return groups
-
-def get_current_user_group_members(dst, username, library='RTA_MAIN'):
-    return search_users_in_group(dst, "EDMS_TEST_GRP_2", "")
-
 def search_users_in_group(dst, group_id, search_term, library='RTA_MAIN'):
+    """
+    Search for users within a specific group.
+    Matches the Fiddler trace pattern for v_peoplegroups queries.
+    """
     try:
         svc_client = get_soap_client('BasicHttpBinding_IDMSvc')
 
         if not group_id:
             return []
 
+        # Use wide date range like Fiddler trace
         search_call = {
             'call': {
                 'dstIn': dst,
@@ -713,11 +875,11 @@ def search_users_in_group(dst, group_id, search_term, library='RTA_MAIN'):
                     'libraries': {'string': [library]},
                     'criteria': {
                         'criteriaCount': 2,
-                        'criteriaNames': {'string': ['GROUP_ID', 'DISABLED']},
-                        'criteriaValues': {'string': [group_id, 'N']}
+                        'criteriaNames': {'string': ['GROUP_ID', 'LAST_UPDATE']},
+                        'criteriaValues': {'string': [group_id, '1900-01-01 00:00:00 TO 3000-01-01 00:00:00']}
                     },
                     'retProperties': {
-                        'string': ['USER_ID', 'FULL_NAME']
+                        'string': ['USER_ID', 'FULL_NAME', 'PEOPLE_SYSTEM_ID', 'Disabled', 'ALLOW_LOGIN']
                     },
                     'sortProps': {
                         'propertyCount': 1,
@@ -744,7 +906,6 @@ def search_users_in_group(dst, group_id, search_term, library='RTA_MAIN'):
         data_reply = getattr(data_client.service, method_name)(**get_data_call)
 
         members = []
-        all_raw_members = []
         seen_ids = set()
 
         def clean_text(text):
@@ -752,52 +913,17 @@ def search_users_in_group(dst, group_id, search_term, library='RTA_MAIN'):
                 return ""
             return re.sub(r'[\x00-\x1f\x7f]', '', str(text)).strip()
 
-        def is_system_id(val):
-            """Check if value is a numeric system ID (>5 digits)."""
-            return val and val.isdigit() and len(val) > 5
-
-        def is_valid_username(val):
-            """Check if value could be a valid username."""
-            if not val or len(val) <= 1:
-                return False
-            if is_system_id(val):
-                return False
-            # Single special chars are not usernames
-            if len(val) == 1 and not val.isalnum():
-                return False
-            return True
-
-        def extract_user_info(v0, v1):
-            """Extract user_id and full_name from two values."""
-            # Case 1: v0 is system_id, v1 is username
-            if is_system_id(v0) and is_valid_username(v1):
-                return v1, v1
-
-            # Case 2: v0 is empty, v1 has data
-            if not v0 and is_valid_username(v1):
-                return v1, v1
-
-            # Case 3: v0 has username, v1 has full_name (ideal case)
-            if is_valid_username(v0) and v1 and ' ' in v1:
-                return v0, v1
-
-            # Case 4: v0 has username, v1 is empty or same
-            if is_valid_username(v0):
-                return v0, v1 if v1 else v0
-
-            # Case 5: v0 looks like full_name (has space), v1 is empty
-            if v0 and ' ' in v0 and not v1:
-                return v0, v0
-
-            return None, None
-
-        def add_member(user_id, full_name):
+        def add_member(user_id, full_name, disabled=None, allow_login=None):
             if not user_id or user_id in seen_ids:
                 return
+            # Filter by search term if provided
             if search_term:
                 search_lower = search_term.lower()
                 if search_lower not in user_id.lower() and search_lower not in (full_name or '').lower():
                     return
+            # Skip disabled users
+            if disabled and str(disabled).upper() == 'Y':
+                return
             seen_ids.add(user_id)
             members.append({'user_id': user_id, 'full_name': full_name or user_id})
 
@@ -808,14 +934,13 @@ def search_users_in_group(dst, group_id, search_term, library='RTA_MAIN'):
             for row in row_nodes:
                 vals = row.propValues.anyType if hasattr(row, 'propValues') else []
                 if vals:
-                    v0 = clean_text(vals[0] if len(vals) > 0 else None)
-                    v1 = clean_text(vals[1] if len(vals) > 1 else None)
+                    user_id = clean_text(vals[0] if len(vals) > 0 else None)
+                    full_name = clean_text(vals[1] if len(vals) > 1 else None)
+                    disabled = vals[3] if len(vals) > 3 else None
+                    allow_login = vals[4] if len(vals) > 4 else None
 
-                    all_raw_members.append({'v0': v0, 'v1': v1})
-
-                    user_id, full_name = extract_user_info(v0, v1)
                     if user_id:
-                        add_member(user_id, full_name)
+                        add_member(user_id, full_name, disabled, allow_login)
 
         # Fallback: Binary Buffer
         if not members and hasattr(data_reply, 'resultSetData') and data_reply.resultSetData:
@@ -823,10 +948,8 @@ def search_users_in_group(dst, group_id, search_term, library='RTA_MAIN'):
             if hasattr(container, 'resultBuffer') and container.resultBuffer:
                 parsed_items = parse_user_result_buffer(container.resultBuffer)
                 for p in parsed_items:
-                    v0 = clean_text(p.get('user_id'))
-                    v1 = clean_text(p.get('full_name'))
-                    all_raw_members.append({'v0': v0, 'v1': v1})
-                    user_id, full_name = extract_user_info(v0, v1)
+                    user_id = clean_text(p.get('user_id'))
+                    full_name = clean_text(p.get('full_name'))
                     if user_id:
                         add_member(user_id, full_name)
 
@@ -842,282 +965,111 @@ def search_users_in_group(dst, group_id, search_term, library='RTA_MAIN'):
         logging.error(f"Error searching group users: {e}", exc_info=True)
         return []
 
+def get_all_users(dst, search_term='', library='RTA_MAIN'):
+    """
+    Get all users (v_peoples) with optional search filter.
+    Uses the pattern from Fiddler trace.
+    """
+    try:
+        svc_client = get_soap_client('BasicHttpBinding_IDMSvc')
+
+        # Build criteria
+        if search_term:
+            criteria_names = ['USER_ID', 'LAST_UPDATE']
+            criteria_values = [f'*{search_term}*', '1900-01-01 00:00:00 TO 3000-01-01 00:00:00']
+        else:
+            criteria_names = ['LAST_UPDATE']
+            criteria_values = ['1900-01-01 00:00:00 TO 3000-01-01 00:00:00']
+
+        search_call = {
+            'call': {
+                'dstIn': dst,
+                'objectType': 'v_peoples',
+                'signature': {
+                    'libraries': {'string': [library]},
+                    'criteria': {
+                        'criteriaCount': len(criteria_names),
+                        'criteriaNames': {'string': criteria_names},
+                        'criteriaValues': {'string': criteria_values}
+                    },
+                    'retProperties': {'string': ['USER_ID', 'FULL_NAME', 'SYSTEM_ID']},
+                    'sortProps': {
+                        'propertyCount': 1,
+                        'propertyNames': {'string': ['FULL_NAME']},
+                        'propertyFlags': {'int': [1]}
+                    },
+                    'maxRows': 0
+                }
+            }
+        }
+
+        search_reply = svc_client.service.Search(**search_call)
+
+        if not (search_reply and search_reply.resultCode == 0 and search_reply.resultSetID):
+            return []
+
+        result_set_id = search_reply.resultSetID
+
+        data_client = find_client_with_operation('GetDataW') or svc_client
+        method_name = 'GetDataW' if hasattr(data_client.service, 'GetDataW') else 'GetData'
+
+        get_data_call = {'call': {'resultSetID': result_set_id, 'requestedRows': 500, 'startingRow': 0}}
+        data_reply = getattr(data_client.service, method_name)(**get_data_call)
+
+        users = []
+        seen_ids = set()
+
+        # Process results
+        row_nodes = getattr(data_reply, 'rowNode', None) or getattr(data_reply, 'RowNode', None)
+        if row_nodes:
+            for row in row_nodes:
+                vals = row.propValues.anyType if hasattr(row, 'propValues') else []
+                if vals and vals[0]:
+                    user_id = str(vals[0]).strip()
+                    if user_id not in seen_ids:
+                        seen_ids.add(user_id)
+                        users.append({
+                            'user_id': user_id,
+                            'full_name': str(vals[1]).strip() if len(vals) > 1 and vals[1] else user_id,
+                            'system_id': str(vals[2]).strip() if len(vals) > 2 and vals[2] else None
+                        })
+
+        # Binary buffer fallback
+        if not users and hasattr(data_reply, 'resultSetData') and data_reply.resultSetData:
+            container = data_reply.resultSetData
+            if hasattr(container, 'resultBuffer') and container.resultBuffer:
+                parsed = parse_user_result_buffer(container.resultBuffer)
+                for p in parsed:
+                    user_id = p.get('user_id')
+                    if user_id and user_id not in seen_ids:
+                        seen_ids.add(user_id)
+                        users.append({
+                            'user_id': user_id,
+                            'full_name': p.get('full_name', user_id)
+                        })
+
+        try:
+            svc_client.service.ReleaseData(call={'resultSetID': result_set_id})
+            svc_client.service.ReleaseObject(call={'objectID': result_set_id})
+        except:
+            pass
+
+        return users
+
+    except Exception as e:
+        logging.error(f"Error getting all users: {e}")
+        return []
+
 def get_groups_for_user(dst, username, library='RTA_MAIN'):
     """
-    Attempts to fetch groups for a specific user.
-    Falls back to fetching all groups if specific filtering fails.
+    Get all groups that a specific user belongs to.
     """
     group_ids = []
 
     try:
         svc_client = get_soap_client('BasicHttpBinding_IDMSvc')
 
-        # Strategy 1: Search v_peoples (User Profile)
-        try:
-            search_call = {
-                'call': {
-                    'dstIn': dst,
-                    'objectType': 'v_peoples',
-                    'signature': {
-                        'libraries': {'string': [library]},
-                        'criteria': {
-                            'criteriaCount': 2,
-                            'criteriaNames': {'string': ['USER_ID', 'ALLOW_LOGIN']},
-                            'criteriaValues': {'string': [username, 'Y']}
-                        },
-                        'retProperties': {
-                            'string': ['GROUP_ID']
-                        },
-                        'maxRows': 0
-                    }
-                }
-            }
-
-            search_reply = svc_client.service.Search(**search_call)
-
-            if search_reply and search_reply.resultCode == 0 and search_reply.resultSetID:
-                result_set_id = search_reply.resultSetID
-                data_client = find_client_with_operation('GetDataW') or svc_client
-                method_name = 'GetDataW' if hasattr(data_client.service, 'GetDataW') else 'GetData'
-                get_data_call = {'call': {'resultSetID': result_set_id, 'requestedRows': 500, 'startingRow': 0}}
-
-                try:
-                    data_reply = getattr(data_client.service, method_name)(**get_data_call)
-                    row_nodes = getattr(data_reply, 'rowNode', None) or getattr(data_reply, 'RowNode', None)
-                    if row_nodes:
-                        for row in row_nodes:
-                            vals = row.propValues.anyType
-                            if vals and vals[0]: group_ids.append(vals[0])
-                finally:
-                    try:
-                        svc_client.service.ReleaseData(call={'resultSetID': result_set_id})
-                        svc_client.service.ReleaseObject(call={'objectID': result_set_id})
-                    except:
-                        pass
-        except Exception as e:
-            logging.debug(f"v_peoples search failed (using fallback): {e}")
-
-        # Strategy 2: v_peoplegroups (Secondary check)
-        if not group_ids:
-            try:
-                search_call['call']['objectType'] = 'v_peoplegroups'
-                search_call['call']['signature']['criteria'] = {
-                    'criteriaCount': 1,
-                    'criteriaNames': {'string': ['USER_ID']},
-                    'criteriaValues': {'string': [username]}
-                }
-
-                search_reply = svc_client.service.Search(**search_call)
-
-                if search_reply and search_reply.resultCode == 0 and search_reply.resultSetID:
-                    result_set_id = search_reply.resultSetID
-                    data_client = find_client_with_operation('GetDataW') or svc_client
-                    method_name = 'GetDataW' if hasattr(data_client.service, 'GetDataW') else 'GetData'
-                    get_data_call = {'call': {'resultSetID': result_set_id, 'requestedRows': 500, 'startingRow': 0}}
-
-                    try:
-                        data_reply = getattr(data_client.service, method_name)(**get_data_call)
-                        row_nodes = getattr(data_reply, 'rowNode', None) or getattr(data_reply, 'RowNode', None)
-                        if row_nodes:
-                            for row in row_nodes:
-                                vals = row.propValues.anyType
-                                if vals and vals[0] and vals[0] not in group_ids:
-                                    group_ids.append(vals[0])
-                    finally:
-                        try:
-                            svc_client.service.ReleaseData(call={'resultSetID': result_set_id})
-                            svc_client.service.ReleaseObject(call={'objectID': result_set_id})
-                        except:
-                            pass
-            except Exception as e:
-                logging.debug(f"v_peoplegroups search failed (using fallback): {e}")
-
-    except Exception as e:
-        logging.warning(f"Error initializing group search: {e}")
-
-    # Final logic:
-    if group_ids:
-        all_groups = get_all_groups(dst, library)
-        user_groups = [g for g in all_groups if g['group_id'] in group_ids]
-
-        if user_groups:
-            return user_groups
-
-        return [{'group_id': gid, 'group_name': gid} for gid in group_ids]
-
-    # FALLBACK: Return ALL groups.
-    return get_all_groups(dst, library)
-
-def get_all_groups(dst, library='RTA_MAIN'):
-    try:
-        # Use the robust search_groups function to fetch all groups (wildcard)
-        groups = search_groups(dst, "*", library)
-
-        # If wildcard search failed, try with percent
-        if not groups:
-            groups = search_groups(dst, "%", library)
-
-        # Emergency fallback (ensure UI is never empty)
-        if not groups:
-            groups = [
-                {'group_id': 'DOCS_USERS', 'group_name': 'DOCS Users', 'description': 'System Users'},
-                {'group_id': 'TIBCO_GROUP', 'group_name': 'TIBCO Group', 'description': ''}
-            ]
-
-        return groups
-    except Exception as e:
-        logging.error(f"Error getting groups: {e}")
-        return []
-
-def get_user_security_from_dms(dst, username, library='RTA_MAIN'):
-    """
-    Fetches a user's security/privilege information from DMS.
-    Uses multiple fallback strategies based on working queries.
-    """
-    try:
-        svc_client = get_soap_client('BasicHttpBinding_IDMSvc')
-
-        # Strategy 1: v_peoplegroups (PROVEN WORKING from search_users_in_group)
-        try:
-            search_call = {
-                'call': {
-                    'dstIn': dst,
-                    'objectType': 'v_peoplegroups',
-                    'signature': {
-                        'libraries': {'string': [library]},
-                        'criteria': {
-                            'criteriaCount': 2,
-                            'criteriaNames': {'string': ['USER_ID', 'DISABLED']},
-                            'criteriaValues': {'string': [username, 'N']}
-                        },
-                        'retProperties': {
-                            'string': [
-                                'USER_ID',
-                                'FULL_NAME',
-                                'GROUP_ID',
-                                'PEOPLE_SYSTEM_ID'
-                            ]
-                        },
-                        'maxRows': 1
-                    }
-                }
-            }
-
-            search_reply = svc_client.service.Search(**search_call)
-
-            if search_reply and search_reply.resultCode == 0 and search_reply.resultSetID:
-                result_set_id = search_reply.resultSetID
-                data_client = find_client_with_operation('GetDataW') or svc_client
-                method_name = 'GetDataW' if hasattr(data_client.service, 'GetDataW') else 'GetData'
-
-                get_data_call = {'call': {'resultSetID': result_set_id, 'requestedRows': 1, 'startingRow': 0}}
-                data_reply = getattr(data_client.service, method_name)(**get_data_call)
-
-                try:
-                    svc_client.service.ReleaseData(call={'resultSetID': result_set_id})
-                    svc_client.service.ReleaseObject(call={'objectID': result_set_id})
-                except:
-                    pass
-
-                row_nodes = getattr(data_reply, 'rowNode', None) or getattr(data_reply, 'RowNode', None)
-
-                if row_nodes and row_nodes[0].propValues.anyType:
-                    vals = row_nodes[0].propValues.anyType
-                    group_id = vals[2] if len(vals) > 2 else None
-
-                    # Determine security level from group
-                    security_level = determine_security_from_group(group_id)
-
-                    return {
-                        'user_id': vals[0] if len(vals) > 0 else username,
-                        'full_name': vals[1] if len(vals) > 1 else username,
-                        'group_id': group_id,
-                        'security_level': security_level,
-                        'people_system_id': vals[3] if len(vals) > 3 else None
-                    }
-        except Exception as e:
-            logging.debug(f"v_peoplegroups lookup failed: {e}")
-
-        # Strategy 2: Check if user exists in any admin/power groups
-        try:
-            admin_groups = ['DOCS_ADMINS', 'ADMINISTRATORS', 'ADMIN', 'POWER_USERS', 'SUPERVISORS', 'SUPERVISOR']
-            editor_groups = ['DOCS_EDITORS', 'EDITORS', 'CONTRIBUTORS']
-
-            user_groups = get_groups_for_user(dst, username, library)
-
-            if user_groups:
-                group_ids = [g.get('group_id', '').upper() for g in user_groups]
-
-                # Check for admin
-                for admin_grp in admin_groups:
-                    if admin_grp in group_ids:
-                        return {
-                            'user_id': username,
-                            'full_name': username,
-                            'group_id': admin_grp,
-                            'security_level': 9  # Admin
-                        }
-
-                # Check for editor
-                for editor_grp in editor_groups:
-                    if editor_grp in group_ids:
-                        return {
-                            'user_id': username,
-                            'full_name': username,
-                            'group_id': editor_grp,
-                            'security_level': 5  # Editor
-                        }
-
-                # Default to viewer if in any group
-                return {
-                    'user_id': username,
-                    'full_name': username,
-                    'group_id': group_ids[0] if group_ids else None,
-                    'security_level': 0  # Viewer
-                }
-        except Exception as e:
-            logging.debug(f"Group-based security lookup failed: {e}")
-
-        # Strategy 3: Fallback - just confirm user exists
-        logging.warning(f"Could not determine security level for {username}, defaulting to Viewer")
-        return {
-            'user_id': username,
-            'full_name': username,
-            'group_id': None,
-            'security_level': 0  # Default to Viewer
-        }
-
-    except Exception as e:
-        logging.error(f"Error getting user security from DMS: {e}", exc_info=True)
-        return None
-
-def determine_security_from_group(group_id):
-    """
-    Maps a DMS group to a security level.
-    Customize this based on your organization's group structure.
-    """
-    if not group_id:
-        return 0
-
-    group_upper = str(group_id).upper()
-
-    # Admin groups (level 9)
-    if any(x in group_upper for x in ['ADMIN', 'SUPERUSER', 'SYSADMIN', 'ROOT', 'SUPERVISOR']):
-        return 9
-
-    # Editor groups (level 5)
-    if any(x in group_upper for x in ['EDITOR', 'CONTRIBUTOR', 'POWER', 'MANAGER']):
-        return 5
-
-    # Default to Viewer (level 0)
-    return 0
-
-def debug_user_in_group(dst, username, group_id, library='RTA_MAIN'):
-    """Debug why a specific user doesn't appear in group search"""
-    try:
-        svc_client = get_soap_client('BasicHttpBinding_IDMSvc')
-
-        # Search 1: Without DISABLED filter
+        # Search v_peoplegroups for this user
         search_call = {
             'call': {
                 'dstIn': dst,
@@ -1125,47 +1077,47 @@ def debug_user_in_group(dst, username, group_id, library='RTA_MAIN'):
                 'signature': {
                     'libraries': {'string': [library]},
                     'criteria': {
-                        'criteriaCount': 2,
-                        'criteriaNames': {'string': ['GROUP_ID', 'USER_ID']},
-                        'criteriaValues': {'string': [group_id, username]}
+                        'criteriaCount': 1,
+                        'criteriaNames': {'string': ['USER_ID']},
+                        'criteriaValues': {'string': [username]}
                     },
-                    'retProperties': {
-                        'string': ['USER_ID', 'FULL_NAME', 'GROUP_ID', 'DISABLED']
-                    },
-                    'maxRows': 10
+                    'retProperties': {'string': ['GROUP_ID']},
+                    'maxRows': 0
                 }
             }
         }
 
         search_reply = svc_client.service.Search(**search_call)
-        logging.info(
-            f"[DEBUG USER] Search for {username} in {group_id} - resultCode: {getattr(search_reply, 'resultCode', 'N/A')}")
 
         if search_reply and search_reply.resultCode == 0 and search_reply.resultSetID:
             result_set_id = search_reply.resultSetID
-
             data_client = find_client_with_operation('GetDataW') or svc_client
             method_name = 'GetDataW' if hasattr(data_client.service, 'GetDataW') else 'GetData'
 
-            get_data_call = {'call': {'resultSetID': result_set_id, 'requestedRows': 10, 'startingRow': 0}}
+            get_data_call = {'call': {'resultSetID': result_set_id, 'requestedRows': 100, 'startingRow': 0}}
             data_reply = getattr(data_client.service, method_name)(**get_data_call)
 
             row_nodes = getattr(data_reply, 'rowNode', None) or getattr(data_reply, 'RowNode', None)
-
             if row_nodes:
-                logging.info(f"[DEBUG USER] Found {len(row_nodes)} records for {username}:")
-                for idx, row in enumerate(row_nodes):
+                for row in row_nodes:
                     vals = row.propValues.anyType if hasattr(row, 'propValues') else []
-                    logging.info(f"[DEBUG USER] Row {idx}: {vals}")
-            else:
-                logging.info(f"[DEBUG USER] No records found for {username} in {group_id}")
+                    if vals and vals[0]:
+                        gid = str(vals[0]).strip()
+                        if gid not in group_ids:
+                            group_ids.append(gid)
 
             try:
                 svc_client.service.ReleaseData(call={'resultSetID': result_set_id})
+                svc_client.service.ReleaseObject(call={'objectID': result_set_id})
             except:
                 pass
-        else:
-            logging.info(f"[DEBUG USER] Search returned no results")
 
     except Exception as e:
-        logging.error(f"[DEBUG USER] Error: {e}")
+        logging.debug(f"Error getting groups for user {username}: {e}")
+
+    # Return as list of group dicts
+    if group_ids:
+        return [{'group_id': gid, 'group_name': gid} for gid in group_ids]
+
+    # Fallback: return all groups
+    return get_all_groups(dst, library)

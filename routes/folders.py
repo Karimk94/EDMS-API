@@ -58,6 +58,24 @@ async def api_create_folder(request: Request, data: CreateFolderRequest):
             user_id=username
         )
         if new_folder_id:
+            # Set security so only the creator can see the folder
+            trustees = [
+                {
+                    'username': username,
+                    'rights': 255,  # Full control
+                    'flag': 2  # User (not group)
+                }
+            ]
+            success, message = wsdl_client.set_trustees(
+                dst=dst,
+                doc_id=str(new_folder_id),
+                library='RTA_MAIN',
+                trustees=trustees,
+                security_enabled='1'
+            )
+            if not success:
+                logging.warning(f"Failed to set security on folder {new_folder_id}: {message}")
+
             return {"message": "Folder created", "folder_id": new_folder_id, "name": data.name}
         else:
             raise HTTPException(status_code=500, detail="Failed to create folder")
