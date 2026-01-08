@@ -116,8 +116,12 @@ def get_doc_trustees(doc_id: str, request: Request):
     trustees = wsdl_client.get_object_trustees(token, doc_id)
     return trustees
 
-@router.get("/api/groups", response_model=List[Group])
-def get_groups(request: Request):
+@router.get("/api/groups", response_model=dict)
+def get_groups(
+    request: Request,
+    search: str = Query(""),
+    page: int = 1
+):
     token = processor.get_session_token(request)
     user = request.session.get('user')
     username = user.get('username') if user else None
@@ -125,7 +129,7 @@ def get_groups(request: Request):
     if not username:
         raise HTTPException(status_code=401, detail="Not authenticated")
 
-    # Get user's groups from DMS (this already works!)
+    # Get user's groups from DMS
     user_groups = wsdl_client.get_groups_for_user(token, username)
 
     # Determine security level from their groups
@@ -138,9 +142,31 @@ def get_groups(request: Request):
 
     # If admin (9), show all groups. Otherwise, show only user's groups.
     if security_level >= 9:
-        return wsdl_client.get_all_groups(token)
+        all_groups = wsdl_client.get_all_groups(token)
     else:
-        return user_groups
+        all_groups = user_groups
+
+    # Filter by search term
+    if search:
+        search_lower = search.lower()
+        filtered_groups = [
+            g for g in all_groups
+            if search_lower in (g.get('group_name') or g.get('name') or '').lower()
+        ]
+    else:
+        filtered_groups = all_groups
+
+    # Pagination Logic
+    limit = 20
+    start = (page - 1) * limit
+    end = start + limit
+    paged_groups = filtered_groups[start:end]
+    has_more = len(filtered_groups) > end
+
+    return {
+        "options": paged_groups,
+        "hasMore": has_more
+    }
 
 @router.get("/api/groups/search_members", response_model=dict)
 def search_group_members(
