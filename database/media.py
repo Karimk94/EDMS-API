@@ -324,7 +324,8 @@ async def resolve_media_types_from_db(doc_ids):
 
             image_exts = {'jpg', 'jpeg', 'png', 'gif', 'bmp', 'tif', 'tiff', 'webp', 'heic'}
             video_exts = {'mp4', 'mov', 'avi', 'wmv', 'mkv', 'flv', 'webm', '3gp'}
-            pdf_exts = {'pdf', 'doc', 'docx'}
+            pdf_exts = {'pdf'}
+            word_exts = {'doc', 'docx'}
             excel_exts = {'xls', 'xlsx', 'ods', 'xlsm'}
             ppt_exts = {'ppt', 'pptx', 'odp', 'pps', 'ppsx'}
             text_exts = {'txt', 'csv', 'json', 'xml', 'log', 'md'}
@@ -339,6 +340,8 @@ async def resolve_media_types_from_db(doc_ids):
                         media_type = 'video'
                     elif clean_ext in pdf_exts:
                         media_type = 'pdf'
+                    elif clean_ext in word_exts:
+                        media_type = 'docx'
                     elif clean_ext in excel_exts:
                         media_type = 'excel'
                     elif clean_ext in ppt_exts:
