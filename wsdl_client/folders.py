@@ -53,13 +53,51 @@ def create_dms_folder(dst, folder_name, description="", parent_id=None, user_id=
     except Exception as e:
         return None
 
-async def get_recursive_doc_ids(dst, media_type_filter=None, search_term=None, start_node=None):
+async def get_recursive_doc_ids(dst, media_type_filter=None, search_term=None, start_node=None, username=None, user_groups=None, permission_checker=None):
     import db_connector
+    from .users import get_object_trustees, get_groups_for_user
+    
     root_node = start_node if start_node else SMART_EDMS_ROOT_ID
     matching_docs = []
     folder_queue = [root_node]
     processed_folders = set()
     MAX_FOLDERS_TO_SCAN = 100
+
+    # Get user's groups for permission checking if not already provided
+    if username and user_groups is None:
+        try:
+            groups_data = get_groups_for_user(dst, username)
+            user_groups = [g.get('group_id', '').upper() for g in groups_data if g.get('group_id')]
+        except Exception as e:
+            logging.warning(f"Could not fetch groups for user {username}: {e}")
+            user_groups = []
+    
+    def folder_has_permission(folder_id):
+        """Check if user has permission to see this folder based on trustees."""
+        # Use external permission checker if provided
+        if permission_checker:
+            return permission_checker(folder_id)
+        
+        if not username:
+            return True  # No user filtering if username not provided
+        
+        try:
+            trustees = get_object_trustees(dst, folder_id)
+            if not trustees:
+                return True  # No trustees means folder is accessible to all
+            
+            # Check if user is directly in trustees list or via group
+            for trustee in trustees:
+                trustee_name = trustee.get('username', '').upper()
+                if trustee_name == username.upper():
+                    return True
+                if user_groups and trustee_name in user_groups:
+                    return True
+            
+            return False
+        except Exception as e:
+            logging.warning(f"Could not check permissions for folder {folder_id}: {e}")
+            return True  # On error, allow access
 
     search_client = get_soap_client('BasicHttpBinding_IDMSvc')
     data_client = find_client_with_operation('GetDataW') or find_client_with_operation('GetData')
@@ -145,6 +183,10 @@ async def get_recursive_doc_ids(dst, media_type_filter=None, search_term=None, s
                 ids_to_resolve = []
                 for item in items_batch:
                     if item.get('type') == 'folder' or item.get('media_type') == 'folder':
+                        # Check permission before adding folder to queue
+                        if not folder_has_permission(item['id']):
+                            continue  # Skip folders the user doesn't have permission to see
+                        
                         if item['id'] not in processed_folders and item['id'] not in folder_queue:
                             folder_queue.append(item['id'])
                         if search_term and search_term.lower() in item['name'].lower():
@@ -215,8 +257,10 @@ async def get_recursive_doc_ids(dst, media_type_filter=None, search_term=None, s
         pass
     return matching_docs
 
-async def list_folder_contents(dst, parent_id=None, app_source=None, scope=None, media_type=None, search_term=None):
+async def list_folder_contents(dst, parent_id=None, app_source=None, scope=None, media_type=None, search_term=None, username=None):
     import db_connector
+    from .users import get_object_trustees, get_groups_for_user
+    
     items = []
     if parent_id == 'images':
         media_type = 'image'
@@ -234,16 +278,49 @@ async def list_folder_contents(dst, parent_id=None, app_source=None, scope=None,
                                                                                                           'files']:
         target_id = SMART_EDMS_ROOT_ID
 
+    # Get user's groups for permission checking
+    user_groups = []
+    if username:
+        try:
+            groups_data = get_groups_for_user(dst, username)
+            user_groups = [g.get('group_id', '').upper() for g in groups_data if g.get('group_id')]
+        except Exception as e:
+            logging.warning(f"Could not fetch groups for user {username}: {e}")
+    
+    def user_has_permission(folder_id):
+        """Check if user has permission to see this folder based on trustees."""
+        if not username:
+            return True  # No user filtering if username not provided
+        
+        try:
+            trustees = get_object_trustees(dst, folder_id)
+            if not trustees:
+                return True  # No trustees means folder is accessible to all
+            
+            # Check if user is directly in trustees list
+            for trustee in trustees:
+                trustee_name = trustee.get('username', '').upper()
+                if trustee_name == username.upper():
+                    return True
+                # Check if any of user's groups is in trustees list
+                if trustee_name in user_groups:
+                    return True
+            
+            return False
+        except Exception as e:
+            logging.warning(f"Could not check permissions for folder {folder_id}: {e}")
+            return True  # On error, allow access
+
     if (scope == 'folders' and media_type) or search_term:
         start_node = target_id
         return await get_recursive_doc_ids(dst, media_type_filter=media_type, search_term=search_term,
-                                           start_node=start_node)
+                                           start_node=start_node, username=username, user_groups=user_groups)
 
     is_root_view = (target_id == SMART_EDMS_ROOT_ID)
     if is_root_view and not media_type and not search_term:
         try:
-            # AWAIT HERE
-            counts = await db_connector.get_media_type_counts(app_source, scope=scope)
+            # AWAIT HERE - pass username for permission-filtered counts
+            counts = await db_connector.get_media_type_counts(app_source, scope=scope, username=username)
 
             def get_cnt(k):
                 return counts.get(k, 0) if counts else 0
@@ -358,15 +435,36 @@ async def list_folder_contents(dst, parent_id=None, app_source=None, scope=None,
         except Exception:
             for item in items:
                 if item.get('media_type') == 'resolve': item['media_type'] = 'pdf'
+    
+    # Filter folders based on user permissions
+    if username:
+        filtered_items = []
+        for item in items:
+            # Keep standard folders (images, videos, files) - they're virtual
+            if item.get('is_standard'):
+                filtered_items.append(item)
+                continue
+            
+            # For real folders, check if user has permission
+            if item.get('type') == 'folder':
+                if user_has_permission(item['id']):
+                    filtered_items.append(item)
+            else:
+                # Keep non-folder items (files)
+                filtered_items.append(item)
+        
+        items = filtered_items
+    
     return items
 
-async def get_root_folder_counts(dst):
+async def get_root_folder_counts(dst, username=None):
     """
     Counts documents by media type (images, videos, files) recursively from the root.
+    Only counts items in folders the user has permission to see.
     """
     try:
-        # Pass media_type_filter=None to get all docs
-        items = await get_recursive_doc_ids(dst, media_type_filter=None)
+        # Pass media_type_filter=None to get all docs, with username for permission filtering
+        items = await get_recursive_doc_ids(dst, media_type_filter=None, username=username)
 
         counts = {'images': 0, 'videos': 0, 'files': 0}
 

@@ -82,11 +82,17 @@ async def api_clear_cache():
 
 @router.get('/api/media_counts')
 async def get_media_counts(
+        request: Request,
         x_app_source: str = Header("unknown", alias="X-App-Source"),
         scope: Optional[str] = None
 ):
     try:
-        counts = await db_connector.get_media_type_counts(app_source=x_app_source, scope=scope)
+        # Get username from session for permission filtering
+        username = None
+        if 'user' in request.session:
+            username = request.session['user'].get('username')
+        
+        counts = await db_connector.get_media_type_counts(app_source=x_app_source, scope=scope, username=username)
         if counts:
             return counts
         else:

@@ -21,13 +21,16 @@ async def api_list_folders(
     if parent_id in ['null', 'undefined', '']:
         parent_id = None
 
+    # Get the current logged-in user's username for permission filtering
+    username = request.session['user'].get('username')
+
     dst = wsdl_client.dms_system_login()
     if not dst:
         raise HTTPException(status_code=500, detail="Failed to authenticate with DMS")
 
     try:
         contents = await wsdl_client.list_folder_contents(
-            dst, parent_id, x_app_source, scope=scope, media_type=media_type, search_term=search
+            dst, parent_id, x_app_source, scope=scope, media_type=media_type, search_term=search, username=username
         )
         return {"contents": contents}
     except Exception as e:

@@ -225,12 +225,12 @@ async def get_app_id_from_extension(extension):
         if conn: conn.close()
     return app_id
 
-async def get_media_type_counts(app_source='unknown', scope=None):
+async def get_media_type_counts(app_source='unknown', scope=None, username=None):
     """Counts documents by media type (Async)."""
     if scope == 'folders':
         dst = dms_system_login()
         if dst:
-            return await wsdl_client.get_root_folder_counts(dst)
+            return await wsdl_client.get_root_folder_counts(dst, username=username)
         return {"images": 0, "videos": 0, "files": 0}
 
     conn = get_connection()
