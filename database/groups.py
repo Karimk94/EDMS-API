@@ -37,7 +37,7 @@ async def get_all_groups_from_db():
                     'description': ''
                 })
         
-        logging.info(f"[database/groups.py] Fetched {len(groups)} groups from database")
+        # logging.info(f"[database/groups.py] Fetched {len(groups)} groups from database")
         return groups
         
     except oracledb.Error as e:
@@ -77,7 +77,7 @@ def get_all_groups_from_db_sync():
                     'description': ''
                 })
         
-        logging.info(f"[database/groups.py] Fetched {len(groups)} groups from database (sync)")
+        # logging.info(f"[database/groups.py] Fetched {len(groups)} groups from database (sync)")
         return groups
         
     except oracledb.Error as e:

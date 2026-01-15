@@ -48,7 +48,7 @@ def get_all_groups(dst, library='RTA_MAIN'):
     """
     Fetches all available groups using multiple strategies.
     """
-    logging.info(f"[users.py] get_all_groups called with library={library}")
+    # logging.info(f"[users.py] get_all_groups called with library={library}")
     groups = []
     seen_ids = set()
 
@@ -118,7 +118,7 @@ def get_all_groups(dst, library='RTA_MAIN'):
 
     # STRATEGY 0: Query v_groups with NO criteria at all (get everything)
     try:
-        logging.info(f"[users.py] Trying v_groups with empty criteria...")
+        # logging.info(f"[users.py] Trying v_groups with empty criteria...")
         search_call = {
             'call': {
                 'dstIn': dst,
@@ -142,7 +142,7 @@ def get_all_groups(dst, library='RTA_MAIN'):
         }
 
         resp = svc_client.service.Search(**search_call)
-        logging.info(f"[users.py] v_groups (empty criteria) resultCode={getattr(resp, 'resultCode', 'N/A')}")
+        # logging.info(f"[users.py] v_groups (empty criteria) resultCode={getattr(resp, 'resultCode', 'N/A')}")
         if resp and resp.resultCode == 0 and resp.resultSetID:
             def extract_groups_empty(data, data_type):
                 extracted = []
@@ -172,13 +172,13 @@ def get_all_groups(dst, library='RTA_MAIN'):
                 if r['group_id']:
                     add_group(r['group_id'], r.get('group_name'), r.get('description', ''))
                     s0_count += 1
-            logging.info(f"[users.py] Strategy 0 (empty criteria) added {s0_count} groups")
+            # logging.info(f"[users.py] Strategy 0 (empty criteria) added {s0_count} groups")
     except Exception as e:
         logging.debug(f"[users.py] Strategy 0 failed: {e}")
 
     # STRATEGY 0.5: Query v_groups with GROUP_ID wildcard (get all by name pattern)
     try:
-        logging.info(f"[users.py] Trying v_groups with GROUP_ID=* wildcard...")
+        # logging.info(f"[users.py] Trying v_groups with GROUP_ID=* wildcard...")
         search_call = {
             'call': {
                 'dstIn': dst,
@@ -202,7 +202,7 @@ def get_all_groups(dst, library='RTA_MAIN'):
         }
 
         resp = svc_client.service.Search(**search_call)
-        logging.info(f"[users.py] v_groups (wildcard) resultCode={getattr(resp, 'resultCode', 'N/A')}")
+        # logging.info(f"[users.py] v_groups (wildcard) resultCode={getattr(resp, 'resultCode', 'N/A')}")
         if resp and resp.resultCode == 0 and resp.resultSetID:
             def extract_groups_wild(data, data_type):
                 extracted = []
@@ -232,7 +232,7 @@ def get_all_groups(dst, library='RTA_MAIN'):
                 if r['group_id'] and r['group_id'] not in seen_ids:
                     add_group(r['group_id'], r.get('group_name'), r.get('description', ''))
                     s05_count += 1
-            logging.info(f"[users.py] Strategy 0.5 (wildcard) added {s05_count} new groups")
+            # logging.info(f"[users.py] Strategy 0.5 (wildcard) added {s05_count} new groups")
     except Exception as e:
         logging.debug(f"[users.py] Strategy 0.5 failed: {e}")
 
@@ -343,7 +343,7 @@ def get_all_groups(dst, library='RTA_MAIN'):
 
     # STRATEGY 3: Try v_nativegroups (captures native/system groups)
     try:
-        logging.info(f"[users.py] Trying v_nativegroups strategy...")
+        # logging.info(f"[users.py] Trying v_nativegroups strategy...")
         search_call = {
             'call': {
                 'dstIn': dst,
@@ -396,13 +396,13 @@ def get_all_groups(dst, library='RTA_MAIN'):
                 if r['group_id'] and r['group_id'] not in seen_ids:
                     add_group(r['group_id'], r.get('group_name'), r.get('description', ''))
                     native_count += 1
-            logging.info(f"[users.py] v_nativegroups added {native_count} new groups")
+            # logging.info(f"[users.py] v_nativegroups added {native_count} new groups")
     except Exception as e:
         logging.debug(f"[users.py] v_nativegroups strategy failed: {e}")
 
     # STRATEGY 4: Try v_usergroups (captures user-defined groups)
     try:
-        logging.info(f"[users.py] Trying v_usergroups strategy...")
+        # logging.info(f"[users.py] Trying v_usergroups strategy...")
         search_call = {
             'call': {
                 'dstIn': dst,
@@ -455,16 +455,14 @@ def get_all_groups(dst, library='RTA_MAIN'):
                 if r['group_id'] and r['group_id'] not in seen_ids:
                     add_group(r['group_id'], r.get('group_name'), r.get('description', ''))
                     usergroup_count += 1
-            logging.info(f"[users.py] v_usergroups added {usergroup_count} new groups")
+            # logging.info(f"[users.py] v_usergroups added {usergroup_count} new groups")
     except Exception as e:
         logging.debug(f"[users.py] v_usergroups strategy failed: {e}")
 
-    # STRATEGY: Query v_peoplegroups from additional libraries (ENOC, etc.) to get cross-library groups
-    # The Fiddler trace shows TIBCO_GROUP is in ENOC library, not RTA_MAIN
     additional_libraries = ['ENOC'] if library != 'ENOC' else []
     for extra_lib in additional_libraries:
         try:
-            logging.info(f"[users.py] Trying v_peoplegroups from library {extra_lib}...")
+            # logging.info(f"[users.py] Trying v_peoplegroups from library {extra_lib}...")
             search_call = {
                 'call': {
                     'dstIn': dst,
@@ -488,7 +486,7 @@ def get_all_groups(dst, library='RTA_MAIN'):
             }
 
             resp = svc_client.service.Search(**search_call)
-            logging.info(f"[users.py] v_peoplegroups ({extra_lib}) resultCode={getattr(resp, 'resultCode', 'N/A')}")
+            # logging.info(f"[users.py] v_peoplegroups ({extra_lib}) resultCode={getattr(resp, 'resultCode', 'N/A')}")
             if resp and resp.resultCode == 0 and resp.resultSetID:
                 def extract_extra_lib_groups(data, data_type):
                     extracted = []
@@ -518,15 +516,13 @@ def get_all_groups(dst, library='RTA_MAIN'):
                     if r['group_id'] and r['group_id'] not in seen_ids:
                         add_group(r['group_id'], r.get('group_name'), r.get('description', ''))
                         lib_count += 1
-                logging.info(f"[users.py] v_peoplegroups ({extra_lib}) added {lib_count} new groups")
+                # logging.info(f"[users.py] v_peoplegroups ({extra_lib}) added {lib_count} new groups")
         except Exception as e:
             logging.debug(f"[users.py] v_peoplegroups ({extra_lib}) strategy failed: {e}")
 
-    # STRATEGY: Query v_peoples from additional libraries to discover primary groups of all users
-    # This extracts GROUP_ID from users, which captures groups like TIBCO_GROUP
     for extra_lib in ['ENOC'] if library != 'ENOC' else []:
         try:
-            logging.info(f"[users.py] Trying v_peoples (user primary groups) from library {extra_lib}...")
+            # logging.info(f"[users.py] Trying v_peoples (user primary groups) from library {extra_lib}...")
             search_call = {
                 'call': {
                     'dstIn': dst,
@@ -550,7 +546,7 @@ def get_all_groups(dst, library='RTA_MAIN'):
             }
 
             resp = svc_client.service.Search(**search_call)
-            logging.info(f"[users.py] v_peoples ({extra_lib}) resultCode={getattr(resp, 'resultCode', 'N/A')}")
+            # logging.info(f"[users.py] v_peoples ({extra_lib}) resultCode={getattr(resp, 'resultCode', 'N/A')}")
             if resp and resp.resultCode == 0 and resp.resultSetID:
                 def extract_user_primary_groups(data, data_type):
                     extracted = []
@@ -580,28 +576,28 @@ def get_all_groups(dst, library='RTA_MAIN'):
                     if r['group_id'] and r['group_id'] not in seen_ids:
                         add_group(r['group_id'], r.get('group_name'), '')
                         user_primary_count += 1
-                logging.info(f"[users.py] v_peoples ({extra_lib}) user primary groups added {user_primary_count} new groups")
+                # logging.info(f"[users.py] v_peoples ({extra_lib}) user primary groups added {user_primary_count} new groups")
         except Exception as e:
             logging.debug(f"[users.py] v_peoples ({extra_lib}) user primary groups failed: {e}")
 
     # FINAL STRATEGY: Query database directly (most reliable, bypasses all DMS API limitations)
     try:
         from database.groups import get_all_groups_from_db_sync
-        logging.info("[users.py] Trying direct database query for groups...")
+        # logging.info("[users.py] Trying direct database query for groups...")
         db_groups = get_all_groups_from_db_sync()
         db_count = 0
         for g in db_groups:
             if g['group_id'] and g['group_id'] not in seen_ids:
                 add_group(g['group_id'], g.get('group_name'), g.get('description', ''))
                 db_count += 1
-        logging.info(f"[users.py] Database query added {db_count} new groups")
+        # logging.info(f"[users.py] Database query added {db_count} new groups")
     except Exception as e:
         logging.warning(f"[users.py] Database fallback failed: {e}")
 
     # Sort groups alphabetically
     groups.sort(key=lambda x: x['group_id'].lower() if x['group_id'] else '')
 
-    logging.info(f"[users.py] get_all_groups returning {len(groups)} groups: {[g['group_id'] for g in groups]}")
+    # logging.info(f"[users.py] get_all_groups returning {len(groups)} groups: {[g['group_id'] for g in groups]}")
     return groups
 
 def search_groups(dst, name_pattern='', library='RTA_MAIN'):

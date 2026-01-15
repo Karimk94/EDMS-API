@@ -439,7 +439,7 @@ def rename_document(dst, doc_id, new_name):
     This updates the underlying document name.
     """
     try:
-        logging.info(f"Attempting to rename doc {doc_id} to '{new_name}'")
+        # logging.info(f"Attempting to rename doc {doc_id} to '{new_name}'")
         svc_client = get_soap_client('BasicHttpBinding_IDMSvc')
 
         string_type = svc_client.get_type('{http://www.w3.org/2001/XMLSchema}string')
@@ -470,11 +470,11 @@ def rename_document(dst, doc_id, new_name):
             }
         }
 
-        logging.info("Sending UpdateObject request for Profile...")
+        # logging.info("Sending UpdateObject request for Profile...")
         response = svc_client.service.UpdateObject(call=call_data)
 
         if response.resultCode == 0:
-            logging.info(f"Successfully renamed doc {doc_id} to '{new_name}'")
+            # logging.info(f"Successfully renamed doc {doc_id} to '{new_name}'")
             return True
         else:
             error_msg = getattr(response, 'errorDoc', 'Unknown error')
@@ -494,7 +494,7 @@ def rename_folder_display(dst, content_item_system_id, new_name):
     Matches the exact SOAP structure from the working request.
     """
     try:
-        logging.info(f"Attempting to rename ContentItem {content_item_system_id} to '{new_name}'")
+        # logging.info(f"Attempting to rename ContentItem {content_item_system_id} to '{new_name}'")
 
         # Get fresh client
         wsdl_url = os.getenv("WSDL_URL")
@@ -541,18 +541,18 @@ def rename_folder_display(dst, content_item_system_id, new_name):
         # Debug: Print XML preview
         try:
             envelope = svc_client.create_message(svc_client.service, 'UpdateObject', call=call_object)
-            logging.info("--- Generated XML ---")
-            logging.info(etree.tostring(envelope, pretty_print=True).decode())
-            logging.info("--------------------")
+            # logging.info("--- Generated XML ---")
+            # logging.info(etree.tostring(envelope, pretty_print=True).decode())
+            # logging.info("--------------------")
         except Exception as xml_e:
             logging.warning(f"Could not preview XML: {xml_e}")
 
         # Send request
-        logging.info("Sending UpdateObject request...")
+        # logging.info("Sending UpdateObject request...")
         response = svc_client.service.UpdateObject(call=call_object)
 
         if response.resultCode == 0:
-            logging.info(f"Successfully renamed ContentItem {content_item_system_id} to '{new_name}'")
+            # logging.info(f"Successfully renamed ContentItem {content_item_system_id} to '{new_name}'")
             return True
         else:
             error_msg = getattr(response, 'errorDoc', '') or getattr(response, 'resultCode', 'Unknown')
