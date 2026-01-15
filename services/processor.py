@@ -225,7 +225,8 @@ def determine_security_from_groups(user_groups):
     # Define your organization's security groups
     ADMIN_GROUPS = {
         'DOCS_ADMINS',
-        'ADMINISTRATORS',
+        'DOCS_SUPERVISORS',
+        'ADMINISTRATOR',
         'ADMIN',
         'SYSADMIN',
         # Add more admin groups here
@@ -233,8 +234,8 @@ def determine_security_from_groups(user_groups):
 
     EDITOR_GROUPS = {
         'DOCS_EDITORS',
-        'DOCS_USERS',  # ← Your user is in this group
-        'TIBCO_GROUP',  # ← Your user is in this group
+        'DOCS_USERS',
+        'TIBCO_GROUP',
         'CONTRIBUTORS',
         'POWER_USERS'
     }

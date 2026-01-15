@@ -1,6 +1,7 @@
 from fastapi import APIRouter, HTTPException, Request, Query
 import db_connector
 import wsdl_client
+from wsdl_client import users as wsdl_users
 from schemas.auth import LoginRequest, LangUpdateRequest, ThemeUpdateRequest, GroupMember, TrusteeResponse, Group
 from typing import List
 from services import processor
@@ -131,20 +132,33 @@ def get_groups(
 
     # Get user's groups from DMS
     user_groups = wsdl_client.get_groups_for_user(token, username)
+    logging.info(f"[/api/groups] User {username} has {len(user_groups)} direct groups: {[g.get('group_id') for g in user_groups]}")
 
     # Determine security level from their groups
     security_level = processor.determine_security_from_groups(user_groups)
+    logging.info(f"[/api/groups] User {username} security_level={security_level}")
 
     # Update session with DMS-based security
     if user:
         user['dms_security_level'] = security_level
         request.session['user'] = user
 
-    # If admin (9), show all groups. Otherwise, show only user's groups.
+    # If admin (9), show all groups merged with user's groups.
+    # Otherwise, show only user's groups.
     if security_level >= 9:
-        all_groups = wsdl_client.get_all_groups(token)
+        all_groups = wsdl_users.get_all_groups(token)
+        logging.info(f"[/api/groups] Admin mode: got {len(all_groups)} groups from get_all_groups")
+        # Merge user's groups with all groups to ensure none are missed
+        # (some groups might not be in v_groups view but user is still a member)
+        existing_group_ids = {g.get('group_id') for g in all_groups}
+        for ug in user_groups:
+            if ug.get('group_id') not in existing_group_ids:
+                all_groups.append(ug)
+                logging.info(f"[/api/groups] Added missing user group: {ug.get('group_id')}")
+        logging.info(f"[/api/groups] Final merged count: {len(all_groups)}")
     else:
         all_groups = user_groups
+        logging.info(f"[/api/groups] Non-admin mode: returning {len(all_groups)} user groups")
 
     # Filter by search term
     if search:

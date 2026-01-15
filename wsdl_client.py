@@ -1635,6 +1635,7 @@ def get_groups_for_user(dst, username, library='RTA_MAIN'):
 def get_all_groups(dst, library='RTA_MAIN'):
     try:
         svc_client = get_soap_client('BasicHttpBinding_IDMSvc')
+        logging.info(f"get_all_groups called with library={library}")
 
         # --- ATTEMPT 1: v_groups with various strategies ---
 
@@ -1664,6 +1665,7 @@ def get_all_groups(dst, library='RTA_MAIN'):
         }
 
         search_reply = svc_client.service.Search(**search_call)
+        logging.info(f"v_groups search result: resultCode={getattr(search_reply, 'resultCode', 'N/A')}")
 
         # Strategy 1.2: Wildcard '%' on GROUP_ID
         if not (search_reply and search_reply.resultCode == 0 and search_reply.resultSetID):
@@ -1694,12 +1696,17 @@ def get_all_groups(dst, library='RTA_MAIN'):
             result_set_id = search_reply.resultSetID
             data_client = find_client_with_operation('GetDataW') or svc_client
             method_name = 'GetDataW' if hasattr(data_client.service, 'GetDataW') else 'GetData'
-            get_data_call = {'call': {'resultSetID': result_set_id, 'requestedRows': 500, 'startingRow': 0}}
 
             try:
-                data_reply = getattr(data_client.service, method_name)(**get_data_call)
-                row_nodes = getattr(data_reply, 'rowNode', None) or getattr(data_reply, 'RowNode', None)
-                if row_nodes:
+                # Paginate through all results
+                starting_row = 0
+                batch_size = 1000
+                while True:
+                    get_data_call = {'call': {'resultSetID': result_set_id, 'requestedRows': batch_size, 'startingRow': starting_row}}
+                    data_reply = getattr(data_client.service, method_name)(**get_data_call)
+                    row_nodes = getattr(data_reply, 'rowNode', None) or getattr(data_reply, 'RowNode', None)
+                    if not row_nodes:
+                        break
                     for row in row_nodes:
                         vals = row.propValues.anyType
                         if vals:
@@ -1708,6 +1715,9 @@ def get_all_groups(dst, library='RTA_MAIN'):
                                 'group_name': vals[1] if len(vals) > 1 else vals[0],
                                 'description': vals[2] if len(vals) > 2 else ""
                             })
+                    if len(row_nodes) < batch_size:
+                        break
+                    starting_row += len(row_nodes)
             except Exception as e:
                 logging.debug(f"Error fetching data for v_groups: {e}")
             finally:
@@ -1734,11 +1744,16 @@ def get_all_groups(dst, library='RTA_MAIN'):
                     result_set_id = search_reply.resultSetID
                     data_client = find_client_with_operation('GetDataW') or svc_client
                     method_name = 'GetDataW' if hasattr(data_client.service, 'GetDataW') else 'GetData'
-                    get_data_call = {'call': {'resultSetID': result_set_id, 'requestedRows': 500, 'startingRow': 0}}
 
-                    data_reply = getattr(data_client.service, method_name)(**get_data_call)
-                    row_nodes = getattr(data_reply, 'rowNode', None) or getattr(data_reply, 'RowNode', None)
-                    if row_nodes:
+                    # Paginate through all results
+                    starting_row = 0
+                    batch_size = 1000
+                    while True:
+                        get_data_call = {'call': {'resultSetID': result_set_id, 'requestedRows': batch_size, 'startingRow': starting_row}}
+                        data_reply = getattr(data_client.service, method_name)(**get_data_call)
+                        row_nodes = getattr(data_reply, 'rowNode', None) or getattr(data_reply, 'RowNode', None)
+                        if not row_nodes:
+                            break
                         for row in row_nodes:
                             vals = row.propValues.anyType
                             if vals:
@@ -1747,6 +1762,9 @@ def get_all_groups(dst, library='RTA_MAIN'):
                                     'group_name': vals[1] if len(vals) > 1 else vals[0],
                                     'description': vals[2] if len(vals) > 2 else ""
                                 })
+                        if len(row_nodes) < batch_size:
+                            break
+                        starting_row += len(row_nodes)
 
                     try:
                         svc_client.service.ReleaseData(call={'resultSetID': result_set_id})
@@ -1773,11 +1791,16 @@ def get_all_groups(dst, library='RTA_MAIN'):
                     result_set_id = search_reply.resultSetID
                     data_client = find_client_with_operation('GetDataW') or svc_client
                     method_name = 'GetDataW' if hasattr(data_client.service, 'GetDataW') else 'GetData'
-                    get_data_call = {'call': {'resultSetID': result_set_id, 'requestedRows': 500, 'startingRow': 0}}
 
-                    data_reply = getattr(data_client.service, method_name)(**get_data_call)
-                    row_nodes = getattr(data_reply, 'rowNode', None) or getattr(data_reply, 'RowNode', None)
-                    if row_nodes:
+                    # Paginate through all results
+                    starting_row = 0
+                    batch_size = 1000
+                    while True:
+                        get_data_call = {'call': {'resultSetID': result_set_id, 'requestedRows': batch_size, 'startingRow': starting_row}}
+                        data_reply = getattr(data_client.service, method_name)(**get_data_call)
+                        row_nodes = getattr(data_reply, 'rowNode', None) or getattr(data_reply, 'RowNode', None)
+                        if not row_nodes:
+                            break
                         for row in row_nodes:
                             vals = row.propValues.anyType
                             if vals:
@@ -1786,6 +1809,9 @@ def get_all_groups(dst, library='RTA_MAIN'):
                                     'group_name': vals[1] if len(vals) > 1 else vals[0],
                                     'description': vals[2] if len(vals) > 2 else ""
                                 })
+                        if len(row_nodes) < batch_size:
+                            break
+                        starting_row += len(row_nodes)
 
                     try:
                         svc_client.service.ReleaseData(call={'resultSetID': result_set_id})
@@ -1801,6 +1827,7 @@ def get_all_groups(dst, library='RTA_MAIN'):
             groups.append({'group_id': 'DOCS_USERS', 'group_name': 'DOCS Users', 'description': 'System Users'})
             groups.append({'group_id': 'TIBCO_GROUP', 'group_name': 'TIBCO Group', 'description': ''})
 
+        logging.info(f"get_all_groups returning {len(groups)} groups")
         return groups
 
     except Exception as e:
