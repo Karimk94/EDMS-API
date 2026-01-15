@@ -89,6 +89,9 @@ async def fetch_documents_from_oracle(page=1, page_size=20, search_term=None, da
 
         where_clauses.append(doc_filter_sql.replace('AND ', '', 1))  # Strip first AND if adding to list
 
+        # Exclude documents that are in folders (have entries in FOLDER_ITEM with NODE_TYPE = 'D')
+        where_clauses.append("NOT EXISTS (SELECT 1 FROM FOLDER_ITEM fi WHERE fi.DOCNUMBER = p.DOCNUMBER AND fi.NODE_TYPE = 'D')")
+
         if media_type:
             try:
                 async with conn.cursor() as app_cursor:
