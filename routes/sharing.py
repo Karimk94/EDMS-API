@@ -150,6 +150,7 @@ async def get_share_info(token: str):
     Returns basic share link info (without requiring authentication).
     Used by frontend to determine if email is pre-set and share type.
     For restricted shares, returns full target_email to enable auto-OTP.
+    Also returns skip_otp flag - True for restricted shares to skip OTP verification.
     """
     try:
         share_info = await sharing_db.get_share_details(token)
@@ -158,16 +159,18 @@ async def get_share_info(token: str):
 
         target_email = share_info.get('target_email')
         share_type = share_info.get('share_type', 'file')
+        is_restricted = target_email is not None
 
         # For restricted shares, return full email to enable auto-OTP
         # This is safe because the link is only sent to that specific email
         return {
-            "is_restricted": target_email is not None,
+            "is_restricted": is_restricted,
             "target_email": target_email,  # Full email for auto-OTP
             "target_email_hint": target_email[:3] + "***" + target_email[
                 target_email.index('@'):] if target_email else None,
             "expiry_date": share_info.get('expiry_date'),
-            "share_type": share_type
+            "share_type": share_type,
+            "skip_otp": is_restricted  # Skip OTP for restricted shares
         }
 
     except HTTPException:
@@ -219,8 +222,11 @@ async def request_access_otp(token: str, req: ShareAccessRequest):
 @router.post('/api/share/verify-access/{token}')
 async def verify_access_otp(token: str, req: ShareVerifyRequest):
     """
-    Step 2: Verifies OTP via Database.
+    Step 2: Verifies OTP via Database (or skips for restricted shares).
     Returns document info for file shares, or folder info for folder shares.
+    
+    For restricted shares (target_email set), OTP verification can be skipped
+    by setting skip_otp=True. Open shares always require OTP verification.
     """
     try:
         viewer_email = req.viewer_email.strip().lower()
@@ -230,16 +236,31 @@ async def verify_access_otp(token: str, req: ShareVerifyRequest):
         if not is_allowed:
             raise HTTPException(status_code=403, detail=error_message)
 
-        # Verify and Consume OTP in one go
-        is_valid = await sharing_db.verify_otp(token, viewer_email, req.otp)
-
-        if not is_valid:
-            # Note: This generic message covers expired, used, or wrong OTPs for security
-            raise HTTPException(status_code=400, detail="Invalid or expired OTP.")
-
+        # Get share details to check if it's restricted
         share_info = await sharing_db.get_share_details(token)
         if not share_info:
             raise HTTPException(status_code=404, detail="Link is invalid or expired")
+
+        target_email = share_info.get('target_email')
+        is_restricted = target_email is not None
+
+        # Determine if we should skip OTP verification
+        # Only allow skipping OTP for restricted shares where viewer matches target
+        if req.skip_otp:
+            if not is_restricted:
+                raise HTTPException(
+                    status_code=400, 
+                    detail="OTP verification cannot be skipped for open shares"
+                )
+            # For restricted shares, viewer_email must match target_email (already validated above)
+            # Skip OTP verification - access is granted based on email match
+        else:
+            # Verify and Consume OTP in one go
+            is_valid = await sharing_db.verify_otp(token, viewer_email, req.otp)
+
+            if not is_valid:
+                # Note: This generic message covers expired, used, or wrong OTPs for security
+                raise HTTPException(status_code=400, detail="Invalid or expired OTP.")
 
         await sharing_db.log_share_access(share_info['share_id'], viewer_email)
 

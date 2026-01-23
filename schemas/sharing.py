@@ -53,6 +53,7 @@ class ShareInfoResponse(BaseModel):
     target_email_hint: Optional[str] = None  # Masked for display
     expiry_date: Optional[datetime] = None
     share_type: str = "file"
+    skip_otp: bool = False  # True for restricted shares, False for open shares
 
 class ShareAccessRequest(BaseModel):
     """Request model for requesting OTP access to a shared document."""
@@ -79,7 +80,8 @@ class ShareAccessResponse(BaseModel):
 class ShareVerifyRequest(BaseModel):
     """Request model for verifying OTP access."""
     viewer_email: str
-    otp: str
+    otp: Optional[str] = None  # Optional when skip_otp is True
+    skip_otp: bool = False  # True to skip OTP verification for restricted shares
 
     @field_validator('viewer_email')
     @classmethod
@@ -92,10 +94,18 @@ class ShareVerifyRequest(BaseModel):
     @field_validator('otp')
     @classmethod
     def validate_otp(cls, v):
-        v = v.strip()
-        if not v.isdigit() or len(v) != 6:
-            raise ValueError("OTP must be a 6-digit number")
+        if v is not None:
+            v = v.strip()
+            if not v.isdigit() or len(v) != 6:
+                raise ValueError("OTP must be a 6-digit number")
         return v
+
+    @model_validator(mode='after')
+    def validate_otp_required(self):
+        """OTP is required when skip_otp is False."""
+        if not self.skip_otp and not self.otp:
+            raise ValueError("OTP is required when skip_otp is False")
+        return self
 
 class SharedFolderContentsRequest(BaseModel):
     """Request model for getting shared folder contents."""
