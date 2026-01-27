@@ -559,9 +559,6 @@ def rename_folder_display(dst, content_item_system_id, new_name):
             logging.error(f"Rename failed. ResultCode: {response.resultCode}, Error: {error_msg}")
             return False
 
-    except Fault as f:
-        logging.error(f"SOAP Fault: {f.message}", exc_info=True)
-        return False
     except Exception as e:
         logging.error(f"Error in rename_folder_display: {e}", exc_info=True)
         return False

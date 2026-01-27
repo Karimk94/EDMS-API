@@ -1,8 +1,10 @@
 from fastapi import APIRouter, HTTPException, Header, Request, Query, Depends
+from fastapi.concurrency import run_in_threadpool
 import db_connector
 from database import sharing as sharing_db
 from database import documents as documents_db
 from database import folders as folders_db
+
 from schemas.sharing import (
     ShareLinkCreateRequest,
     ShareAccessRequest,
@@ -14,9 +16,11 @@ import logging
 import os
 import random
 from datetime import datetime
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, FileResponse
 import io
+import re
 import wsdl_client
+from database.media import video_cache_dir
 
 from utils.common import send_otp_email, send_share_link_email
 from utils.watermark import apply_watermark_to_image, apply_watermark_to_pdf, apply_watermark_to_video
@@ -362,6 +366,117 @@ async def get_shared_folder_contents(
         logging.error(f"Folder contents error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+@router.get('/api/share/stream/{token}')
+async def stream_shared_document(
+        token: str,
+        req: SharedDocumentDownloadRequest = Depends()
+):
+    """
+    Streams a shared document without watermark for viewing.
+    Optimized for video streaming (supports Range requests via cache).
+    """
+    try:
+        viewer_email = req.viewer_email
+        doc_id = req.doc_id
+
+        # 1. Validate email access
+        is_allowed, error_message = await sharing_db.validate_target_email_access(token, viewer_email)
+        if not is_allowed:
+            raise HTTPException(status_code=403, detail=error_message)
+
+        # 2. Verify the share link is valid
+        share_info = await sharing_db.get_share_details(token)
+        if not share_info:
+            raise HTTPException(status_code=404, detail="Link is invalid or expired")
+
+        # 3. Verify the viewer has verified access via OTP
+        has_access = await sharing_db.check_viewer_access(token, viewer_email)
+        if not has_access:
+            raise HTTPException(status_code=403, detail="Access not verified.")
+
+        # 4. Determine document ID
+        share_type = share_info.get('share_type', 'file')
+
+        if share_type == 'folder':
+            if not doc_id:
+                raise HTTPException(status_code=400, detail="doc_id is required for folder shares")
+            
+            # Verify document in folder hierarchy
+            root_folder_id = str(share_info['folder_id'])
+            is_in_folder = await folders_db.verify_document_in_folder(root_folder_id, str(doc_id))
+            if not is_in_folder:
+                raise HTTPException(status_code=403, detail="Document outside shared scope")
+            
+            document_id = doc_id
+        else:
+            document_id = share_info['document_id']
+
+        # 5. Login with system credentials
+        dst = wsdl_client.dms_system_login()
+        if not dst:
+            raise HTTPException(status_code=500, detail="Failed to authenticate with DMS")
+
+        # 6. Get document info
+        filename, media_type, file_ext = await db_connector.get_media_info_from_dms(dst, document_id)
+        if not filename:
+            raise HTTPException(status_code=404, detail="Document not found")
+
+        if file_ext and not filename.lower().endswith(file_ext.lower()):
+            filename = f"{filename}{file_ext}"
+
+        # 7. For Video: Cache RAW (no watermark) and serve FileResponse
+        if media_type == 'video':
+            # Create a separate cache for raw shared videos
+            cache_filename = f"share_raw_{document_id}{file_ext}"
+            cache_filepath = os.path.join(video_cache_dir, cache_filename)
+
+            if not os.path.exists(cache_filepath):
+                file_bytes = db_connector.get_media_content_from_dms(dst, document_id)
+                if not file_bytes:
+                    raise HTTPException(status_code=500, detail="Failed to retrieve content")
+                
+                # Verify video dict exists
+                if not os.path.exists(video_cache_dir):
+                    os.makedirs(video_cache_dir)
+
+                with open(cache_filepath, 'wb') as f:
+                    f.write(file_bytes)
+            
+            # Serve as file (supports Range requests)
+            return FileResponse(
+                cache_filepath,
+                media_type=f"video/{file_ext.replace('.', '')}",
+                filename=filename,
+                headers={
+                    "Content-Disposition": "inline", # Inline for playback
+                    "Accept-Ranges": "bytes"
+                }
+            )
+
+        # 8. For other files, just stream inline (no watermark)
+        file_bytes = db_connector.get_media_content_from_dms(dst, document_id)
+        if not file_bytes:
+            raise HTTPException(status_code=500, detail="Failed to retrieve content")
+
+        mimetype = 'application/octet-stream'
+        if media_type == 'pdf': mimetype = 'application/pdf'
+        elif media_type == 'image': mimetype = 'image/jpeg'
+        elif media_type == 'text': mimetype = 'text/plain'
+
+        return StreamingResponse(
+            io.BytesIO(file_bytes),
+            media_type=mimetype,
+            headers={
+                "Content-Disposition": "inline"
+            }
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logging.error(f"Stream error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 @router.get('/api/share/download/{token}')
 async def download_shared_document(
         token: str,
@@ -438,11 +553,48 @@ async def download_shared_document(
         processed_bytes = file_bytes
 
         if media_type == 'image':
-            processed_bytes, mimetype = apply_watermark_to_image(file_bytes, watermark_text)
+            processed_bytes, mimetype = await run_in_threadpool(apply_watermark_to_image, file_bytes, watermark_text)
         elif media_type == 'pdf':
-            processed_bytes, mimetype = apply_watermark_to_pdf(file_bytes, watermark_text)
+            processed_bytes, mimetype = await run_in_threadpool(apply_watermark_to_pdf, file_bytes, watermark_text)
         elif media_type == 'video':
-            processed_bytes, mimetype = apply_watermark_to_video(file_bytes, watermark_text, filename)
+            # Video Caching Logic
+            safe_email = re.sub(r'[^a-zA-Z0-9]', '_', viewer_email)
+            cache_filename = f"share_{document_id}_{safe_email}{file_ext}"
+            cache_filepath = os.path.join(video_cache_dir, cache_filename)
+
+            if os.path.exists(cache_filepath):
+                return FileResponse(
+                    cache_filepath,
+                    media_type=f"video/{file_ext.replace('.', '')}",
+                    filename=filename,
+                    headers={
+                        "Content-Disposition": f'attachment; filename="{filename}"',
+                        "Access-Control-Expose-Headers": "Content-Disposition"
+                    }
+                )
+
+            processed_bytes, mimetype = await run_in_threadpool(apply_watermark_to_video, file_bytes, watermark_text, filename)
+            
+            # Save to cache
+            try:
+                with open(cache_filepath, 'wb') as f:
+                    f.write(processed_bytes)
+                
+                # Serve from file to enable range requests (seeking)
+                return FileResponse(
+                    cache_filepath,
+                    media_type=mimetype,
+                    filename=filename,
+                    headers={
+                        "Content-Disposition": f'attachment; filename="{filename}"',
+                        "Access-Control-Expose-Headers": "Content-Disposition"
+                    }
+                )
+            except Exception as e:
+                logging.error(f"Failed to cache video: {e}")
+                # Fallback to streaming if cache save fails
+                pass 
+
         elif media_type == 'text':
             mimetype = "text/plain"
         elif media_type == 'excel':

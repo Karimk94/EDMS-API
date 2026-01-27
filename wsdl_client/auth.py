@@ -70,8 +70,7 @@ def dms_user_login(username, password):
                 }
 
                 search_reply = svc_client.service.Search(**search_call)
-                logging.info(
-                    f"[DEBUG USER] Search for {username} in DOCS_USERS - resultCode: {getattr(search_reply, 'resultCode', 'N/A')}")
+                # logging.info(f"[DEBUG USER] Search for {username} in DOCS_USERS - resultCode: {getattr(search_reply, 'resultCode', 'N/A')}")
 
                 if search_reply and search_reply.resultCode == 0 and search_reply.resultSetID:
                     data_client = find_client_with_operation('GetDataW') or svc_client
@@ -86,10 +85,9 @@ def dms_user_login(username, password):
                     if row_nodes:
                         for idx, row in enumerate(row_nodes):
                             vals = row.propValues.anyType if hasattr(row, 'propValues') else []
-                            logging.info(
-                                f"[DEBUG USER] {username} record: USER_ID={vals[0] if len(vals) > 0 else ''}, FULL_NAME={vals[1] if len(vals) > 1 else ''}, GROUP_ID={vals[2] if len(vals) > 2 else ''}, DISABLED={vals[3] if len(vals) > 3 else ''}")
-                    else:
-                        logging.info(f"[DEBUG USER] {username} NOT FOUND in v_peoplegroups for DOCS_USERS")
+                            # logging.info(f"[DEBUG USER] {username} record: USER_ID={vals[0] if len(vals) > 0 else ''}, FULL_NAME={vals[1] if len(vals) > 1 else ''}, GROUP_ID={vals[2] if len(vals) > 2 else ''}, DISABLED={vals[3] if len(vals) > 3 else ''}")
+                    # else:
+                    #     logging.info(f"[DEBUG USER] {username} NOT FOUND in v_peoplegroups for DOCS_USERS")
 
                     try:
                         svc_client.service.ReleaseData(call={'resultSetID': search_reply.resultSetID})
@@ -101,6 +99,6 @@ def dms_user_login(username, password):
 
             return dst
 
-        return None
-    except Exception:
+    except Exception as e:
+        logging.error(f"[DEBUG USER] Error: {e}")
         return None
