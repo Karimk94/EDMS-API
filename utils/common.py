@@ -497,13 +497,6 @@ def get_share_link_email_template(
                                 Or copy this link: <br/>
                                 <a href="{share_link}" style="color: {primary_color}; word-break: break-all;">{share_link}</a>
                             </p>
-
-                            <!-- Security Notice -->
-                            <div style="background-color: #e8f4fd; border-left: 3px solid {primary_color}; border-radius: 4px; padding: 10px 12px; margin-top: 25px;">
-                                <p style="color: #0056b3; font-size: 11px; margin: 0; line-height: 1.5;">
-                                    <strong>🔒 Secure Access:</strong> You will need to verify your email address ({recipient_email}) with a one-time code to access this document.
-                                </p>
-                            </div>
                         </td>
                     </tr>
 
