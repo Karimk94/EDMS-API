@@ -30,7 +30,7 @@ def dms_user_login(username, password):
         client = get_soap_client()
         if not hasattr(client.service, 'LoginSvr5'):
             client = find_client_with_operation('LoginSvr5')
-            if not client: return None
+            if not client: return None, "Could not connect to EDMS service"
 
         login_info_type = client.get_type(
             '{http://schemas.datacontract.org/2004/07/OpenText.DMSvr.Serializable}DMSvrLoginInfo')
@@ -97,8 +97,14 @@ def dms_user_login(username, password):
             except Exception as e:
                 logging.error(f"[DEBUG USER] Error: {e}")
 
-            return dst
+            return dst, None
+        else:
+            # Try to get error message from response
+            error_msg = getattr(response, 'errMsg', 'Unknown EDMS error')
+            if not error_msg and hasattr(response, 'resultCode'):
+                 error_msg = f"EDMS Error Code: {response.resultCode}"
+            return None, error_msg
 
     except Exception as e:
         logging.error(f"[DEBUG USER] Error: {e}")
-        return None
+        return None, str(e)

@@ -11,8 +11,13 @@ router = APIRouter()
 
 @router.post('/api/auth/login')
 async def login(request: Request, creds: LoginRequest):
-    dst = wsdl_client.dms_user_login(creds.username, creds.password)
+    dst, error_msg = wsdl_client.dms_user_login(creds.username, creds.password)
     if dst:
+        # Mandatory: Check if user exists in Smart EDMS local DB
+        db_user = await db_connector.get_user_details(creds.username)
+        if not db_user:
+            raise HTTPException(status_code=403, detail="User doesn't have smart EDMS account")
+
         # Get user's groups from DMS (proven working query)
         try:
             user_groups = wsdl_client.get_groups_for_user(dst, creds.username)
@@ -22,15 +27,15 @@ async def login(request: Request, creds: LoginRequest):
             security_str = {9: 'Admin', 5: 'Editor', 0: 'Viewer'}.get(security_level, 'Viewer')
         except Exception as e:
             logging.error(f"Could not get DMS groups for {creds.username}: {e}")
-            # Fallback to DB
-            db_user = await db_connector.get_user_details(creds.username)
-            if not db_user or 'security_level' not in db_user:
+            # Fallback to DB security level since DMS failed
+            # db_user is already guaranteed to exist here
+            if 'security_level' not in db_user:
                 raise HTTPException(status_code=401, detail="User not authorized")
             security_str = db_user.get('security_level', 'Viewer')
             security_level = processor.get_security_level_int(security_str)
 
-        # Get preferences from DB (lang, theme)
-        db_prefs = await db_connector.get_user_details(creds.username)
+        # Use already fetched db_user for preferences
+        db_prefs = db_user
 
         user_details = {
             'username': creds.username,
@@ -44,7 +49,7 @@ async def login(request: Request, creds: LoginRequest):
         request.session['user'] = user_details
         return {"message": "Login successful", "user": user_details}
     else:
-        raise HTTPException(status_code=401, detail="Invalid DMS credentials")
+        raise HTTPException(status_code=401, detail=error_msg or "Invalid DMS credentials")
 
 @router.post('/api/auth/logout')
 async def logout(request: Request):
