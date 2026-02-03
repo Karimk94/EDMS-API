@@ -11,7 +11,7 @@ import db_connector
 from  utils import common
 import wsdl_client
 from services.processor import process_document
-from utils.watermark import apply_watermark_to_image, apply_watermark_to_pdf, apply_watermark_to_video
+from utils.watermark import apply_watermark_to_image, apply_watermark_to_pdf, apply_watermark_to_video, apply_watermark_to_video_async
 from schemas.documents import ProcessUploadRequest, UpdateMetadataRequest, UpdateAbstractRequest, LinkEventRequest, SetTrusteesRequest
 
 router = APIRouter()
@@ -306,7 +306,7 @@ async def api_download_watermarked(doc_id: int, request: Request):
     elif media_type == 'pdf':
         processed_bytes, mimetype = apply_watermark_to_pdf(file_bytes, watermark_text)
     elif media_type == 'video':
-        processed_bytes, mimetype = apply_watermark_to_video(file_bytes, watermark_text, filename)
+        processed_bytes, mimetype = await apply_watermark_to_video_async(file_bytes, watermark_text, filename)
     elif media_type == 'excel':
         mimetype = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     elif media_type == 'powerpoint':

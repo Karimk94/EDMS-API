@@ -23,7 +23,7 @@ import wsdl_client
 from database.media import video_cache_dir
 
 from utils.common import send_otp_email, send_share_link_email
-from utils.watermark import apply_watermark_to_image, apply_watermark_to_pdf, apply_watermark_to_video
+from utils.watermark import apply_watermark_to_image, apply_watermark_to_pdf, apply_watermark_to_video, apply_watermark_to_video_async
 
 router = APIRouter()
 ALLOWED_DOMAIN = "@rta.ae"
@@ -427,7 +427,7 @@ async def stream_shared_document(
         # 7. For Video: Cache RAW (no watermark) and serve FileResponse
         if media_type == 'video':
             # Create a separate cache for raw shared videos
-            cache_filename = f"share_raw_{document_id}{file_ext}"
+            cache_filename = f"{document_id}{file_ext}"
             cache_filepath = os.path.join(video_cache_dir, cache_filename)
 
             if not os.path.exists(cache_filepath):
@@ -541,12 +541,36 @@ async def download_shared_document(
         if file_ext and not filename.lower().endswith(file_ext.lower()):
             filename = f"{filename}{file_ext}"
 
-        file_bytes = db_connector.get_media_content_from_dms(dst, document_id)
+        # 6. Get content (Check Cache -> Download -> Populate Cache)
+        file_bytes = None
+        raw_cache_path = None
+        
+        if media_type == 'video':
+            raw_cache_path = os.path.join(video_cache_dir, f"{document_id}{file_ext}")
+            if os.path.exists(raw_cache_path):
+                logging.info(f"Using existing global raw cache for shared download: {document_id}{file_ext}")
+                try:
+                    with open(raw_cache_path, 'rb') as f:
+                        file_bytes = f.read()
+                except Exception as e:
+                    logging.warning(f"Failed to read cache {raw_cache_path}: {e}")
+
         if not file_bytes:
-            raise HTTPException(status_code=500, detail="Failed to retrieve document content")
+            file_bytes = db_connector.get_media_content_from_dms(dst, document_id)
+            if not file_bytes:
+                raise HTTPException(status_code=500, detail="Failed to retrieve document content")
+            
+            # Populate cache if it's a video and we just downloaded it
+            if media_type == 'video' and raw_cache_path:
+                try:
+                    with open(raw_cache_path, 'wb') as f:
+                        f.write(file_bytes)
+                    logging.info(f"Populated global raw cache for: {document_id}{file_ext}")
+                except Exception as e:
+                    logging.warning(f"Failed to populate global cache: {e}")
 
         # 7. Create watermark text using viewer_email
-        watermark_text = f"{viewer_email} | {document_id} | {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+        watermark_text = f"{viewer_email} - {document_id} | {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
 
         # 8. Determine mime type and apply watermark based on media type
         mimetype = 'application/octet-stream'
@@ -557,44 +581,11 @@ async def download_shared_document(
         elif media_type == 'pdf':
             processed_bytes, mimetype = await run_in_threadpool(apply_watermark_to_pdf, file_bytes, watermark_text)
         elif media_type == 'video':
-            # Video Caching Logic
-            safe_email = re.sub(r'[^a-zA-Z0-9]', '_', viewer_email)
-            cache_filename = f"share_{document_id}_{safe_email}{file_ext}"
-            cache_filepath = os.path.join(video_cache_dir, cache_filename)
-
-            if os.path.exists(cache_filepath):
-                return FileResponse(
-                    cache_filepath,
-                    media_type=f"video/{file_ext.replace('.', '')}",
-                    filename=filename,
-                    headers={
-                        "Content-Disposition": f'attachment; filename="{filename}"',
-                        "Access-Control-Expose-Headers": "Content-Disposition"
-                    }
-                )
-
-            processed_bytes, mimetype = await run_in_threadpool(apply_watermark_to_video, file_bytes, watermark_text, filename)
+            # Note: We do NOT cache watermarked videos anymore per user request.
+            # They are generated on-the-fly and streamed, leaving no residual files.
+            # Use async version to support cancellation (client disconnect stops processing)
+            processed_bytes, mimetype = await apply_watermark_to_video_async(file_bytes, watermark_text, filename)
             
-            # Save to cache
-            try:
-                with open(cache_filepath, 'wb') as f:
-                    f.write(processed_bytes)
-                
-                # Serve from file to enable range requests (seeking)
-                return FileResponse(
-                    cache_filepath,
-                    media_type=mimetype,
-                    filename=filename,
-                    headers={
-                        "Content-Disposition": f'attachment; filename="{filename}"',
-                        "Access-Control-Expose-Headers": "Content-Disposition"
-                    }
-                )
-            except Exception as e:
-                logging.error(f"Failed to cache video: {e}")
-                # Fallback to streaming if cache save fails
-                pass 
-
         elif media_type == 'text':
             mimetype = "text/plain"
         elif media_type == 'excel':
