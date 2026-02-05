@@ -13,6 +13,7 @@ import wsdl_client
 from services.processor import process_document
 from utils.watermark import apply_watermark_to_image, apply_watermark_to_pdf, apply_watermark_to_video, apply_watermark_to_video_async
 from schemas.documents import ProcessUploadRequest, UpdateMetadataRequest, UpdateAbstractRequest, LinkEventRequest, SetTrusteesRequest
+from database import user_data
 
 router = APIRouter()
 
@@ -95,7 +96,7 @@ async def process_batch(background_tasks: BackgroundTasks):
 
 
 @router.post('/api/upload_document')
-async def api_upload_document(file: UploadFile = File(...), docname: Optional[str] = Form(None),
+async def api_upload_document(request: Request, file: UploadFile = File(...), docname: Optional[str] = Form(None),
                               abstract: str = Form("Uploaded via EDMS Viewer"),
                               event_id: Optional[str] = Form(None), parent_id: Optional[str] = Form(None),
                               date_taken: Optional[str] = Form(None),
@@ -105,6 +106,47 @@ async def api_upload_document(file: UploadFile = File(...), docname: Optional[st
 
     file_bytes = file.file.read()
     file.file.seek(0)
+    file_size = len(file_bytes)
+
+    # --- Quota Check ---
+    user = request.session.get('user')
+    if user:
+        # We need the EDMS User ID (System ID from LKP_EDMS_USR_SECUR)
+        # The session user might just have username.
+        # We need to fetch the system ID.
+        username = user.get('username')
+        # We can implement a quick lookup or cache, but for now let's use the DB helper we have
+        # Wait, we need "edms_user_id" which is from LKP_EDMS_USR_SECUR, not PEOPLE.system_id.
+        # Let's get "people system ID" first then "edms user id".
+        # Actually admin_db has get_all_edms_users but not get_one.
+        # Let's add a helper or use a direct query here? Or use user_data module?
+        # Ideally we should fetch this info cleanly.
+        # db_connector.get_user_system_id gets PEOPLE.SYSTEM_ID.
+        
+        # Let's do a direct lookup for efficiency or add to user_data?
+        # Let's assume we can query it.
+        
+        # Optimization: To avoid circular imports or complex logic, let's just query here using existing connection?
+        # No, let's do it properly. Add a helper in db_connector to get EDMS system ID?
+        # Or better, let's use db_connector to get people_id then query security table.
+        
+        people_id = await db_connector.get_user_system_id(username)
+        if people_id:
+             # Find EDMS ID
+             conn = await db_connector.get_async_connection()
+             if conn:
+                 try:
+                     async with conn.cursor() as cursor:
+                         await cursor.execute("SELECT SYSTEM_ID FROM LKP_EDMS_USR_SECUR WHERE USER_ID = :1", [people_id])
+                         res = await cursor.fetchone()
+                         if res:
+                             edms_user_id = res[0]
+                             current_quota = await user_data.get_user_quota(edms_user_id)
+                             if file_size > current_quota:
+                                 raise HTTPException(status_code=400, detail=f"Upload exceeds remaining quota. Remaining: {current_quota} bytes, File: {file_size} bytes.")
+                 finally:
+                     await conn.close()
+    # -------------------
 
     if date_taken:
         try:
@@ -142,6 +184,10 @@ async def api_upload_document(file: UploadFile = File(...), docname: Optional[st
     new_doc_number = await wsdl_client.upload_document_to_dms(dst, file.file, metadata, parent_id=parent_id)
 
     if new_doc_number:
+        # --- Deduct Quota ---
+        if user and 'edms_user_id' in locals():
+            await user_data.deduct_user_quota(edms_user_id, file_size)
+        # --------------------
         return {"success": True, "docnumber": new_doc_number, "filename": original_filename}
     else:
         raise HTTPException(status_code=500, detail="Failed to upload file to DMS.")

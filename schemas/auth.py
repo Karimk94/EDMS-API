@@ -42,6 +42,7 @@ class EdmsUserResponse(BaseModel):
     security_level_id: int
     lang: str
     theme: str
+    quota: int
 
 
 class AddEdmsUserRequest(BaseModel):
@@ -49,6 +50,7 @@ class AddEdmsUserRequest(BaseModel):
     security_level_id: int
     lang: str = 'en'
     theme: str = 'light'
+    quota: int = 1073741824
 
 
 class SecurityLevelResponse(BaseModel):
@@ -66,3 +68,5 @@ class UpdateEdmsUserRequest(BaseModel):
     security_level_id: int
     lang: str = 'en'
     theme: str = 'light'
+    remaining_quota: Optional[int] = None
+    quota: Optional[int] = None

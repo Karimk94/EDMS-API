@@ -54,10 +54,13 @@ async def get_all_edms_users(search: str = "", page: int = 1, limit: int = 20):
                         us.SECURITY_LEVEL_ID,
                         us.LANG,
                         us.THEME,
+                        COALESCE(ud.REMAINING_QUOTA, 1073741824) as REMAINING_QUOTA,
+                        COALESCE(ud.QUOTA, 1073741824) as QUOTA,
                         ROW_NUMBER() OVER (ORDER BY p.USER_ID) as rn
                     FROM LKP_EDMS_USR_SECUR us
                     JOIN PEOPLE p ON us.USER_ID = p.SYSTEM_ID
                     JOIN LKP_EDMS_SECURITY sl ON us.SECURITY_LEVEL_ID = sl.SYSTEM_ID
+                    LEFT JOIN LKP_EDMS_USR_DATA ud ON us.SYSTEM_ID = ud.USER_ID
                     WHERE 1=1 {search_condition}
                 )
                 WHERE rn > :offset AND rn <= :end_row
@@ -78,7 +81,9 @@ async def get_all_edms_users(search: str = "", page: int = 1, limit: int = 20):
                     'security_level': row[4],
                     'security_level_id': row[5],
                     'lang': row[6] or 'en',
-                    'theme': row[7] or 'light'
+                    'theme': row[7] or 'light',
+                    'remaining_quota': row[8],
+                    'quota': row[9],
                 })
     except oracledb.Error as e:
         logging.error(f"Oracle Database error in get_all_edms_users: {e}", exc_info=True)
@@ -121,7 +126,7 @@ async def get_security_levels():
     return levels
 
 
-async def add_edms_user(user_system_id: int, security_level_id: int, lang: str = 'en', theme: str = 'light'):
+async def add_edms_user(user_system_id: int, security_level_id: int, lang: str = 'en', theme: str = 'light', quota: int = 1073741824):
     """Adds a new user to LKP_EDMS_USR_SECUR table."""
     conn = await get_async_connection()
     if not conn:
@@ -149,6 +154,17 @@ async def add_edms_user(user_system_id: int, security_level_id: int, lang: str =
                 lang=lang,
                 theme=theme
             )
+            
+            # Get the newly created EDMS User ID
+            await cursor.execute("SELECT SYSTEM_ID FROM LKP_EDMS_USR_SECUR WHERE USER_ID = :1", [user_system_id])
+            edms_user_id = (await cursor.fetchone())[0]
+
+            # Initialize Quota
+            await cursor.execute(
+                "INSERT INTO LKP_EDMS_USR_DATA (SYSTEM_ID, USER_ID, REMAINING_QUOTA, QUOTA, DISABLED) VALUES ((SELECT NVL(MAX(SYSTEM_ID), 0) + 1 FROM LKP_EDMS_USR_DATA), :1, :2, :3, '0')",
+                [edms_user_id, quota, quota]
+            )
+
             await conn.commit()
             return True, "User added successfully"
             
@@ -169,6 +185,9 @@ async def delete_edms_user(edms_user_id: int):
 
     try:
         async with conn.cursor() as cursor:
+            # Delete quota data first (FK)
+            await cursor.execute("DELETE FROM LKP_EDMS_USR_DATA WHERE USER_ID = :edms_user_id", edms_user_id=edms_user_id)
+
             delete_query = "DELETE FROM LKP_EDMS_USR_SECUR WHERE SYSTEM_ID = :edms_user_id"
             await cursor.execute(delete_query, edms_user_id=edms_user_id)
             
@@ -187,7 +206,7 @@ async def delete_edms_user(edms_user_id: int):
             await conn.close()
 
 
-async def update_edms_user(edms_user_id: int, security_level_id: int, lang: str = 'en', theme: str = 'light'):
+async def update_edms_user(edms_user_id: int, security_level_id: int, lang: str = 'en', theme: str = 'light', remaining_quota: int = None, quota: int = None):
     """Updates an existing user in LKP_EDMS_USR_SECUR table."""
     conn = await get_async_connection()
     if not conn:
@@ -212,6 +231,27 @@ async def update_edms_user(edms_user_id: int, security_level_id: int, lang: str 
             
             if cursor.rowcount == 0:
                 return False, "User not found"
+
+            # Update User Data if quota or remaining_quota is provided
+            if remaining_quota is not None or quota is not None:
+                # Check if record exists
+                await cursor.execute("SELECT COUNT(*) FROM LKP_EDMS_USR_DATA WHERE USER_ID = :1", [edms_user_id])
+                exists = (await cursor.fetchone())[0] > 0
+                
+                if exists:
+                    if remaining_quota is not None:
+                         await cursor.execute("UPDATE LKP_EDMS_USR_DATA SET REMAINING_QUOTA = :1 WHERE USER_ID = :2", [remaining_quota, edms_user_id])
+                    if quota is not None:
+                         await cursor.execute("UPDATE LKP_EDMS_USR_DATA SET QUOTA = :1 WHERE USER_ID = :2", [quota, edms_user_id])
+                else:
+                    # Insert new record if not exists
+                     current_quota = quota if quota is not None else 1073741824
+                     current_remaining = remaining_quota if remaining_quota is not None else current_quota
+                     await cursor.execute(
+                        "INSERT INTO LKP_EDMS_USR_DATA (SYSTEM_ID, USER_ID, REMAINING_QUOTA, QUOTA, DISABLED) VALUES ((SELECT NVL(MAX(SYSTEM_ID), 0) + 1 FROM LKP_EDMS_USR_DATA), :1, :2, :3, '0')", 
+                        [edms_user_id, current_remaining, current_quota]
+                    )
+
             
             await conn.commit()
             return True, "User updated successfully"

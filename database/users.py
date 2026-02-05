@@ -57,23 +57,28 @@ async def get_user_details(username):
             if user_result:
                 user_id = user_result[0]
 
-                # Now, get details from the EDMS security table
+                # Now, get details from the EDMS security and data tables
                 query = """
-                    SELECT sl.NAME, us.LANG, us.THEME
+                    SELECT sl.NAME, us.LANG, us.THEME, 
+                           COALESCE(ud.QUOTA, 1073741824), 
+                           COALESCE(ud.REMAINING_QUOTA, COALESCE(ud.QUOTA, 1073741824))
                     FROM LKP_EDMS_USR_SECUR us
                     JOIN LKP_EDMS_SECURITY sl ON us.SECURITY_LEVEL_ID = sl.SYSTEM_ID
+                    LEFT JOIN LKP_EDMS_USR_DATA ud ON us.SYSTEM_ID = ud.USER_ID
                     WHERE us.USER_ID = :user_id
                 """
                 await cursor.execute(query, user_id=user_id)
                 details_result = await cursor.fetchone()
 
                 if details_result:
-                    security_level, lang, theme = details_result
+                    security_level, lang, theme, quota, remaining_quota = details_result
                     user_details = {
                         'username': username,
                         'security_level': security_level,
-                        'lang': lang or 'en',  # Default to 'en'
-                        'theme': theme or 'light' # Default to 'light'
+                        'lang': lang or 'en',
+                        'theme': theme or 'light',
+                        'quota': quota,
+                        'remaining_quota': remaining_quota
                     }
                 else:
                     logging.warning(f"No security details found for user_id {user_id} (DMS user: {username})")

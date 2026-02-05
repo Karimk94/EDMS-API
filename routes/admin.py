@@ -76,7 +76,8 @@ async def add_user(request: Request, user_data: AddEdmsUserRequest):
         user_system_id=user_data.user_system_id,
         security_level_id=user_data.security_level_id,
         lang=user_data.lang,
-        theme=user_data.theme
+        theme=user_data.theme,
+        quota=user_data.quota
     )
     
     if not success:
@@ -109,7 +110,9 @@ async def update_user(request: Request, edms_user_id: int, user_data: UpdateEdms
         edms_user_id=edms_user_id,
         security_level_id=user_data.security_level_id,
         lang=user_data.lang,
-        theme=user_data.theme
+        theme=user_data.theme,
+        remaining_quota=user_data.remaining_quota,
+        quota=user_data.quota
     )
     
     if not success:
