@@ -53,7 +53,7 @@ async def login(request: Request, creds: LoginRequest):
 
 @router.post('/api/auth/logout')
 async def logout(request: Request):
-    request.session.pop('user', None)
+    request.session.clear()
     return {"message": "Logout successful"}
 
 @router.get('/api/auth/user')
