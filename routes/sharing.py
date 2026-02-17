@@ -592,6 +592,8 @@ async def download_shared_document(
             mimetype = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         elif media_type == 'powerpoint':
             mimetype = "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+        elif media_type in ['word', 'docx', 'doc']:
+            mimetype = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 
         # 9. Log the download
         await sharing_db.log_share_access(share_info['share_id'], viewer_email)
