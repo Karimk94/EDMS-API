@@ -128,23 +128,16 @@ async def api_delete_folder(folder_id: str, request: Request, force: bool = Fals
 
         # Check for specific "Referenced by" error to prompt user
         if "referenced by one or more folders" in message.lower() or "referenced" in message.lower():
-            if not force:
+            # Automatically proceed to force delete without confirmation
+            contents_deleted = await wsdl_client.delete_folder_contents(dst, folder_id, delete_root=True)
+
+            if not contents_deleted:
                 raise HTTPException(
-                    status_code=409,
-                    detail=f"Folder is not empty or contains referenced items. Use force delete to remove all contents. Error: {message}"
+                    status_code=500,
+                    detail="Failed to clear folder contents. Some items may still be referenced elsewhere. Check logs for details."
                 )
-            else:
-                # User confirmed Force Delete
 
-                contents_deleted = await wsdl_client.delete_folder_contents(dst, folder_id, delete_root=True)
-
-                if not contents_deleted:
-                    raise HTTPException(
-                        status_code=500,
-                        detail="Failed to clear folder contents. Some items may still be referenced elsewhere. Check logs for details."
-                    )
-
-                return {"message": "Folder and contents deleted", "id": folder_id}
+            return {"message": "Folder and contents deleted", "id": folder_id}
 
         # Other errors
         raise HTTPException(status_code=500, detail=f"Delete failed: {message}")
