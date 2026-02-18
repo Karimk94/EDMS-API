@@ -10,7 +10,7 @@ from moviepy.video.io.VideoFileClip import VideoFileClip
 from zeep import Client, Settings
 from zeep.exceptions import Fault
 import wsdl_client
-from database.connection import get_connection
+from database.connection import get_connection, get_async_connection
 
 # --- Cache Directory Setup ---
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -22,6 +22,13 @@ if not os.path.exists(video_cache_dir): os.makedirs(video_cache_dir)
 def dms_system_login():
     """Logs into the DMS SOAP service using system credentials."""
     return wsdl_client.dms_system_login()
+
+def stream_document_from_dms(dst, doc_number):
+    """
+    Returns a generator that yields file content chunks and the filename.
+    Returns: (generator, filename)
+    """
+    return wsdl_client.stream_document_content(dst, doc_number)
 
 def get_exif_date(image_stream):
     """Extracts the 'Date Taken' from image EXIF data."""
@@ -43,11 +50,37 @@ def get_exif_date(image_stream):
         image_stream.seek(0)
     return None
 
+async def get_document_metadata_from_db(doc_number):
+    """Fetches DOCNAME and DEFAULT_EXTENSION from Oracle DB."""
+    conn = await get_async_connection()
+    if not conn: return None, None
+    try:
+        async with conn.cursor() as cursor:
+            # Query PROFILE and APPS. 
+            # Note: APPS join based on resolve_media_types_from_db logic
+            sql = """
+                SELECT p.DOCNAME, a.DEFAULT_EXTENSION
+                FROM PROFILE p
+                LEFT JOIN APPS a ON p.APPLICATION = a.SYSTEM_ID
+                WHERE p.DOCNUMBER = :doc_number
+            """
+            await cursor.execute(sql, {'doc_number': doc_number})
+            row = await cursor.fetchone()
+            if row:
+                return row[0], row[1]
+    except Exception as e:
+        logging.error(f"Error fetching DB metadata for {doc_number}: {e}")
+    finally:
+        await conn.close()
+    return None, None
+
 async def get_media_info_from_dms(dst, doc_number):
     """
-    Efficiently retrieves only the metadata (like filename) for a document from the DMS
-    without downloading the full file content. Uses DB resolution for media type.
+    Efficiently retrieves metadata. Prioritizes Oracle DB for Filename/DocName.
     """
+    # 1. Fetch metadata from Oracle DB (Async)
+    db_docname, db_def_ext = await get_document_metadata_from_db(doc_number)
+    
     try:
         settings = Settings(strict=False, xml_huge_tree=True)
         wsdl_url = os.getenv("WSDL_URL")
@@ -69,16 +102,41 @@ async def get_media_info_from_dms(dst, doc_number):
             return None, 'image', ''
 
         filename = f"{doc_number}"  # Default
+        system_filename = None
+
         if doc_reply.docProperties and doc_reply.docProperties.propertyValues:
             try:
                 prop_names = doc_reply.docProperties.propertyNames.string
+                prop_values = doc_reply.docProperties.propertyValues.anyType
+                
                 if '%VERSION_FILE_NAME' in prop_names:
-                    index = prop_names.index('%VERSION_FILE_NAME')
-                    version_file_name = doc_reply.docProperties.propertyValues.anyType[index]
-                    if version_file_name:
-                        filename = str(version_file_name)
+                     index = prop_names.index('%VERSION_FILE_NAME')
+                     val = prop_values[index]
+                     if val: system_filename = str(val).strip()
             except Exception as e:
-                logging.error(f"Could not get filename for {doc_number}, using default. Error: {e}")
+                 logging.error(f"Error parsing DMS properties for {doc_number}: {e}")
+
+        # --- FILENAME RESOLUTION ---
+        # Priority 1: Oracle DOCNAME
+        if db_docname:
+            filename = str(db_docname).strip()
+        # Priority 2: DMS Version Filename
+        elif system_filename:
+            filename = system_filename
+        
+        # --- EXTENSION RESOLUTION ---
+        # Ensure filename has an extension
+        _, current_ext = os.path.splitext(filename)
+        if not current_ext:
+            if db_def_ext:
+                # Use default extension from DB APPS table
+                clean_ext = str(db_def_ext).strip().replace('.', '')
+                filename = f"{filename}.{clean_ext}"
+            elif system_filename:
+                # Fallback to extension from system filename
+                _, sys_ext = os.path.splitext(system_filename)
+                if sys_ext:
+                    filename = f"{filename}{sys_ext}"
 
         # Resolve media type strictly from DB first
         media_type = 'file'  # Default

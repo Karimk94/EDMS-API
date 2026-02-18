@@ -238,9 +238,11 @@ async def get_document_file(docnumber: int, request: Request):
             filename = f"{filename}{file_ext}"
 
         # Get content
-        file_bytes = db_connector.get_media_content_from_dms(dst, docnumber)
+        # Get content stream
+        # file_bytes = db_connector.get_media_content_from_dms(dst, docnumber)
+        stream_generator, stream_filename = db_connector.stream_document_from_dms(dst, docnumber)
 
-        if file_bytes:
+        if stream_generator:
             # Determine correct content type
             mimetype = 'application/octet-stream'
             disposition = 'inline'
@@ -259,15 +261,18 @@ async def get_document_file(docnumber: int, request: Request):
             elif media_type == 'powerpoint':
                 mimetype = "application/vnd.openxmlformats-officedocument.presentationml.presentation"
                 disposition = 'attachment'
+            
+            # Use filename from stream if DB filename was missing (unlikely given get_media_info check)
+            if not filename and stream_filename:
+                filename = stream_filename
 
-            # Convert bytes to stream for StreamingResponse
             return StreamingResponse(
-                io.BytesIO(file_bytes),
+                stream_generator,
                 media_type=mimetype,
                 headers={"Content-Disposition": f"{disposition}; filename={filename}"}
             )
         else:
-            # Fallback to old method if db_connector fails to get content
+            # Fallback to old method if streaming setup fails
             file_bytes, filename = wsdl_client.get_document_from_dms(dst, docnumber)
             if file_bytes:
                 mimetype = mimetypes.guess_type(filename)[0] or 'application/octet-stream'
@@ -337,6 +342,35 @@ async def api_download_watermarked(doc_id: int, request: Request):
     if file_ext and not filename.lower().endswith(file_ext.lower()):
         filename = f"{filename}{file_ext}"
 
+    # Determine if watermarking is needed
+    needs_watermark = media_type in ['image', 'pdf', 'video']
+
+    if not needs_watermark:
+        # --- STREAMING PATH (No Watermark) ---
+        stream_generator, stream_filename = db_connector.stream_document_from_dms(dst, doc_id)
+        if stream_generator:
+            mimetype = 'application/octet-stream'
+            if media_type == 'excel':
+                mimetype = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            elif media_type == 'powerpoint':
+                mimetype = "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+            elif media_type == 'text':
+                mimetype = "text/plain"
+            
+            # Use filename from stream if DB filename was missing
+            if not filename and stream_filename:
+                filename = stream_filename
+
+            return StreamingResponse(
+                stream_generator,
+                media_type=mimetype,
+                headers={
+                    "Content-Disposition": f'attachment; filename="{filename}"',
+                    "Access-Control-Expose-Headers": "Content-Disposition"
+                }
+            )
+    
+    # --- PROCESSING PATH (Watermark Required or Fallback) ---
     file_bytes = db_connector.get_media_content_from_dms(dst, doc_id)
     if not file_bytes:
         raise HTTPException(status_code=500, detail="Failed to retrieve content")
@@ -354,6 +388,7 @@ async def api_download_watermarked(doc_id: int, request: Request):
     elif media_type == 'video':
         processed_bytes, mimetype = await apply_watermark_to_video_async(file_bytes, watermark_text, filename)
     elif media_type == 'excel':
+        # Fallback if streaming failed for some reason, though unlikely to reach here if logic holds
         mimetype = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     elif media_type == 'powerpoint':
         mimetype = "application/vnd.openxmlformats-officedocument.presentationml.presentation"

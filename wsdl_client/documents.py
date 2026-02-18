@@ -559,6 +559,78 @@ def rename_folder_display(dst, content_item_system_id, new_name):
             logging.error(f"Rename failed. ResultCode: {response.resultCode}, Error: {error_msg}")
             return False
 
+
     except Exception as e:
         logging.error(f"Error in rename_folder_display: {e}", exc_info=True)
         return False
+
+def stream_document_content(dst, doc_number):
+    """
+    Sets up a streaming generator for document content.
+    Returns (generator, filename) or (None, None) on failure.
+    """
+    svc_client, obj_client, content_id, stream_id = None, None, None, None
+    try:
+        svc_client = get_soap_client('BasicHttpBinding_IDMSvc')
+        obj_client = get_soap_client('BasicHttpBinding_IDMObj')
+        
+        get_doc_call = {'call': {'dstIn': dst, 'criteria': {'criteriaCount': 3, 'criteriaNames': {
+            'string': ['%TARGET_LIBRARY', '%DOCUMENT_NUMBER', '%VERSION_ID']}, 'criteriaValues': {
+            'string': ['RTA_MAIN', str(doc_number), '%VERSION_TO_INDEX']}}}}
+            
+        doc_reply = svc_client.service.GetDocSvr3(**get_doc_call)
+        if not (doc_reply and doc_reply.resultCode == 0 and doc_reply.getDocID): 
+            return None, None
+            
+        content_id = doc_reply.getDocID
+        
+        stream_reply = obj_client.service.GetReadStream(call={'dstIn': dst, 'contentID': content_id})
+        if not (stream_reply and stream_reply.resultCode == 0 and stream_reply.streamID):
+            try:
+                obj_client.service.ReleaseObject(call={'objectID': content_id})
+            except: pass
+            return None, None
+            
+        stream_id = stream_reply.streamID
+        
+        # Determine filename
+        filename = f"{doc_number}.dat"
+        if doc_reply.docProperties and doc_reply.docProperties.propertyValues:
+            try:
+                prop_names = doc_reply.docProperties.propertyNames.string
+                if '%VERSION_FILE_NAME' in prop_names:
+                    index = prop_names.index('%VERSION_FILE_NAME')
+                    version_file_name = doc_reply.docProperties.propertyValues.anyType[index]
+                    if version_file_name:
+                        filename = str(version_file_name)
+            except Exception:
+                pass
+
+        def content_generator():
+            try:
+                while True:
+                    read_reply = obj_client.service.ReadStream(call={'streamID': stream_id, 'requestedBytes': 65536})
+                    if not read_reply or read_reply.resultCode != 0: break
+                    chunk_data = read_reply.streamData.streamBuffer if read_reply.streamData else None
+                    if not chunk_data: break
+                    yield chunk_data
+            finally:
+                # Cleanup within the generator when it stops iterating
+                if obj_client:
+                    if stream_id:
+                        try:
+                            obj_client.service.ReleaseObject(call={'objectID': stream_id})
+                        except Exception: pass
+                    if content_id:
+                        try:
+                            obj_client.service.ReleaseObject(call={'objectID': content_id})
+                        except Exception: pass
+
+        return content_generator(), filename
+
+    except Fault as e:
+        logging.error(f"DMS Fault in stream_document_content: {e}")
+        return None, None
+    except Exception as e:
+        logging.error(f"Error preparing stream for document {doc_number}: {e}")
+        return None, None
