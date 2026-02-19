@@ -13,7 +13,8 @@ class ShareLinkCreateRequest(BaseModel):
     share_type: Optional[str] = 'file'  # 'file' or 'folder'
     item_name: Optional[str] = None
     expiry_date: Optional[datetime] = None
-    target_email: Optional[str] = None
+    target_email: Optional[str] = None # For backward compatibility
+    target_emails: Optional[List[str]] = None
 
     @field_validator('target_email')
     @classmethod
@@ -24,6 +25,21 @@ class ShareLinkCreateRequest(BaseModel):
                 raise ValueError(f"Target email must be from {ALLOWED_DOMAIN} domain")
             if '@' not in v or len(v) < 8:
                 raise ValueError("Invalid email format")
+        return v
+
+    @field_validator('target_emails')
+    @classmethod
+    def validate_target_emails(cls, v):
+        if v is not None:
+            validated_emails = []
+            for email in v:
+                email = email.strip().lower()
+                if not email.endswith(ALLOWED_DOMAIN.lower()):
+                    raise ValueError(f"All target emails must be from {ALLOWED_DOMAIN} domain. Invalid: {email}")
+                if '@' not in email or len(email) < 8:
+                    raise ValueError(f"Invalid email format: {email}")
+                validated_emails.append(email)
+            return validated_emails
         return v
 
     @model_validator(mode='after')
@@ -43,6 +59,7 @@ class ShareLinkResponse(BaseModel):
     link: str
     expiry_date: Optional[datetime]
     target_email: Optional[str] = None
+    links: Optional[List[Dict[str, str]]] = None # For multiple recipients
     share_mode: str = "open"
     share_type: str = "file"
 

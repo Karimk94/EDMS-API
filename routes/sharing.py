@@ -69,13 +69,25 @@ async def generate_share_link(request: Request, req: ShareLinkCreateRequest):
 
         # Validate target_email if provided
         target_email = None
+        target_emails = req.target_emails or []
+
+        # If single email provided, add to list (backward compatibility / simple mode)
         if req.target_email:
-            target_email = req.target_email.strip().lower()
-            if not target_email.endswith(ALLOWED_DOMAIN.lower()):
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Target email must be from {ALLOWED_DOMAIN} domain"
-                )
+            # check if it's already in the list
+            if req.target_email not in target_emails:
+                target_emails.append(req.target_email)
+
+        # Remove duplicates
+        target_emails = list(set(target_emails))
+
+        if target_emails:
+            for email in target_emails:
+                email = email.strip().lower()
+                if not email.endswith(ALLOWED_DOMAIN.lower()):
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Target email {email} must be from {ALLOWED_DOMAIN} domain"
+                    )
 
         # Determine share type
         share_type = getattr(req, 'share_type', 'file') or 'file'
@@ -94,50 +106,85 @@ async def generate_share_link(request: Request, req: ShareLinkCreateRequest):
             folder_id = None
             item_name = None
 
-        # Create Share Link with optional target_email
-        token = await sharing_db.create_share_link(
-            document_id=document_id,
-            folder_id=folder_id,
-            created_by=user_id,
-            expiry_date=req.expiry_date,
-            target_email=target_email,
-            share_type=share_type
-        )
-
+        generated_links = []
         base_url = os.getenv('FRONTEND_URL', 'http://localhost:3000')
-        link = f"{base_url}/shared/{token}"
 
-        # Send email to target recipient for restricted shares
-        if target_email:
+        # If no restricted emails, treat as Open Share (single link)
+        if not target_emails:
+            token = await sharing_db.create_share_link(
+                document_id=document_id,
+                folder_id=folder_id,
+                created_by=user_id,
+                expiry_date=req.expiry_date,
+                target_email=None, # Open share
+                share_type=share_type
+            )
+            link = f"{base_url}/shared/{token}"
+            
+            return {
+                "token": token,
+                "link": link,
+                "expiry_date": req.expiry_date,
+                "target_email": None,
+                "share_mode": "open",
+                "share_type": share_type,
+                "links": []
+            }
+        
+        # If restricted emails, generate a link for EACH email
+        for email in target_emails:
+            token = await sharing_db.create_share_link(
+                document_id=document_id,
+                folder_id=folder_id,
+                created_by=user_id,
+                expiry_date=req.expiry_date,
+                target_email=email,
+                share_type=share_type
+            )
+            link = f"{base_url}/shared/{token}"
+            
+            generated_links.append({
+                "email": email,
+                "link": link,
+                "token": token
+            })
+
+            # Send email to target recipient
             try:
-                # Get item name for the email
+                # Get item name
                 if share_type == 'folder':
                     document_name = item_name or 'Shared Folder'
                 else:
-                    document = await documents_db.get_document_by_id(document_id)
-                    document_name = document.get('docname',
-                                                 document.get('title', 'Document')) if document else 'Document'
+                    # optimization: only fetch doc if not fetched yet or just once outside loop
+                    # but keeping it simple for now (fetch per email is fine given low volume)
+                     document = await documents_db.get_document_by_id(document_id)
+                     document_name = document.get('docname', document.get('title', 'Document')) if document else 'Document'
 
-                # Get sharer's name/email for the email
+                # Get sharer's name
                 sharer_name = user_info.get('full_name') or user_info.get('email') or username
 
                 send_share_link_email(
-                    to_email=target_email,
+                    to_email=email,
                     share_link=link,
                     document_name=document_name,
                     sharer_name=sharer_name,
                     expiry_date=req.expiry_date
                 )
             except Exception as email_error:
-                logging.error(f"Failed to send share link email to {target_email}: {email_error}")
+                logging.error(f"Failed to send share link email to {email}: {email_error}")
 
+        # Return response with list of links
+        # For backward compatibility, return the first link in main fields if only one
+        first_link = generated_links[0] if generated_links else {}
+        
         return {
-            "token": token,
-            "link": link,
+            "token": first_link.get("token"), # Main token field (legacy support)
+            "link": first_link.get("link"),   # Main link field (legacy support)
             "expiry_date": req.expiry_date,
-            "target_email": target_email,
-            "share_mode": "restricted" if target_email else "open",
-            "share_type": share_type
+            "target_email": first_link.get("email"), # Legacy support
+            "share_mode": "restricted",
+            "share_type": share_type,
+            "links": generated_links # New field containing all links
         }
 
     except HTTPException:
