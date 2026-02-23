@@ -65,6 +65,8 @@ app.include_router(favorites.router)
 app.include_router(memories.router)
 app.include_router(sharing.router)
 app.include_router(admin.router)
+from routes import researcher
+app.include_router(researcher.router)
 
 @app.get("/")
 def health_check():
