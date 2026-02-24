@@ -635,6 +635,8 @@ async def download_shared_document(
             
         elif media_type == 'text':
             mimetype = "text/plain"
+        elif media_type == 'zip':
+            mimetype = "application/zip"
         elif media_type == 'excel':
             mimetype = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         elif media_type == 'powerpoint':

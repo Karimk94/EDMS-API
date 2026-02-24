@@ -221,6 +221,7 @@ async def search_documents(
                 elif ext_str in ['doc', 'docx']: media_type = 'word'
                 elif ext_str in ['xls', 'xlsx']: media_type = 'excel'
                 elif ext_str in ['ppt', 'pptx']: media_type = 'powerpoint'
+                elif ext_str in ['zip', 'rar', '7z', 'tar', 'gz']: media_type = 'zip'
                 elif ext_str in ['jpg', 'png', 'jpeg', 'tif', 'tiff']: media_type = 'image'
                 elif ext_str in ['msg', 'eml']: media_type = 'email'
                 elif ext_str in ['mp4', 'avi']: media_type = 'video'

@@ -255,6 +255,9 @@ async def get_document_file(docnumber: int, request: Request):
                 mimetype = f"video/{file_ext.replace('.', '')}"
             elif media_type == 'text':
                 mimetype = "text/plain"
+            elif media_type == 'zip':
+                mimetype = "application/zip"
+                disposition = 'attachment'
             elif media_type == 'excel':
                 mimetype = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                 disposition = 'attachment'  # Browsers often can't preview Excel inline
@@ -352,6 +355,8 @@ async def api_download_watermarked(doc_id: int, request: Request):
             mimetype = 'application/octet-stream'
             if media_type == 'excel':
                 mimetype = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            elif media_type == 'zip':
+                mimetype = "application/zip"
             elif media_type == 'powerpoint':
                 mimetype = "application/vnd.openxmlformats-officedocument.presentationml.presentation"
             elif media_type == 'text':
@@ -390,6 +395,8 @@ async def api_download_watermarked(doc_id: int, request: Request):
     elif media_type == 'excel':
         # Fallback if streaming failed for some reason, though unlikely to reach here if logic holds
         mimetype = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    elif media_type == 'zip':
+        mimetype = "application/zip"
     elif media_type == 'powerpoint':
         mimetype = "application/vnd.openxmlformats-officedocument.presentationml.presentation"
     elif media_type == 'text':

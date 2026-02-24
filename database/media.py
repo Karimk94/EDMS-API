@@ -158,6 +158,7 @@ async def get_media_info_from_dms(dst, doc_number):
             text_extensions = ['.txt', '.csv', '.json', '.xml', '.log', '.md', '.yml', '.yaml', '.ini', '.conf']
             excel_extensions = ['.xls', '.xlsx', '.ods', '.xlsm']
             ppt_extensions = ['.ppt', '.pptx', '.odp', '.pps', '.ppsx']
+            zip_extensions = ['.zip', '.rar', '.7z', '.tar', '.gz']
 
             file_ext = os.path.splitext(filename)[1].lower()
 
@@ -173,6 +174,8 @@ async def get_media_info_from_dms(dst, doc_number):
                 media_type = 'excel'
             elif file_ext in ppt_extensions:
                 media_type = 'powerpoint'
+            elif file_ext in zip_extensions:
+                media_type = 'zip'
             else:
                 media_type = 'file'
 
@@ -220,7 +223,7 @@ def stream_and_cache_generator(obj_client, stream_id, content_id, final_cache_pa
 
 def create_thumbnail(doc_number, media_type, file_ext, media_bytes):
     """Creates a thumbnail from media bytes and saves it to the cache."""
-    if media_type in ['excel', 'powerpoint', 'text', 'file']:
+    if media_type in ['excel', 'powerpoint', 'text', 'file', 'zip']:
         return None
 
     thumbnail_filename = f"{doc_number}.jpg"
@@ -387,6 +390,7 @@ async def resolve_media_types_from_db(doc_ids):
             excel_exts = {'xls', 'xlsx', 'ods', 'xlsm'}
             ppt_exts = {'ppt', 'pptx', 'odp', 'pps', 'ppsx'}
             text_exts = {'txt', 'csv', 'json', 'xml', 'log', 'md'}
+            zip_exts = {'zip', 'rar', '7z', 'tar', 'gz'}
 
             for doc_id, ext in rows:
                 media_type = 'file'
@@ -406,6 +410,8 @@ async def resolve_media_types_from_db(doc_ids):
                         media_type = 'powerpoint'
                     elif clean_ext in text_exts:
                         media_type = 'text'
+                    elif clean_ext in zip_exts:
+                        media_type = 'zip'
                 resolved_map[str(doc_id)] = media_type
     except Exception as e:
         logging.error(f"Error resolving media types: {e}")
