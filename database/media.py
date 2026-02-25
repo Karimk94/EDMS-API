@@ -16,8 +16,10 @@ from database.connection import get_connection, get_async_connection
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 thumbnail_cache_dir = os.path.join(BASE_DIR, 'thumbnail_cache')
 video_cache_dir = os.path.join(BASE_DIR, 'video_cache')
+temp_thumbnail_cache_dir = os.path.join(BASE_DIR, 'temp_thumbnail_cache')
 if not os.path.exists(thumbnail_cache_dir): os.makedirs(thumbnail_cache_dir)
 if not os.path.exists(video_cache_dir): os.makedirs(video_cache_dir)
+if not os.path.exists(temp_thumbnail_cache_dir): os.makedirs(temp_thumbnail_cache_dir)
 
 def dms_system_login():
     """Logs into the DMS SOAP service using system credentials."""
@@ -221,16 +223,17 @@ def stream_and_cache_generator(obj_client, stream_id, content_id, final_cache_pa
             pass
         if os.path.exists(temp_cache_path): os.remove(temp_cache_path)
 
-def create_thumbnail(doc_number, media_type, file_ext, media_bytes):
+def create_thumbnail(doc_number, media_type, file_ext, media_bytes, is_temp=False):
     """Creates a thumbnail from media bytes and saves it to the cache."""
     if media_type in ['excel', 'powerpoint', 'text', 'file', 'zip']:
         return None
 
     thumbnail_filename = f"{doc_number}.jpg"
-    cached_path = os.path.join(thumbnail_cache_dir, thumbnail_filename)
+    target_dir = temp_thumbnail_cache_dir if is_temp else thumbnail_cache_dir
+    cached_path = os.path.join(target_dir, thumbnail_filename)
     try:
         if media_type == 'video':
-            temp_video_path = os.path.join(thumbnail_cache_dir, f"{doc_number}{file_ext}")
+            temp_video_path = os.path.join(target_dir, f"{doc_number}{file_ext}")
             with open(temp_video_path, 'wb') as f: f.write(media_bytes)
             # Use moviepy.editor
             with VideoFileClip(temp_video_path) as clip: clip.save_frame(cached_path, t=1)
@@ -249,7 +252,7 @@ def create_thumbnail(doc_number, media_type, file_ext, media_bytes):
                 img.thumbnail((300, 300))
                 # Ensure image is RGB before saving as JPEG
                 img.convert("RGB").save(cached_path, "JPEG", quality=95)
-        return f"cache/{thumbnail_filename}" # Return relative path for URL
+        return f"temp_thumbnail/{doc_number}" if is_temp else f"cache/{thumbnail_filename}" # Return appropriate path for URL
     except Exception as e:
         print(f"Could not create thumbnail for {doc_number}: {e}")
         return None

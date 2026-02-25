@@ -2,6 +2,7 @@ from fastapi import APIRouter, Response, HTTPException, Header, Request, Depends
 from fastapi.responses import FileResponse, StreamingResponse
 from typing import Optional
 import os
+import time
 import mimetypes
 import db_connector
 import wsdl_client
@@ -70,6 +71,36 @@ async def serve_cached_thumbnail(filename: str):
     if os.path.exists(file_path):
         return FileResponse(file_path)
     raise HTTPException(status_code=404, detail="File not found")
+
+@router.get('/api/temp_thumbnail/{doc_id}')
+async def serve_temp_thumbnail(doc_id: int):
+    filename = f"{doc_id}.jpg"
+    file_path = os.path.join(db_connector.temp_thumbnail_cache_dir, filename)
+    
+    if os.path.exists(file_path):
+        if time.time() - os.path.getmtime(file_path) > 86400:
+            try:
+                os.remove(file_path)
+            except OSError:
+                pass
+        else:
+            return FileResponse(file_path)
+            
+    dst = db_connector.dms_system_login()
+    if not dst:
+        raise HTTPException(status_code=500, detail='DMS login failed.')
+        
+    original_filename, media_type, file_ext = await db_connector.get_media_info_from_dms(dst, doc_id)
+    if not media_type or media_type in ['excel', 'powerpoint', 'text', 'file', 'zip']:
+        raise HTTPException(status_code=404, detail='Thumbnail not applicable for this media type.')
+        
+    media_bytes = db_connector.get_media_content_from_dms(dst, doc_id)
+    if media_bytes:
+        thumbnail_path = db_connector.create_thumbnail(doc_id, media_type, file_ext, media_bytes, is_temp=True)
+        if thumbnail_path and os.path.exists(file_path):
+            return FileResponse(file_path)
+            
+    raise HTTPException(status_code=404, detail="Failed to generate temporary thumbnail")
 
 @router.post('/api/clear_cache', dependencies=[Depends(verify_editor)])
 async def api_clear_cache():

@@ -5,6 +5,7 @@ pycache/
 *.pyo
 *.pyd
 /thumbnail_cache
+/temp_thumbnail_cache
 /video_cache
 /chroma_db
 __pycache__/

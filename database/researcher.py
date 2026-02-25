@@ -234,7 +234,8 @@ async def search_documents(
                     "typist": typist,
                     "media_type": media_type,
                     "extension": ext_str,
-                    "display_value": display_val
+                    "display_value": display_val,
+                    "thumbnail_url": f"temp_thumbnail/{doc_id}" if media_type in ['image', 'video', 'pdf'] else ""
                 })
 
             # Create a fake total to enable pagination (current page items + more if full page)
