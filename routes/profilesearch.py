@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Request, HTTPException, Query
 from pydantic import BaseModel
 from typing import Optional, List
-from database import researcher
+from database import profilesearch
 import logging
 
 router = APIRouter()
@@ -25,7 +25,7 @@ class MultiSearchRequest(BaseModel):
     page_size: int = 20
 
 
-@router.get('/api/researcher/scopes')
+@router.get('/api/profilesearch/scopes')
 async def get_search_scopes(request: Request):
     """Returns the available search scopes for the current user."""
     try:
@@ -34,14 +34,14 @@ async def get_search_scopes(request: Request):
             raise HTTPException(status_code=401, detail="Unauthorized")
 
         user_id = user.get('username')
-        scopes = await researcher.fetch_search_scopes(user_id)
+        scopes = await profilesearch.fetch_search_scopes(user_id)
         return {"scopes": scopes}
     except Exception as e:
         logging.error(f"Error fetching search scopes: {e}")
         raise HTTPException(status_code=500, detail="Failed to fetch search scopes")
 
 
-@router.get('/api/researcher/types')
+@router.get('/api/profilesearch/types')
 async def get_search_types(request: Request, scope: Optional[str] = None):
     """
     Returns the available search types for the current user.
@@ -53,14 +53,14 @@ async def get_search_types(request: Request, scope: Optional[str] = None):
             raise HTTPException(status_code=401, detail="Unauthorized")
 
         user_id = user.get('username')
-        types = await researcher.fetch_search_types(user_id, scope=scope)
+        types = await profilesearch.fetch_search_types(user_id, scope=scope)
         return {"types": types}
     except Exception as e:
         logging.error(f"Error fetching search types: {e}")
         raise HTTPException(status_code=500, detail="Failed to fetch search types")
 
 
-@router.post('/api/researcher/search')
+@router.post('/api/profilesearch/search')
 async def search_documents_multi(request: Request, body: MultiSearchRequest):
     """
     Multi-criteria search. Accepts scope, an array of criteria (AND logic),
@@ -75,7 +75,7 @@ async def search_documents_multi(request: Request, body: MultiSearchRequest):
 
         criteria_dicts = [c.dict() for c in body.criteria]
 
-        documents, total_rows = await researcher.search_documents_multi(
+        documents, total_rows = await profilesearch.search_documents_multi(
             user_id=user_id,
             scope=body.scope,
             criteria=criteria_dicts,
@@ -95,12 +95,12 @@ async def search_documents_multi(request: Request, body: MultiSearchRequest):
         }
 
     except Exception as e:
-        logging.error(f"Error in researcher search: {e}")
+        logging.error(f"Error in profilesearch search: {e}")
         raise HTTPException(status_code=500, detail="Search failed")
 
 
 # Keep legacy GET endpoint for backwards compatibility
-@router.get('/api/researcher/search')
+@router.get('/api/profilesearch/search')
 async def search_documents_legacy(
     request: Request,
     form_name: str,
@@ -123,7 +123,7 @@ async def search_documents_legacy(
 
         user_id = user.get('username')
 
-        documents, total_rows = await researcher.search_documents(
+        documents, total_rows = await profilesearch.search_documents(
             user_id=user_id,
             form_name=form_name,
             field_name=field_name,
@@ -148,5 +148,5 @@ async def search_documents_legacy(
         }
 
     except Exception as e:
-        logging.error(f"Error in researcher search: {e}")
+        logging.error(f"Error in profilesearch search: {e}")
         raise HTTPException(status_code=500, detail="Search failed")

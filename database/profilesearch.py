@@ -75,7 +75,7 @@ async def fetch_search_types(user_id, scope=None):
     """
     Returns a list of search types dynamically from LKP_MAIN_FIELDS,
     filtered by the user's group permissions.
-    Replicates the legacy Researcher (Home.aspx.cs) GetDoc_types() method.
+    Replicates the legacy ProfileSearch (Home.aspx.cs) GetDoc_types() method.
     Falls back to hardcoded types if the dynamic query fails.
     """
     conn = await get_async_connection()
@@ -216,7 +216,7 @@ async def search_documents(
 ):
     """
     Performs the dynamic search based on the selected Form/Field type.
-    Replicates the legacy Researcher (Home.aspx.cs) General_Search method.
+    Replicates the legacy ProfileSearch (Home.aspx.cs) General_Search method.
     
     Parameters mapping from legacy:
     - form_name: FORM from LKP_MAIN_FIELDS (e.g., 'SEARCH_S354', 'DEF_QBE')

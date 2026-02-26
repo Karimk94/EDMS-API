@@ -8,7 +8,7 @@ Orchestrates calls to multiple external AI APIs in a specific sequence.
 Intelligently skips already completed processing steps to avoid redundant work.
 Performs all database updates in a single, atomic transaction per document.
 Provides a single, simple endpoint (/process-batch) to run the entire workflow.
-Researcher Scope Optimization: The `/api/documents` endpoint accepts a `scope` query parameter. This allows the frontend to manually dictate the database query logic. Providing `scope=0` forces a global cross-table search, while providing a specific Form ID (e.g. `scope=2572`) restricts the query to a singular Oracle table, vastly improving performance for targeted queries. Omitting the parameter relies entirely on the dynamic routing logic.
+Profile Search Scope Optimization: The `/api/documents` endpoint accepts a `scope` query parameter. This allows the frontend to manually dictate the database query logic. Providing `scope=0` forces a global cross-table search, while providing a specific Form ID (e.g. `scope=2572`) restricts the query to a singular Oracle table, vastly improving performance for targeted queries. Omitting the parameter relies entirely on the dynamic routing logic.
 Setup and Installation
 Prerequisites:
 Python 3.x
