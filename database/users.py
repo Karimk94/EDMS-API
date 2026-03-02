@@ -72,9 +72,19 @@ async def get_user_details(username):
 
                 if details_result:
                     security_level, lang, theme, quota, remaining_quota = details_result
+                    # Also fetch the security_level_id for tab permissions lookup
+                    await cursor.execute(
+                        "SELECT SECURITY_LEVEL_ID FROM LKP_EDMS_USR_SECUR WHERE USER_ID = :user_id",
+                        user_id=user_id
+                    )
+                    sec_id_result = await cursor.fetchone()
+                    security_level_id = sec_id_result[0] if sec_id_result else None
+
                     user_details = {
                         'username': username,
+                        'people_system_id': user_id,
                         'security_level': security_level,
+                        'security_level_id': security_level_id,
                         'lang': lang or 'en',
                         'theme': theme or 'light',
                         'quota': quota,

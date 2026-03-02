@@ -1,7 +1,9 @@
 from fastapi import APIRouter, HTTPException, Request, Query
 from typing import List
+from pydantic import BaseModel
 import logging
 from database import admin as admin_db
+from database import tab_permissions as tab_perms_db
 from schemas.auth import EdmsUserResponse, AddEdmsUserRequest, SecurityLevelResponse, PeopleSearchResult, UpdateEdmsUserRequest
 
 router = APIRouter()
@@ -130,3 +132,69 @@ async def check_access(request: Request):
     
     has_access = check_admin_access(request)
     return {"has_access": has_access, "username": user.get('username')}
+
+
+# --- Tab Permissions Endpoints (Per-User) ---
+
+class UpsertTabPermissionRequest(BaseModel):
+    user_id: int  # PEOPLE.SYSTEM_ID
+    tab_key: str
+    can_read: bool = True
+    can_write: bool = False
+
+
+@router.get("/api/admin/tab-permissions/{user_id}")
+async def get_user_tab_permissions(request: Request, user_id: int):
+    """Get tab permissions for a specific user. Requires admin access."""
+    if not check_admin_access(request):
+        raise HTTPException(status_code=403, detail="Access denied. Admin privileges required.")
+    
+    perms = await tab_perms_db.get_tab_permissions_for_user_admin(user_id)
+    return {"permissions": perms}
+
+
+@router.put("/api/admin/tab-permissions")
+async def upsert_tab_permission(request: Request, data: UpsertTabPermissionRequest):
+    """Insert or update a tab permission for a user. Requires admin access."""
+    if not check_admin_access(request):
+        raise HTTPException(status_code=403, detail="Access denied. Admin privileges required.")
+    
+    success, message = await tab_perms_db.upsert_tab_permission(
+        user_id=data.user_id,
+        tab_key=data.tab_key,
+        can_read=data.can_read,
+        can_write=data.can_write
+    )
+    
+    if not success:
+        raise HTTPException(status_code=400, detail=message)
+    
+    return {"message": message}
+
+
+@router.post("/api/admin/tab-permissions/init/{user_id}")
+async def init_user_tab_permissions(request: Request, user_id: int):
+    """Create default tab permissions for a user. Called after adding a new user."""
+    if not check_admin_access(request):
+        raise HTTPException(status_code=403, detail="Access denied. Admin privileges required.")
+    
+    success, message = await tab_perms_db.create_default_permissions_for_user(user_id)
+    
+    if not success:
+        raise HTTPException(status_code=400, detail=message)
+    
+    return {"message": message}
+
+
+@router.delete("/api/admin/tab-permissions/{permission_id}")
+async def delete_tab_permission(request: Request, permission_id: int):
+    """Delete a specific tab permission. Requires admin access."""
+    if not check_admin_access(request):
+        raise HTTPException(status_code=403, detail="Access denied. Admin privileges required.")
+    
+    success, message = await tab_perms_db.delete_tab_permission(permission_id)
+    
+    if not success:
+        raise HTTPException(status_code=400, detail=message)
+    
+    return {"message": message}

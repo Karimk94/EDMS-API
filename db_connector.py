@@ -31,3 +31,8 @@ from database.favorites import (
 from database.memories import (
     fetch_memories_from_oracle, fetch_journey_data
 )
+from database.tab_permissions import (
+    get_tab_permissions_for_user, get_tab_permissions_for_user_admin,
+    upsert_tab_permission, delete_tab_permission, get_admin_full_permissions,
+    create_default_permissions_for_user
+)

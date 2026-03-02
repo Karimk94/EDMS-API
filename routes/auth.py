@@ -34,6 +34,17 @@ async def login(request: Request, creds: LoginRequest):
             security_str = db_user.get('security_level', 'Viewer')
             security_level = processor.get_security_level_int(security_str)
 
+        # Fetch tab permissions — admin override bypasses DB
+        if security_str == 'Admin':
+            tab_permissions = db_connector.get_admin_full_permissions()
+        else:
+            # Get the people_system_id from the DB user record for per-user lookup
+            people_system_id = db_user.get('people_system_id')
+            if people_system_id:
+                tab_permissions = await db_connector.get_tab_permissions_for_user(people_system_id)
+            else:
+                tab_permissions = []
+
         # Use already fetched db_user for preferences
         db_prefs = db_user
 
@@ -43,7 +54,8 @@ async def login(request: Request, creds: LoginRequest):
             'security_level': security_str,
             'dms_security_level': security_level,  # Numeric for logic
             'lang': db_prefs.get('lang', 'en') if db_prefs else 'en',
-            'theme': db_prefs.get('theme', 'light') if db_prefs else 'light'
+            'theme': db_prefs.get('theme', 'light') if db_prefs else 'light',
+            'tab_permissions': tab_permissions
         }
 
         request.session['user'] = user_details
@@ -65,6 +77,18 @@ async def get_user(request: Request):
             # Preserve token if it exists in session but not in db details
             if 'token' in user_session:
                 user_details['token'] = user_session['token']
+
+            # Fetch tab permissions — per-user
+            security_level = user_details.get('security_level', 'Viewer')
+            if security_level == 'Admin':
+                user_details['tab_permissions'] = db_connector.get_admin_full_permissions()
+            else:
+                people_system_id = user_details.get('people_system_id')
+                if people_system_id:
+                    user_details['tab_permissions'] = await db_connector.get_tab_permissions_for_user(people_system_id)
+                else:
+                    user_details['tab_permissions'] = []
+
             request.session['user'] = user_details
             return {'user': user_details}
         else:

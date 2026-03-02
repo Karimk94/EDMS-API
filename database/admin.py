@@ -144,8 +144,8 @@ async def add_edms_user(user_system_id: int, security_level_id: int, lang: str =
             
             # Insert new user
             insert_query = """
-                INSERT INTO LKP_EDMS_USR_SECUR (SYSTEM_ID, USER_ID, SECURITY_LEVEL_ID, LANG, THEME)
-                VALUES ((SELECT NVL(MAX(SYSTEM_ID), 0) + 1 FROM LKP_EDMS_USR_SECUR), :user_id, :security_level_id, :lang, :theme)
+                INSERT INTO LKP_EDMS_USR_SECUR (SYSTEM_ID, USER_ID, SECURITY_LEVEL_ID, LANG, THEME, DISABLED)
+                VALUES ((SELECT NVL(MAX(SYSTEM_ID), 0) + 1 FROM LKP_EDMS_USR_SECUR), :user_id, :security_level_id, :lang, :theme, '0')
             """
             await cursor.execute(
                 insert_query,
