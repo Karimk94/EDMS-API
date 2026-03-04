@@ -8,6 +8,8 @@ async def fetch_search_scopes(user_id):
     Returns distinct search scopes from LKP_MAIN_FIELDS,
     filtered by the user's group permissions.
     Each scope is derived from the SEARCH_FORM column.
+    Users in DOCS_SUPERVISORS see all scopes (unfiltered).
+    Labels include FORM_TITLE from the FORMS table.
     """
     conn = await get_async_connection()
     if not conn:
@@ -15,22 +17,48 @@ async def fetch_search_scopes(user_id):
 
     try:
         async with conn.cursor() as cursor:
-            sql = """
-                SELECT DISTINCT SEARCH_FORM, FORM
-                FROM LKP_MAIN_FIELDS
-                WHERE (DISABLED <> 'Y')
-                  AND UPPER(FORM) IN (
-                    SELECT DISTINCT UPPER(FORMS.FORM_NAME) AS UFORM
-                    FROM SEARCH_FORM sf, FORMS, PEOPLEGROUPS, PEOPLE, GROUPS
-                    WHERE sf.FORM_ID = FORMS.SYSTEM_ID
-                      AND sf.GROUP_ID = GROUPS.SYSTEM_ID
-                      AND PEOPLEGROUPS.PEOPLE_SYSTEM_ID = PEOPLE.SYSTEM_ID
-                      AND PEOPLEGROUPS.GROUPS_SYSTEM_ID = GROUPS.SYSTEM_ID
-                      AND PEOPLE.USER_ID = UPPER(:user_id)
-                  )
-                ORDER BY 1
+            # Check if user is in DOCS_SUPERVISORS group
+            check_sql = """
+                SELECT COUNT(*) FROM PEOPLEGROUPS pg
+                JOIN PEOPLE p ON pg.PEOPLE_SYSTEM_ID = p.SYSTEM_ID
+                JOIN GROUPS g ON pg.GROUPS_SYSTEM_ID = g.SYSTEM_ID
+                WHERE UPPER(p.USER_ID) = UPPER(:user_id)
+                  AND UPPER(g.GROUP_ID) = 'DOCS_SUPERVISORS'
             """
-            await cursor.execute(sql, {'user_id': user_id.strip()})
+            await cursor.execute(check_sql, {'user_id': user_id.strip()})
+            supervisor_row = await cursor.fetchone()
+            is_supervisor = supervisor_row and supervisor_row[0] > 0
+
+            if is_supervisor:
+                # Supervisors see all scopes (no group filter)
+                sql = """
+                    SELECT DISTINCT lmf.SEARCH_FORM, lmf.FORM, f.FORM_TITLE
+                    FROM LKP_MAIN_FIELDS lmf
+                    LEFT JOIN FORMS f ON UPPER(f.FORM_NAME) = UPPER(lmf.FORM)
+                    WHERE (lmf.DISABLED <> 'Y')
+                    ORDER BY 1
+                """
+                await cursor.execute(sql)
+            else:
+                # Regular users: filter by their group memberships
+                sql = """
+                    SELECT DISTINCT lmf.SEARCH_FORM, lmf.FORM, f.FORM_TITLE
+                    FROM LKP_MAIN_FIELDS lmf
+                    LEFT JOIN FORMS f ON UPPER(f.FORM_NAME) = UPPER(lmf.FORM)
+                    WHERE (lmf.DISABLED <> 'Y')
+                      AND UPPER(lmf.FORM) IN (
+                        SELECT DISTINCT UPPER(FORMS.FORM_NAME) AS UFORM
+                        FROM SEARCH_FORM sf, FORMS, PEOPLEGROUPS, PEOPLE, GROUPS
+                        WHERE sf.FORM_ID = FORMS.SYSTEM_ID
+                          AND sf.GROUP_ID = GROUPS.SYSTEM_ID
+                          AND PEOPLEGROUPS.PEOPLE_SYSTEM_ID = PEOPLE.SYSTEM_ID
+                          AND PEOPLEGROUPS.GROUPS_SYSTEM_ID = GROUPS.SYSTEM_ID
+                          AND PEOPLE.USER_ID = UPPER(:user_id)
+                      )
+                    ORDER BY 1
+                """
+                await cursor.execute(sql, {'user_id': user_id.strip()})
+
             rows = await cursor.fetchall()
 
             if not rows:
@@ -42,13 +70,22 @@ async def fetch_search_scopes(user_id):
             for row in rows:
                 search_form = str(row[0]).strip() if row[0] else ""
                 form_name = str(row[1]).strip() if row[1] else ""
+                form_title = str(row[2]).strip() if row[2] else ""
                 # Use SEARCH_FORM as scope key; skip empty/duplicate
                 key = search_form or form_name
                 if not key or key in seen:
                     continue
                 seen.add(key)
+                # Show form title if available, otherwise show form key
+                # If form_title is the generic "Search Form", prepend form key to disambiguate
+                if form_title and form_title.upper() == 'SEARCH FORM':
+                    label = f"{key} - {form_title}"
+                elif form_title:
+                    label = form_title
+                else:
+                    label = key
                 scopes.append({
-                    "label": key,
+                    "label": label,
                     "value": key
                 })
 
