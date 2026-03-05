@@ -231,6 +231,7 @@ async def upload_document_to_dms(dst, file_stream, metadata, parent_id=None):
         return created_doc_number
 
     except Exception as e:
+        logging.error(f"upload_document_to_dms failed: {e}", exc_info=True)
         return None
     finally:
         if obj_client:
