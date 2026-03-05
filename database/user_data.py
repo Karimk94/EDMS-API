@@ -146,3 +146,27 @@ async def deduct_user_quota(edms_user_id, amount_bytes):
     finally:
         if conn:
             await conn.close()
+
+async def get_edms_user_id(people_system_id):
+    """
+    Looks up the EDMS user SYSTEM_ID from LKP_EDMS_USR_SECUR given a PEOPLE.SYSTEM_ID.
+    Returns the EDMS user ID or None if not found.
+    """
+    conn = await get_async_connection()
+    if not conn:
+        return None
+
+    try:
+        async with conn.cursor() as cursor:
+            await cursor.execute(
+                "SELECT SYSTEM_ID FROM LKP_EDMS_USR_SECUR WHERE USER_ID = :1",
+                [people_system_id]
+            )
+            res = await cursor.fetchone()
+            return res[0] if res else None
+    except oracledb.Error as e:
+        logging.error(f"Oracle error in get_edms_user_id: {e}", exc_info=True)
+        return None
+    finally:
+        if conn:
+            await conn.close()

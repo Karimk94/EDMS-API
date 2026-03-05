@@ -73,7 +73,7 @@ async def fetch_lkp_persons(page=1, page_size=20, search='', lang='en'):
             async for row in cursor:
                 persons.append({"id": row[0], "name_english": row[1], "name_arabic": row[2]})
     except oracledb.Error as e:
-        print(f"❌ Oracle Database error in fetch_lkp_persons: {e}")
+        logging.error(f"❌ Oracle Database error in fetch_lkp_persons: {e}")
     finally:
         if conn:
             await conn.close()
@@ -135,7 +135,7 @@ async def fetch_all_tags(lang='en', security_level='Editor', app_source='unknown
                 if row[0]:
                     tags.add(row[0].strip())
     except oracledb.Error as e:
-        print(f"❌ Oracle Database error in fetch_all_tags: {e}")
+        logging.error(f"❌ Oracle Database error in fetch_all_tags: {e}")
     finally:
         if conn:
             await conn.close()
@@ -198,12 +198,65 @@ async def fetch_tags_for_document(doc_id, lang='en', security_level='Editor'):
                         })
 
     except oracledb.Error as e:
-        print(f"❌ Oracle Database error in fetch_tags_for_document for doc_id {doc_id}: {e}")
+        logging.error(f"❌ Oracle Database error in fetch_tags_for_document for doc_id {doc_id}: {e}")
     finally:
         if conn:
             await conn.close()
 
     return sorted(doc_tags, key=lambda x: x['text'].lower())
+
+async def fetch_tags_for_documents_batch(doc_ids, lang='en', security_level='Editor'):
+    """Fetches keyword tags for multiple documents in a single query. Returns {doc_id: [tags]}."""
+    if not doc_ids:
+        return {}
+
+    conn = await get_async_connection()
+    if not conn: return {}
+
+    result_map = {doc_id: [] for doc_id in doc_ids}
+    seen_per_doc = {doc_id: set() for doc_id in doc_ids}
+
+    try:
+        async with conn.cursor() as cursor:
+            keyword_column = "k.DESCRIPTION" if lang == 'ar' else "k.KEYWORD_ID"
+            shortlist_clause = "AND k.SHORTLISTED = '1'" if security_level == 'Viewer' else ""
+
+            # Build bind variables for the IN clause
+            bind_names = [f":id{i}" for i in range(len(doc_ids))]
+            bind_clause = ", ".join(bind_names)
+            bind_params = {f"id{i}": doc_id for i, doc_id in enumerate(doc_ids)}
+
+            tag_query = f"""
+                SELECT ldt.DOCNUMBER, {keyword_column}, k.SHORTLISTED
+                FROM LKP_DOCUMENT_TAGS ldt
+                JOIN KEYWORD k ON ldt.TAG_ID = k.SYSTEM_ID
+                WHERE ldt.DOCNUMBER IN ({bind_clause}) AND {keyword_column} IS NOT NULL {shortlist_clause}
+            """
+            await cursor.execute(tag_query, bind_params)
+            async for row in cursor:
+                doc_id = row[0]
+                tag_text = row[1].strip() if row[1] else ""
+                is_shortlisted = row[2] if row[2] else '0'
+
+                if tag_text and tag_text not in seen_per_doc.get(doc_id, set()):
+                    seen_per_doc[doc_id].add(tag_text)
+                    result_map[doc_id].append({
+                        'text': tag_text,
+                        'shortlisted': 1 if str(is_shortlisted) == '1' else 0,
+                        'type': 'keyword'
+                    })
+
+        # Sort tags per document
+        for doc_id in result_map:
+            result_map[doc_id] = sorted(result_map[doc_id], key=lambda x: x['text'].lower())
+
+    except oracledb.Error as e:
+        logging.error(f"Oracle Database error in fetch_tags_for_documents_batch: {e}")
+    finally:
+        if conn:
+            await conn.close()
+
+    return result_map
 
 async def toggle_tag_shortlist(tag, lang='en'):
     """Toggles the SHORTLISTED status of a keyword."""

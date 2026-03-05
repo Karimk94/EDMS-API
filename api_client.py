@@ -98,7 +98,8 @@ def summarize_video(video_data, filename):
         raise Exception("Failed to get a task ID from the video summarizer.")
 
     status_endpoint = f"{api_url}/status/{task_id}"
-    while True:
+    max_polls = 360  # 30 minutes max (360 * 5s)
+    for _ in range(max_polls):
         time.sleep(5)
         status_response = requests.get(status_endpoint, timeout=300)
         status_response.raise_for_status()
@@ -108,6 +109,8 @@ def summarize_video(video_data, filename):
             return status_data['result']
         elif status_data['status'] == 'error':
             raise Exception(f"Video summarization failed: {status_data.get('error')}")
+
+    raise TimeoutError(f"Video summarization timed out after {max_polls * 5} seconds for task {task_id}")
 
 def tokenize_transcript(transcript):
     """Calls the translator/rephraser API to tokenize the transcript."""

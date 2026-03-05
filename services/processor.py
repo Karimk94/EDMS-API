@@ -4,8 +4,38 @@ import json
 import api_client
 import db_connector
 import wsdl_client
-from utils.common import clean_repeated_words
+from utils.common import clean_repeated_words, get_session_token
 from fastapi import HTTPException, Request
+from starlette.concurrency import run_in_threadpool
+
+
+# --- Async wrappers for blocking api_client calls ---
+# api_client uses synchronous `requests` which blocks the event loop.
+# These wrappers offload them to a thread pool.
+
+async def async_summarize_video(video_data, filename):
+    return await run_in_threadpool(api_client.summarize_video, video_data, filename)
+
+async def async_get_captions(image_data, filename):
+    return await run_in_threadpool(api_client.get_captions, image_data, filename)
+
+async def async_get_ocr_text(image_data, filename):
+    return await run_in_threadpool(api_client.get_ocr_text, image_data, filename)
+
+async def async_get_ocr_text_from_pdf(pdf_data, filename):
+    return await run_in_threadpool(api_client.get_ocr_text_from_pdf, pdf_data, filename)
+
+async def async_recognize_faces(image_data, filename):
+    return await run_in_threadpool(api_client.recognize_faces, image_data, filename)
+
+async def async_recognize_faces_from_list(faces_list):
+    return await run_in_threadpool(api_client.recognize_faces_from_list, faces_list)
+
+async def async_translate_text(text):
+    return await run_in_threadpool(api_client.translate_text, text)
+
+async def async_tokenize_transcript(transcript):
+    return await run_in_threadpool(api_client.tokenize_transcript, transcript)
 
 async def process_document(doc, dms_session_token):
     docnumber = doc['docnumber']
@@ -35,24 +65,24 @@ async def process_document(doc, dms_session_token):
         logging.info(f"Media for {docnumber} ({filename}) fetched successfully. Type: {media_type}")
 
         if media_type == 'video':
-            video_summary = api_client.summarize_video(media_bytes, filename)
+            video_summary = await async_summarize_video(media_bytes, filename)
             caption_parts = []
             keywords_to_insert = []
             if video_summary.get('objects'):
                 caption_parts.extend(video_summary['objects'])
                 results['o_detected'] = 1
                 for obj in video_summary['objects']:
-                    arabic_translation = api_client.translate_text(obj)
+                    arabic_translation = await async_translate_text(obj)
                     keywords_to_insert.append({'english': obj, 'arabic': arabic_translation})
             if video_summary.get('faces'):
-                recognized_faces = api_client.recognize_faces_from_list(video_summary['faces'])
+                recognized_faces = await async_recognize_faces_from_list(video_summary['faces'])
                 unique_known_faces = {f.get('name').replace('_', ' ').title() for f in recognized_faces if
                                       f.get('name') and f.get('name') != 'Unknown'}
                 if unique_known_faces:
                     ai_abstract_parts['VIPS'] = ", ".join(sorted(list(unique_known_faces)))
                 results['face'] = 1
             if video_summary.get('transcript'):
-                tokenized_json_str = api_client.tokenize_transcript(video_summary['transcript'])
+                tokenized_json_str = await async_tokenize_transcript(video_summary['transcript'])
                 english_tags = []
                 try:
                     tokenized_data = json.loads(tokenized_json_str)
@@ -65,13 +95,13 @@ async def process_document(doc, dms_session_token):
                 if english_tags:
                     caption_parts.extend(english_tags)
                     for tag in english_tags:
-                        arabic_translation = api_client.translate_text(tag)
+                        arabic_translation = await async_translate_text(tag)
                         keywords_to_insert.append({'english': tag, 'arabic': arabic_translation})
             if video_summary.get('ocr_texts'):
                 results['ocr'] = 1
                 for ocr_text in video_summary['ocr_texts']:
                     if not ocr_text: continue
-                    tokenized_json_str = api_client.tokenize_transcript(ocr_text)
+                    tokenized_json_str = await async_tokenize_transcript(ocr_text)
                     english_tags = []
                     try:
                         tokenized_data = json.loads(tokenized_json_str)
@@ -86,7 +116,7 @@ async def process_document(doc, dms_session_token):
                     if english_tags:
                         caption_parts.extend(english_tags)
                         for tag in english_tags:
-                            arabic_translation = api_client.translate_text(tag)
+                            arabic_translation = await async_translate_text(tag)
                             keywords_to_insert.append({'english': tag, 'arabic': arabic_translation})
             else:
                 results['ocr'] = 1
@@ -99,10 +129,10 @@ async def process_document(doc, dms_session_token):
         elif media_type == 'pdf':
             keywords_to_insert = []
             caption_parts = []
-            ocr_text = api_client.get_ocr_text_from_pdf(media_bytes, filename)
+            ocr_text = await async_get_ocr_text_from_pdf(media_bytes, filename)
             if ocr_text:
                 results['ocr'] = 1
-                tokenized_json_str = api_client.tokenize_transcript(ocr_text)
+                tokenized_json_str = await async_tokenize_transcript(ocr_text)
                 english_tags = []
                 try:
                     tokenized_data = json.loads(tokenized_json_str)
@@ -115,7 +145,7 @@ async def process_document(doc, dms_session_token):
                 if english_tags:
                     caption_parts.extend(english_tags)
                     for tag in english_tags:
-                        arabic_translation = api_client.translate_text(tag)
+                        arabic_translation = await async_translate_text(tag)
                         keywords_to_insert.append({'english': tag, 'arabic': arabic_translation})
             else:
                 results['ocr'] = 1
@@ -129,7 +159,7 @@ async def process_document(doc, dms_session_token):
 
         else:
             keywords_to_insert = []
-            result = api_client.get_captions(media_bytes, filename)
+            result = await async_get_captions(media_bytes, filename)
             if result:
                 raw_caption = result.get('caption', '')
                 cleaned_caption = clean_repeated_words(raw_caption)
@@ -137,17 +167,17 @@ async def process_document(doc, dms_session_token):
                 results['o_detected'] = 1
                 tags = result.get('tags', [])
                 for tag in tags:
-                    arabic_translation = api_client.translate_text(tag)
+                    arabic_translation = await async_translate_text(tag)
                     keywords_to_insert.append({'english': tag, 'arabic': arabic_translation})
             else:
                 results['o_detected'] = 0
-            ocr_text = api_client.get_ocr_text(media_bytes, filename)
+            ocr_text = await async_get_ocr_text(media_bytes, filename)
             if ocr_text:
                 results['ocr'] = 1
                 ai_abstract_parts['OCR'] = ocr_text
             else:
                 results['ocr'] = 1
-            recognized_faces = api_client.recognize_faces(media_bytes, filename)
+            recognized_faces = await async_recognize_faces(media_bytes, filename)
             if recognized_faces is not None:
                 results['face'] = 1
                 unique_known_faces = {f.get('name').replace('_', ' ').title() for f in recognized_faces if
@@ -200,13 +230,9 @@ def get_security_level_int(role: str) -> int:
     # Default/Reader
     return 0
 
-def get_session_token(request: Request):
-    user = request.session.get('user')
-    if not user or 'token' not in user:
-        token = db_connector.dms_system_login()
-        if token: return token
-        raise HTTPException(status_code=401, detail="Session required")
-    return user['token']
+
+# get_session_token is now imported from utils.common
+
 
 def get_current_username(request: Request):
     user = request.session.get('user')

@@ -46,7 +46,7 @@ async def generate_share_link(request: Request, req: ShareLinkCreateRequest):
             user = request.session.get('user')
 
             if not user:
-                return HTTPException(status_code=401, detail="Unauthorized")
+                raise HTTPException(status_code=401, detail="Unauthorized")
 
             user_info = await db_connector.get_user_details(user['username'])
 

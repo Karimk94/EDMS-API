@@ -169,7 +169,7 @@ async def log_share_access(share_id, viewer_email):
             })
             await conn.commit()
     except Exception as e:
-        print(f"Failed to log access: {e}")
+        logging.error(f"Failed to log access: {e}")
     finally:
         await conn.close()
 
@@ -217,18 +217,31 @@ async def get_system_id_by_username(username: str) -> int | None:
             row = await cursor.fetchone()
             return row[0] if row else None
     except Exception as e:
-        print(f"Error fetching user system_id: {e}")
+        logging.error(f"Error fetching user system_id: {e}")
         return None
     finally:
         await conn.close()
 
 async def save_otp(token, email, otp_code, validity_minutes=5):
-    """Saves an OTP to the database with an expiry time."""
+    """Saves an OTP to the database with an expiry time. Rate-limited to 5 per 15 minutes."""
     conn = await get_async_connection()
     if not conn: return False
 
     try:
         async with conn.cursor() as cursor:
+            # Rate limit: check how many OTPs were generated for this token+email recently
+            rate_check_sql = """
+                SELECT COUNT(*) FROM lkp_share_otp 
+                WHERE share_token = :token 
+                AND LOWER(email) = LOWER(:email) 
+                AND expiry_date > SYSDATE - 15/1440
+            """
+            await cursor.execute(rate_check_sql, {'token': token, 'email': email})
+            count_row = await cursor.fetchone()
+            if count_row and count_row[0] >= 5:
+                logging.warning(f"OTP rate limit exceeded for token={token}, email={email}")
+                return False
+
             # Oracle SQL: SYSDATE + (Minutes / 1440) adds minutes to current time
             sql = """
                 INSERT INTO lkp_share_otp (system_id, share_token, email, otp_code, expiry_date, is_used, disabled)

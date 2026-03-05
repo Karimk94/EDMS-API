@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Request, HTTPException, UploadFile, File, Form, BackgroundTasks, Header, Response
+from fastapi import APIRouter, Request, HTTPException, UploadFile, File, Form, BackgroundTasks, Header, Response, Depends
 from fastapi.responses import StreamingResponse
 from werkzeug.utils import secure_filename
 from typing import Optional
@@ -8,7 +8,7 @@ import io
 import mimetypes
 import logging
 import db_connector
-from  utils import common
+from utils.common import get_current_user, get_session_token
 import wsdl_client
 from services.processor import process_document
 from utils.watermark import apply_watermark_to_image, apply_watermark_to_pdf, apply_watermark_to_video, apply_watermark_to_video_async
@@ -73,7 +73,7 @@ async def api_get_documents(
         raise HTTPException(status_code=500, detail="Failed to fetch documents due to server error.")
 
 @router.post('/process-batch')
-async def process_batch(background_tasks: BackgroundTasks):
+async def process_batch(background_tasks: BackgroundTasks, user=Depends(get_current_user)):
     dms_session_token = db_connector.dms_system_login()
     if not dms_session_token:
         raise HTTPException(status_code=500, detail="Failed to authenticate with DMS.")
@@ -82,16 +82,26 @@ async def process_batch(background_tasks: BackgroundTasks):
     if not documents:
         return {"status": "success", "message": "No new documents to process.", "processed_count": 0}
 
+    # Process documents in parallel with a concurrency limit of 3
+    import asyncio
+    semaphore = asyncio.Semaphore(3)
+
+    async def process_with_limit(doc):
+        async with semaphore:
+            return await process_document(doc, dms_session_token)
+
+    results = await asyncio.gather(*[process_with_limit(doc) for doc in documents], return_exceptions=True)
+
     processed_count = 0
-    # In FastAPI, we can dispatch background tasks.
-    # Since we have a list, we iterate and add them.
-    for doc in documents:
-        result_data = await process_document(doc, dms_session_token)
+    for result_data in results:
+        if isinstance(result_data, Exception):
+            logging.error(f"Batch processing error: {result_data}")
+            continue
         background_tasks.add_task(run_db_update, result_data)
         if result_data.get('status') == 3:
             processed_count += 1
 
-    return {"status": "success", "message": f"Processing started for {len(documents)} documents.",
+    return {"status": "success", "message": f"Processing completed for {len(documents)} documents.",
             "processed_count": processed_count}
 
 
@@ -111,41 +121,14 @@ async def api_upload_document(request: Request, file: UploadFile = File(...), do
     # --- Quota Check ---
     user = request.session.get('user')
     if user:
-        # We need the EDMS User ID (System ID from LKP_EDMS_USR_SECUR)
-        # The session user might just have username.
-        # We need to fetch the system ID.
         username = user.get('username')
-        # We can implement a quick lookup or cache, but for now let's use the DB helper we have
-        # Wait, we need "edms_user_id" which is from LKP_EDMS_USR_SECUR, not PEOPLE.system_id.
-        # Let's get "people system ID" first then "edms user id".
-        # Actually admin_db has get_all_edms_users but not get_one.
-        # Let's add a helper or use a direct query here? Or use user_data module?
-        # Ideally we should fetch this info cleanly.
-        # db_connector.get_user_system_id gets PEOPLE.SYSTEM_ID.
-        
-        # Let's do a direct lookup for efficiency or add to user_data?
-        # Let's assume we can query it.
-        
-        # Optimization: To avoid circular imports or complex logic, let's just query here using existing connection?
-        # No, let's do it properly. Add a helper in db_connector to get EDMS system ID?
-        # Or better, let's use db_connector to get people_id then query security table.
-        
         people_id = await db_connector.get_user_system_id(username)
         if people_id:
-             # Find EDMS ID
-             conn = await db_connector.get_async_connection()
-             if conn:
-                 try:
-                     async with conn.cursor() as cursor:
-                         await cursor.execute("SELECT SYSTEM_ID FROM LKP_EDMS_USR_SECUR WHERE USER_ID = :1", [people_id])
-                         res = await cursor.fetchone()
-                         if res:
-                             edms_user_id = res[0]
-                             current_quota = await user_data.get_user_quota(edms_user_id)
-                             if file_size > current_quota:
-                                 raise HTTPException(status_code=400, detail=f"Upload exceeds remaining quota. Remaining: {current_quota} bytes, File: {file_size} bytes.")
-                 finally:
-                     await conn.close()
+            edms_user_id = await user_data.get_edms_user_id(people_id)
+            if edms_user_id:
+                current_quota = await user_data.get_user_quota(edms_user_id)
+                if file_size > current_quota:
+                    raise HTTPException(status_code=400, detail=f"Upload exceeds remaining quota. Remaining: {current_quota} bytes, File: {file_size} bytes.")
     # -------------------
 
     if date_taken:
@@ -193,7 +176,7 @@ async def api_upload_document(request: Request, file: UploadFile = File(...), do
         raise HTTPException(status_code=500, detail="Failed to upload file to DMS.")
 
 @router.post('/api/process_uploaded_documents')
-async def api_process_uploaded_documents(data: ProcessUploadRequest, background_tasks: BackgroundTasks):
+async def api_process_uploaded_documents(data: ProcessUploadRequest, background_tasks: BackgroundTasks, user=Depends(get_current_user)):
     dms_session_token = db_connector.dms_system_login()
     if not dms_session_token:
         raise HTTPException(status_code=500, detail="Failed to authenticate.")
@@ -438,7 +421,7 @@ def set_document_security(doc_id: str, data: SetTrusteesRequest, request: Reques
     """
     Sets the trustees for a specific document or folder using the unified session token.
     """
-    token = common.get_session_token(request)
+    token = get_session_token(request)
 
     success, message = wsdl_client.set_trustees(
         dst=token,

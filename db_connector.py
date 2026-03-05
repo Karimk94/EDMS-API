@@ -14,7 +14,7 @@ from database.documents import (
 )
 from database.tags import (
     add_person_to_lkp, fetch_lkp_persons, fetch_all_tags,
-    fetch_tags_for_document, toggle_tag_shortlist, insert_keywords_and_tags,
+    fetch_tags_for_document, fetch_tags_for_documents_batch, toggle_tag_shortlist, insert_keywords_and_tags,
     add_tag_to_document, update_tag_for_document, delete_tag_from_document
 )
 from database.users import (

@@ -6,6 +6,27 @@ from schemas.tags import AddPersonRequest, ToggleShortlistRequest, ProcessingSta
 
 router = APIRouter()
 
+from pydantic import BaseModel
+from typing import List
+
+class BatchTagsRequest(BaseModel):
+    doc_ids: List[int]
+
+@router.post('/api/tags/batch')
+async def api_get_tags_batch(request: Request, data: BatchTagsRequest, lang: str = 'en'):
+    """Fetch tags for multiple documents in a single request (eliminates N+1 calls)."""
+    user = request.session.get('user')
+    security_level = user.get('security_level', 'Viewer') if user else 'Viewer'
+
+    if not data.doc_ids:
+        return {"tags": {}}
+
+    # Limit batch size to prevent abuse
+    doc_ids = data.doc_ids[:50]
+    tags_map = await db_connector.fetch_tags_for_documents_batch(doc_ids, lang=lang, security_level=security_level)
+    # Convert int keys to string keys for JSON compatibility
+    return {"tags": {str(k): v for k, v in tags_map.items()}}
+
 @router.post('/api/add_person')
 async def api_add_person(data: AddPersonRequest):
     if not data.name or len(data.name.strip()) < 2:

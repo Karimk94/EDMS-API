@@ -1,7 +1,6 @@
 from fastapi import Request, HTTPException, status
 import re
 import wsdl_client
-import gc
 import smtplib
 import os
 import logging
@@ -9,6 +8,63 @@ from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from datetime import datetime
 import base64
+
+# --- Reusable MIME type mapping ---
+def get_mimetype_for_media(media_type: str, file_ext: str = '') -> tuple[str, str]:
+    """
+    Returns (mimetype, disposition) for a given media_type and file extension.
+    Centralizes MIME logic that was previously duplicated in 3+ route handlers.
+    """
+    ext_clean = file_ext.replace('.', '') if file_ext else ''
+    mapping = {
+        'pdf': ('application/pdf', 'inline'),
+        'image': (f'image/{ext_clean}' if ext_clean else 'image/jpeg', 'inline'),
+        'video': (f'video/{ext_clean}' if ext_clean else 'video/mp4', 'inline'),
+        'text': ('text/plain', 'inline'),
+        'zip': ('application/zip', 'attachment'),
+        'excel': ('application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', 'attachment'),
+        'powerpoint': ('application/vnd.openxmlformats-officedocument.presentationml.presentation', 'attachment'),
+        'word': ('application/vnd.openxmlformats-officedocument.wordprocessingml.document', 'attachment'),
+        'docx': ('application/vnd.openxmlformats-officedocument.wordprocessingml.document', 'attachment'),
+        'doc': ('application/vnd.openxmlformats-officedocument.wordprocessingml.document', 'attachment'),
+    }
+    return mapping.get(media_type, ('application/octet-stream', 'attachment'))
+
+# --- Reusable company logo loader ---
+def load_company_logo_base64() -> str:
+    """
+    Loads the company logo from static/images/ and returns a base64 data URI.
+    Returns empty string if the logo is not found.
+    """
+    logo_filename = os.getenv("COMPANY_LOGO_FILENAME", "logo.png")
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    base_dir = os.path.dirname(current_dir)
+
+    search_paths = [
+        os.path.join(base_dir, 'static', 'images', logo_filename),
+        os.path.join(os.getcwd(), 'static', 'images', logo_filename),
+        os.path.join(os.getcwd(), logo_filename),
+        os.path.join(base_dir, logo_filename),
+    ]
+
+    mime_types = {
+        '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg',
+        '.gif': 'image/gif', '.svg': 'image/svg+xml', '.webp': 'image/webp'
+    }
+    ext = os.path.splitext(logo_filename)[1].lower()
+    mime_type = mime_types.get(ext, 'image/png')
+
+    for path in search_paths:
+        if os.path.exists(path):
+            try:
+                with open(path, 'rb') as img_file:
+                    logo_base64 = base64.b64encode(img_file.read()).decode('utf-8')
+                    return f"data:{mime_type};base64,{logo_base64}"
+            except Exception as e:
+                logging.error(f"Could not load logo from {path}: {e}")
+
+    logging.warning(f"Logo file '{logo_filename}' not found in any search path.")
+    return ""
 
 def verify_editor(request: Request):
     user = request.session.get("user")
@@ -60,24 +116,7 @@ def get_session_token(request: Request):
         )
     return token
 
-def find_active_soap_client():
-    """
-    Scans memory to find an active Zeep SOAP Client object.
-    Useful when the client instance is hidden in closures or unknown variable names.
-    """
-    for name, obj in vars(wsdl_client).items():
-        if hasattr(obj, 'service') and hasattr(obj.service, 'Search'):
-            return obj
 
-    try:
-        for obj in gc.get_objects():
-            if hasattr(obj, 'service') and hasattr(obj.service, 'Search'):
-                if hasattr(obj, 'wsdl') or hasattr(obj, 'transport'):
-                    return obj
-    except Exception:
-        pass
-
-    return None
 
 def get_otp_email_template(otp: str, recipient_email: str, validity_minutes: int = 5) -> str:
     """

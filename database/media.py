@@ -254,7 +254,7 @@ def create_thumbnail(doc_number, media_type, file_ext, media_bytes, is_temp=Fals
                 img.convert("RGB").save(cached_path, "JPEG", quality=95)
         return f"temp_thumbnail/{doc_number}" if is_temp else f"cache/{thumbnail_filename}" # Return appropriate path for URL
     except Exception as e:
-        print(f"Could not create thumbnail for {doc_number}: {e}")
+        logging.error(f"Could not create thumbnail for {doc_number}: {e}")
         return None
 
 def clear_thumbnail_cache():

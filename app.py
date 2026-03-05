@@ -37,7 +37,10 @@ app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 # --- Security & Middleware ---
 
-secret_key = os.getenv('FLASK_SECRET_KEY', 'super-secret-key-fallback')
+secret_key = os.getenv('FLASK_SECRET_KEY')
+if not secret_key:
+    raise RuntimeError("FLASK_SECRET_KEY environment variable is not set. Cannot start without it.")
+
 app.add_middleware(
     SessionMiddleware,
     secret_key=secret_key,
@@ -45,10 +48,12 @@ app.add_middleware(
     session_cookie="session"
 )
 
-# 2. CORS Middleware
+# 2. CORS Middleware — restrict to configured frontend URL
+frontend_url = os.getenv('FRONTEND_URL', 'http://localhost:3000')
+allowed_origins = [origin.strip() for origin in frontend_url.split(',')]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=allowed_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -70,6 +75,26 @@ app.include_router(profilesearch.router)
 @app.get("/")
 def health_check():
     return {"status": "EDMS API is running"}
+
+# --- Background Cache Eviction ---
+import asyncio
+from utils.cache_eviction import cleanup_video_cache
+
+async def periodic_cache_cleanup():
+    """Runs video cache cleanup every 6 hours."""
+    video_cache_path = os.path.join(os.getcwd(), 'video_cache')
+    while True:
+        try:
+            result = cleanup_video_cache(video_cache_path)
+            if result.get('deleted_count', 0) > 0:
+                logging.info(f"Cache cleanup: {result}")
+        except Exception as e:
+            logging.error(f"Cache cleanup error: {e}")
+        await asyncio.sleep(6 * 3600)  # Every 6 hours
+
+@app.on_event("startup")
+async def startup_event():
+    asyncio.create_task(periodic_cache_cleanup())
 
 if __name__ == '__main__':
     import uvicorn
