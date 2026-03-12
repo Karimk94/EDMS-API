@@ -30,8 +30,8 @@ async def get_tab_permissions_for_user(user_id: int):
             for row in rows:
                 perms.append({
                     'tab_key': row[0],
-                    'can_read': bool(row[1]),
-                    'can_write': bool(row[2])
+                    'can_read': row[1] in (1, '1', 'Y', 'y', 'True', 'true', True),
+                    'can_write': row[2] in (1, '1', 'Y', 'y', 'True', 'true', True)
                 })
     except oracledb.Error as e:
         logging.error(f"Oracle Database error in get_tab_permissions_for_user: {e}", exc_info=True)
@@ -66,8 +66,8 @@ async def get_tab_permissions_for_user_admin(user_id: int):
                 perms.append({
                     'id': row[0],
                     'tab_key': row[1],
-                    'can_read': bool(row[2]),
-                    'can_write': bool(row[3]),
+                    'can_read': row[2] in (1, '1', 'Y', 'y', 'True', 'true', True),
+                    'can_write': row[3] in (1, '1', 'Y', 'y', 'True', 'true', True),
                     'disabled': row[4] in ('1', 'Y') if row[4] else False
                 })
     except oracledb.Error as e:

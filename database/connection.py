@@ -48,7 +48,7 @@ def _get_sync_pool():
                 user=user, password=password, dsn=dsn,
                 min=2, max=10, increment=1
             )
-            logging.info("Synchronous Oracle connection pool created.")
+            # logging.info("Synchronous Oracle connection pool created.")
         except oracledb.Error as ex:
             error, = ex.args
             logging.error(f"Failed to create sync pool: {error.message}")
@@ -70,7 +70,7 @@ async def _get_async_pool():
                 user=user, password=password, dsn=dsn,
                 min=2, max=10, increment=1
             )
-            logging.info("Asynchronous Oracle connection pool created.")
+            # logging.info("Asynchronous Oracle connection pool created.")
         except oracledb.Error as ex:
             error, = ex.args
             logging.error(f"Failed to create async pool: {error.message}")

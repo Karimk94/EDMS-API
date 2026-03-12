@@ -1,13 +1,15 @@
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Depends
 from typing import Optional
 import logging
 import db_connector
 from schemas.events import CreateEventRequest
+from utils.common import get_current_user
 
 router = APIRouter()
 
 @router.get('/api/events')
 async def get_events_route(
+        user=Depends(get_current_user),
         page: int = 1,
         pageSize: int = 20,
         search: Optional[str] = None,
@@ -34,7 +36,7 @@ async def get_events_route(
     }
 
 @router.post('/api/events')
-async def create_event_route(data: CreateEventRequest):
+async def create_event_route(data: CreateEventRequest, user=Depends(get_current_user)):
     if not data.name:
         raise HTTPException(status_code=400, detail="Event name is required.")
 
@@ -45,7 +47,7 @@ async def create_event_route(data: CreateEventRequest):
         raise HTTPException(status_code=400, detail=message)
 
 @router.get('/api/events/{event_id}/documents')
-async def get_event_documents_route(event_id: int, page: int = 1):
+async def get_event_documents_route(event_id: int, page: int = 1, user=Depends(get_current_user)):
     page_size = 1
     if page < 1: page = 1
 
@@ -63,7 +65,7 @@ async def get_event_documents_route(event_id: int, page: int = 1):
     return {"document": current_doc, "page": page, "total_pages": total_pages}
 
 @router.get('/api/journey')
-async def get_journey_data():
+async def get_journey_data(user=Depends(get_current_user)):
     try:
         journey_data = await db_connector.fetch_journey_data()
         return journey_data

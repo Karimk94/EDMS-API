@@ -1,4 +1,5 @@
 from fastapi import APIRouter, HTTPException, Request, Query
+from fastapi.responses import JSONResponse
 import db_connector
 import wsdl_client
 from wsdl_client import users as wsdl_users
@@ -6,10 +7,17 @@ from schemas.auth import LoginRequest, LangUpdateRequest, ThemeUpdateRequest, Gr
 from typing import List
 from services import processor
 import logging
+from slowapi import Limiter
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
 
 router = APIRouter()
 
+# Rate limiter for login endpoint — keyed by client IP
+limiter = Limiter(key_func=get_remote_address)
+
 @router.post('/api/auth/login')
+@limiter.limit("5/minute")
 async def login(request: Request, creds: LoginRequest):
     dst, error_msg = wsdl_client.dms_user_login(creds.username, creds.password)
     if dst:
@@ -59,7 +67,10 @@ async def login(request: Request, creds: LoginRequest):
         }
 
         request.session['user'] = user_details
-        return {"message": "Login successful", "user": user_details}
+
+        # Strip internal token before sending to client
+        safe_user = {k: v for k, v in user_details.items() if k != 'token'}
+        return {"message": "Login successful", "user": safe_user}
     else:
         raise HTTPException(status_code=401, detail=error_msg or "Invalid DMS credentials")
 
@@ -90,7 +101,10 @@ async def get_user(request: Request):
                     user_details['tab_permissions'] = []
 
             request.session['user'] = user_details
-            return {'user': user_details}
+
+            # Strip internal token before sending to client
+            safe_user = {k: v for k, v in user_details.items() if k != 'token'}
+            return {'user': safe_user}
         else:
             request.session.pop('user', None)
             raise HTTPException(status_code=401, detail='User not found')

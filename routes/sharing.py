@@ -19,10 +19,11 @@ from datetime import datetime
 from fastapi.responses import StreamingResponse, FileResponse
 import io
 import re
+import secrets
 import wsdl_client
 from database.media import video_cache_dir
 
-from utils.common import send_otp_email, send_share_link_email
+from utils.common import send_otp_email, send_share_link_email, get_mimetype_for_media
 from utils.watermark import apply_watermark_to_image, apply_watermark_to_pdf, apply_watermark_to_video, apply_watermark_to_video_async
 
 router = APIRouter()
@@ -190,10 +191,10 @@ async def generate_share_link(request: Request, req: ShareLinkCreateRequest):
     except HTTPException:
         raise
     except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        raise HTTPException(status_code=400, detail="Invalid share parameters.")
     except Exception as e:
         logging.error(f"Share generation error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Failed to generate share link.")
 
 @router.get('/api/share/info/{token}')
 async def get_share_info(token: str):
@@ -228,7 +229,7 @@ async def get_share_info(token: str):
         raise
     except Exception as e:
         logging.error(f"Share info error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Failed to retrieve share info.")
 
 @router.post('/api/share/request-access/{token}')
 async def request_access_otp(token: str, req: ShareAccessRequest):
@@ -251,8 +252,8 @@ async def request_access_otp(token: str, req: ShareAccessRequest):
         if not share_info:
             raise HTTPException(status_code=404, detail="Link is invalid or expired")
 
-        # Generate OTP
-        otp = str(random.randint(100000, 999999))
+        # Generate OTP using cryptographically secure random
+        otp = str(secrets.randbelow(900000) + 100000)
 
         # Store OTP in Database
         saved = await sharing_db.save_otp(token, viewer_email, otp)
@@ -268,7 +269,7 @@ async def request_access_otp(token: str, req: ShareAccessRequest):
         raise ex
     except Exception as e:
         logging.error(f"OTP request error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Failed to process OTP request.")
 
 @router.post('/api/share/verify-access/{token}')
 async def verify_access_otp(token: str, req: ShareVerifyRequest):
@@ -295,23 +296,19 @@ async def verify_access_otp(token: str, req: ShareVerifyRequest):
         target_email = share_info.get('target_email')
         is_restricted = target_email is not None
 
-        # Determine if we should skip OTP verification
-        # Only allow skipping OTP for restricted shares where viewer matches target
+        # OTP verification is always required
         if req.skip_otp:
-            if not is_restricted:
-                raise HTTPException(
-                    status_code=400, 
-                    detail="OTP verification cannot be skipped for open shares"
-                )
-            # For restricted shares, viewer_email must match target_email (already validated above)
-            # Skip OTP verification - access is granted based on email match
-        else:
-            # Verify and Consume OTP in one go
-            is_valid = await sharing_db.verify_otp(token, viewer_email, req.otp)
+            raise HTTPException(
+                status_code=400,
+                detail="OTP verification is required for all shares"
+            )
 
-            if not is_valid:
-                # Note: This generic message covers expired, used, or wrong OTPs for security
-                raise HTTPException(status_code=400, detail="Invalid or expired OTP.")
+        # Verify and Consume OTP in one go
+        is_valid = await sharing_db.verify_otp(token, viewer_email, req.otp)
+
+        if not is_valid:
+            # Note: This generic message covers expired, used, or wrong OTPs for security
+            raise HTTPException(status_code=400, detail="Invalid or expired OTP.")
 
         await sharing_db.log_share_access(share_info['share_id'], viewer_email)
 
@@ -344,7 +341,7 @@ async def verify_access_otp(token: str, req: ShareVerifyRequest):
         raise
     except Exception as e:
         logging.error(f"OTP verification error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Failed to verify access.")
 
 @router.get('/api/share/folder-contents/{token}')
 async def get_shared_folder_contents(
@@ -411,7 +408,7 @@ async def get_shared_folder_contents(
         raise
     except Exception as e:
         logging.error(f"Folder contents error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Failed to retrieve folder contents.")
 
 @router.get('/api/share/stream/{token}')
 async def stream_shared_document(
@@ -505,10 +502,7 @@ async def stream_shared_document(
         if not file_bytes:
             raise HTTPException(status_code=500, detail="Failed to retrieve content")
 
-        mimetype = 'application/octet-stream'
-        if media_type == 'pdf': mimetype = 'application/pdf'
-        elif media_type == 'image': mimetype = 'image/jpeg'
-        elif media_type == 'text': mimetype = 'text/plain'
+        mimetype, _ = get_mimetype_for_media(media_type, file_ext)
 
         return StreamingResponse(
             io.BytesIO(file_bytes),
@@ -522,7 +516,7 @@ async def stream_shared_document(
         raise
     except Exception as e:
         logging.error(f"Stream error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Failed to stream document.")
 
 @router.get('/api/share/download/{token}')
 async def download_shared_document(
@@ -632,17 +626,9 @@ async def download_shared_document(
             # They are generated on-the-fly and streamed, leaving no residual files.
             # Use async version to support cancellation (client disconnect stops processing)
             processed_bytes, mimetype = await apply_watermark_to_video_async(file_bytes, watermark_text, filename)
-            
-        elif media_type == 'text':
-            mimetype = "text/plain"
-        elif media_type == 'zip':
-            mimetype = "application/zip"
-        elif media_type == 'excel':
-            mimetype = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        elif media_type == 'powerpoint':
-            mimetype = "application/vnd.openxmlformats-officedocument.presentationml.presentation"
-        elif media_type in ['word', 'docx', 'doc']:
-            mimetype = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        else:
+            # For text, zip, excel, powerpoint, word, etc. — use centralized MIME lookup
+            mimetype, _ = get_mimetype_for_media(media_type, file_ext)
 
         # 9. Log the download
         await sharing_db.log_share_access(share_info['share_id'], viewer_email)
@@ -661,4 +647,4 @@ async def download_shared_document(
         raise
     except Exception as e:
         logging.error(f"Share download error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Failed to download document.")

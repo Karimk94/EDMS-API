@@ -1,8 +1,9 @@
 import logging
-from fastapi import APIRouter, Request, HTTPException, Header
+from fastapi import APIRouter, Request, HTTPException, Header, Depends
 from typing import Optional
 import wsdl_client
 from schemas.folders import CreateFolderRequest, RenameFolderRequest
+from utils.common import get_current_user
 
 router = APIRouter()
 
@@ -34,7 +35,8 @@ async def api_list_folders(
         )
         return {"contents": contents}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logging.error(f"Error listing folders: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to list folder contents.")
 
 @router.post('/api/folders')
 async def api_create_folder(request: Request, data: CreateFolderRequest):
@@ -83,7 +85,8 @@ async def api_create_folder(request: Request, data: CreateFolderRequest):
         else:
             raise HTTPException(status_code=500, detail="Failed to create folder")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logging.error(f"Error creating folder: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to create folder.")
 
 @router.put('/api/folders/{folder_id}')
 async def api_rename_folder(folder_id: str, request: Request, data: RenameFolderRequest):
@@ -108,7 +111,7 @@ async def api_rename_folder(folder_id: str, request: Request, data: RenameFolder
         raise
     except Exception as e:
         logging.error(f"Error in rename: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Failed to rename folder.")
 
 @router.delete('/api/folders/{folder_id}')
 async def api_delete_folder(folder_id: str, request: Request, force: bool = False):
@@ -140,10 +143,10 @@ async def api_delete_folder(folder_id: str, request: Request, force: bool = Fals
             return {"message": "Folder and contents deleted", "id": folder_id}
 
         # Other errors
-        raise HTTPException(status_code=500, detail=f"Delete failed: {message}")
+        raise HTTPException(status_code=500, detail="Failed to delete folder. It may be referenced elsewhere.")
 
     except HTTPException as he:
         raise he
     except Exception as e:
         logging.error(f"Error in api_delete_folder: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Failed to delete folder.")

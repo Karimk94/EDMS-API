@@ -8,7 +8,7 @@ import io
 import mimetypes
 import logging
 import db_connector
-from utils.common import get_current_user, get_session_token
+from utils.common import get_current_user, get_session_token, get_mimetype_for_media
 import wsdl_client
 from services.processor import process_document
 from utils.watermark import apply_watermark_to_image, apply_watermark_to_pdf, apply_watermark_to_video, apply_watermark_to_video_async
@@ -41,12 +41,12 @@ async def api_get_documents(
         media_type: Optional[str] = None,
         scope: Optional[str] = None,
         memoryMonth: Optional[str] = None,
-        memoryDay: Optional[str] = None
+        memoryDay: Optional[str] = None,
+        user=Depends(get_current_user)
 ):
     try:
-        user = request.session.get('user')
-        username = user.get('username') if user else None
-        security_level = user.get('security_level', 'Viewer') if user else 'Viewer'
+        username = user.get('username')
+        security_level = user.get('security_level', 'Viewer')
 
         if page < 1: page = 1
         if pageSize < 1: pageSize = 20
@@ -110,7 +110,8 @@ async def api_upload_document(request: Request, file: UploadFile = File(...), do
                               abstract: str = Form("Uploaded via EDMS Viewer"),
                               event_id: Optional[str] = Form(None), parent_id: Optional[str] = Form(None),
                               date_taken: Optional[str] = Form(None),
-                              x_app_source: str = Header("unknown", alias="X-App-Source")):
+                              x_app_source: str = Header("unknown", alias="X-App-Source"),
+                              user=Depends(get_current_user)):
     if not file.filename:
         raise HTTPException(status_code=400, detail="No selected file")
 
@@ -119,9 +120,8 @@ async def api_upload_document(request: Request, file: UploadFile = File(...), do
     file_size = len(file_bytes)
 
     # --- Quota Check ---
-    user = request.session.get('user')
-    if user:
-        username = user.get('username')
+    username = user.get('username')
+    if username:
         people_id = await db_connector.get_user_system_id(username)
         if people_id:
             edms_user_id = await user_data.get_edms_user_id(people_id)
@@ -226,27 +226,8 @@ async def get_document_file(docnumber: int, request: Request):
         stream_generator, stream_filename = db_connector.stream_document_from_dms(dst, docnumber)
 
         if stream_generator:
-            # Determine correct content type
-            mimetype = 'application/octet-stream'
-            disposition = 'inline'
-
-            if media_type == 'pdf':
-                mimetype = "application/pdf"
-            elif media_type == 'image':
-                mimetype = f"image/{file_ext.replace('.', '')}"
-            elif media_type == 'video':
-                mimetype = f"video/{file_ext.replace('.', '')}"
-            elif media_type == 'text':
-                mimetype = "text/plain"
-            elif media_type == 'zip':
-                mimetype = "application/zip"
-                disposition = 'attachment'
-            elif media_type == 'excel':
-                mimetype = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                disposition = 'attachment'  # Browsers often can't preview Excel inline
-            elif media_type == 'powerpoint':
-                mimetype = "application/vnd.openxmlformats-officedocument.presentationml.presentation"
-                disposition = 'attachment'
+            # Determine correct content type using centralized MIME logic
+            mimetype, disposition = get_mimetype_for_media(media_type, file_ext)
             
             # Use filename from stream if DB filename was missing (unlikely given get_media_info check)
             if not filename and stream_filename:
@@ -255,7 +236,7 @@ async def get_document_file(docnumber: int, request: Request):
             return StreamingResponse(
                 stream_generator,
                 media_type=mimetype,
-                headers={"Content-Disposition": f"{disposition}; filename={filename}"}
+                headers={"Content-Disposition": f'{disposition}; filename="{filename}"'}
             )
         else:
             # Fallback to old method if streaming setup fails
@@ -274,7 +255,7 @@ async def get_document_file(docnumber: int, request: Request):
         raise HTTPException(status_code=500, detail="Internal Server Error")
 
 @router.put('/api/update_metadata')
-async def api_update_metadata(data: UpdateMetadataRequest):
+async def api_update_metadata(data: UpdateMetadataRequest, user=Depends(get_current_user)):
     if data.abstract is None and data.date_taken is None:
         raise HTTPException(status_code=400, detail='At least one field must be provided.')
 
@@ -395,7 +376,7 @@ async def api_download_watermarked(doc_id: int, request: Request):
     )
 
 @router.post('/api/update_abstract')
-async def api_update_abstract(data: UpdateAbstractRequest):
+async def api_update_abstract(data: UpdateAbstractRequest, user=Depends(get_current_user)):
     success, message = await db_connector.update_abstract_with_vips(data.doc_id, data.names)
     if success:
         return {'message': message}
@@ -403,7 +384,7 @@ async def api_update_abstract(data: UpdateAbstractRequest):
         raise HTTPException(status_code=500, detail=message)
 
 @router.put('/api/document/{doc_id}/event')
-async def link_document_event(doc_id: int, data: LinkEventRequest):
+async def link_document_event(doc_id: int, data: LinkEventRequest, user=Depends(get_current_user)):
     success, message = await db_connector.link_document_to_event(doc_id, data.event_id)
     if success:
         return {"message": message}
@@ -411,7 +392,7 @@ async def link_document_event(doc_id: int, data: LinkEventRequest):
         raise HTTPException(status_code=500, detail=message)
 
 @router.get('/api/document/{doc_id}/event')
-async def get_document_event(doc_id: int):
+async def get_document_event(doc_id: int, user=Depends(get_current_user)):
     event_info = await db_connector.get_event_for_document(doc_id)
     # Return empty dict if None to match JSON behavior or handle strictly
     return event_info if event_info else {}

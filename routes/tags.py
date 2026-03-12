@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Request, HTTPException, Depends, Header
 import db_connector
 import api_client
-from utils.common import verify_editor
+from utils.common import verify_editor, get_current_user
 from schemas.tags import AddPersonRequest, ToggleShortlistRequest, ProcessingStatusRequest, AddTagRequest
 
 router = APIRouter()
@@ -13,10 +13,9 @@ class BatchTagsRequest(BaseModel):
     doc_ids: List[int]
 
 @router.post('/api/tags/batch')
-async def api_get_tags_batch(request: Request, data: BatchTagsRequest, lang: str = 'en'):
+async def api_get_tags_batch(request: Request, data: BatchTagsRequest, lang: str = 'en', user=Depends(get_current_user)):
     """Fetch tags for multiple documents in a single request (eliminates N+1 calls)."""
-    user = request.session.get('user')
-    security_level = user.get('security_level', 'Viewer') if user else 'Viewer'
+    security_level = user.get('security_level', 'Viewer')
 
     if not data.doc_ids:
         return {"tags": {}}
@@ -28,7 +27,7 @@ async def api_get_tags_batch(request: Request, data: BatchTagsRequest, lang: str
     return {"tags": {str(k): v for k, v in tags_map.items()}}
 
 @router.post('/api/add_person')
-async def api_add_person(data: AddPersonRequest):
+async def api_add_person(data: AddPersonRequest, user=Depends(get_current_user)):
     if not data.name or len(data.name.strip()) < 2:
         raise HTTPException(status_code=400, detail='Invalid data.')
     try:
@@ -42,7 +41,7 @@ async def api_add_person(data: AddPersonRequest):
             name_english = data.name.strip()
             name_arabic = api_client.translate_text(name_english) or None
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f'Translation error: {e}')
+        raise HTTPException(status_code=500, detail='Translation failed. Please try again.')
 
     success, message = await db_connector.add_person_to_lkp(name_english, name_arabic)
     if success:
@@ -51,7 +50,7 @@ async def api_add_person(data: AddPersonRequest):
         raise HTTPException(status_code=500, detail=message)
 
 @router.get('/api/persons')
-async def api_get_persons(page: int = 1, search: str = '', lang: str = 'en'):
+async def api_get_persons(page: int = 1, search: str = '', lang: str = 'en', user=Depends(get_current_user)):
     persons, total_rows = await db_connector.fetch_lkp_persons(page=page, search=search, lang=lang)
     return {'options': persons, 'hasMore': (page * 20) < total_rows}
 
@@ -59,10 +58,10 @@ async def api_get_persons(page: int = 1, search: str = '', lang: str = 'en'):
 async def api_get_tags(
         request: Request,
         lang: str = 'en',
-        x_app_source: str = Header("unknown", alias="X-App-Source")
+        x_app_source: str = Header("unknown", alias="X-App-Source"),
+        user=Depends(get_current_user)
 ):
-    user = request.session.get('user')
-    security_level = user.get('security_level', 'Viewer') if user else 'Viewer'
+    security_level = user.get('security_level', 'Viewer')
 
     tags = await db_connector.fetch_all_tags(
         lang=lang, security_level=security_level, app_source=x_app_source
@@ -70,9 +69,8 @@ async def api_get_tags(
     return tags
 
 @router.get('/api/tags/{doc_id}')
-async def api_get_tags_for_document(doc_id: int, request: Request, lang: str = 'en'):
-    user = request.session.get('user')
-    security_level = user.get('security_level', 'Viewer') if user else 'Viewer'
+async def api_get_tags_for_document(doc_id: int, request: Request, lang: str = 'en', user=Depends(get_current_user)):
+    security_level = user.get('security_level', 'Viewer')
 
     tags = await db_connector.fetch_tags_for_document(
         doc_id, lang=lang, security_level=security_level
@@ -90,14 +88,14 @@ async def api_toggle_shortlist(data: ToggleShortlistRequest):
         raise HTTPException(status_code=400, detail=result)
 
 @router.post('/api/processing_status')
-async def api_processing_status(data: ProcessingStatusRequest):
+async def api_processing_status(data: ProcessingStatusRequest, user=Depends(get_current_user)):
     if not data.docnumbers:
         raise HTTPException(status_code=400, detail="Invalid data.")
     still_processing = await db_connector.check_processing_status(data.docnumbers)
     return {"processing": still_processing}
 
 @router.post('/api/tags/{doc_id}')
-async def api_add_tag(doc_id: int, data: AddTagRequest):
+async def api_add_tag(doc_id: int, data: AddTagRequest, user=Depends(get_current_user)):
     if not data.tag or len(data.tag.strip()) < 2:
         raise HTTPException(status_code=400, detail='Invalid tag.')
     try:
@@ -119,10 +117,10 @@ async def api_add_tag(doc_id: int, data: AddTagRequest):
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f'Server error: {e}')
+        raise HTTPException(status_code=500, detail='Failed to add tag.')
 
 @router.delete('/api/tags/{doc_id}/{tag}')
-async def api_delete_tag(doc_id: int, tag: str):
+async def api_delete_tag(doc_id: int, tag: str, user=Depends(get_current_user)):
     success, message = await db_connector.delete_tag_from_document(doc_id, tag)
     if success:
         return {'message': message}

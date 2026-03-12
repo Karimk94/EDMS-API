@@ -68,7 +68,7 @@ def load_company_logo_base64() -> str:
 
 def verify_editor(request: Request):
     user = request.session.get("user")
-    if not user or user.get("security_level") != "Editor":
+    if not user or user.get("security_level") not in ("Editor", "Admin"):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Forbidden: Editor privileges required."
@@ -129,76 +129,8 @@ def get_otp_email_template(otp: str, recipient_email: str, validity_minutes: int
     support_email = os.getenv("SUPPORT_EMAIL")
     primary_color = os.getenv("EMAIL_PRIMARY_COLOR")
 
-    # Build logo as base64 data URI from local file
-    logo_base64_src = ""
-    logo_filename = os.getenv("COMPANY_LOGO_FILENAME")
-
-    # Get current file location
-    current_file = os.path.abspath(__file__)
-
-    # Get directory of current file (utils/)
-    current_dir = os.path.dirname(current_file)
-
-    # Get parent directory (project root)
-    base_dir = os.path.dirname(current_dir)
-
-    # Build expected logo path
-    logo_path = os.path.join(base_dir, 'static', 'images', logo_filename)
-
-    # Check if logo file exists
-    logo_exists = os.path.exists(logo_path)
-
-    if logo_exists:
-        try:
-            # Get file size
-            file_size = os.path.getsize(logo_path)
-
-            # Determine mime type based on file extension
-            ext = os.path.splitext(logo_filename)[1].lower()
-            mime_types = {
-                '.png': 'image/png',
-                '.jpg': 'image/jpeg',
-                '.jpeg': 'image/jpeg',
-                '.gif': 'image/gif',
-                '.svg': 'image/svg+xml',
-                '.webp': 'image/webp'
-            }
-            mime_type = mime_types.get(ext, 'image/png')
-
-            # Read and encode the image
-            with open(logo_path, 'rb') as img_file:
-                logo_bytes = img_file.read()
-
-                logo_base64 = base64.b64encode(logo_bytes).decode('utf-8')
-
-                logo_base64_src = f"data:{mime_type};base64,{logo_base64}"
-
-        except Exception as e:
-            logging.error(f"[ERROR] Could not load logo from {logo_path}: {e}", exc_info=True)
-    else:
-        logging.warning(f"[WARNING] Logo file not found at: {logo_path}")
-
-        # Try alternative paths
-        alt_paths = [
-            os.path.join(os.getcwd(), 'static', 'images', logo_filename),
-            os.path.join(os.getcwd(), logo_filename),
-            os.path.join(base_dir, logo_filename),
-            os.path.join(current_dir, 'static', 'images', logo_filename),
-        ]
-
-        for i, alt_path in enumerate(alt_paths):
-            exists = os.path.exists(alt_path)
-            if exists and not logo_base64_src:
-                try:
-                    ext = os.path.splitext(logo_filename)[1].lower()
-                    mime_type = {'.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg',
-                                 '.gif': 'image/gif'}.get(ext, 'image/png')
-                    with open(alt_path, 'rb') as img_file:
-                        logo_base64 = base64.b64encode(img_file.read()).decode('utf-8')
-                        logo_base64_src = f"data:{mime_type};base64,{logo_base64}"
-                except Exception as e:
-                    logging.error(f"  [ERROR] Failed to load from {alt_path}: {e}")
-    # === END LOGO PATH RESOLUTION ===
+    # Build logo as base64 data URI from local file (uses consolidated loader)
+    logo_base64_src = load_company_logo_base64()
 
     current_datetime = datetime.now().strftime("%B %d, %Y at %I:%M %p")
 
@@ -357,7 +289,7 @@ def send_otp_email(to_email: str, otp: str, validity_minutes: int = 5):
     sender_name = os.getenv("SMTP_SENDER_NAME")
 
     if not smtp_user or not smtp_password:
-        logging.warning(f"SMTP credentials not configured. Mocking OTP for {to_email}: {otp}")
+        logging.warning(f"SMTP credentials not configured. OTP generation skipped for {to_email}")
         return
 
     subject = "Document Access Verification Code"
@@ -415,32 +347,8 @@ def get_share_link_email_template(
     support_email = os.getenv("SUPPORT_EMAIL")
     primary_color = os.getenv("EMAIL_PRIMARY_COLOR")
 
-    # Build logo as base64
-    logo_base64_src = ""
-    logo_filename = os.getenv("COMPANY_LOGO_FILENAME")
-    current_file = os.path.abspath(__file__)
-    current_dir = os.path.dirname(current_file)
-    base_dir = os.path.dirname(current_dir)
-    logo_path = os.path.join(base_dir, 'static', 'images', logo_filename)
-
-    if os.path.exists(logo_path):
-        try:
-            ext = os.path.splitext(logo_filename)[1].lower()
-            mime_types = {
-                '.png': 'image/png',
-                '.jpg': 'image/jpeg',
-                '.jpeg': 'image/jpeg',
-                '.gif': 'image/gif',
-                '.svg': 'image/svg+xml',
-                '.webp': 'image/webp'
-            }
-            mime_type = mime_types.get(ext, 'image/png')
-            with open(logo_path, 'rb') as img_file:
-                logo_bytes = img_file.read()
-                logo_base64 = base64.b64encode(logo_bytes).decode('utf-8')
-                logo_base64_src = f"data:{mime_type};base64,{logo_base64}"
-        except Exception as e:
-            logging.error(f"Could not load logo: {e}")
+    # Build logo as base64 (uses consolidated loader)
+    logo_base64_src = load_company_logo_base64()
 
     # Logo section
     logo_section = ""

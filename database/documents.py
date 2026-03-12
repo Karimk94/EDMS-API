@@ -400,18 +400,15 @@ async def fetch_documents_from_oracle(page=1, page_size=20, search_term=None, da
                     cached_thumbnail_file = f"{doc_id}.jpg"
                     cached_path = os.path.join(thumbnail_cache_dir, cached_thumbnail_file)
 
+                    # Only use pre-cached thumbnails — do NOT block on WSDL calls
+                    # to download full media content during listing.
+                    # Uncached thumbnails are lazy-loaded by the frontend via
+                    # GET /api/temp_thumbnail/{doc_id}
                     if os.path.exists(cached_path):
                         thumbnail_path = f"cache/{cached_thumbnail_file}"
-                    else:
-                        # Sync call for content retrieval (WSDL)
-                        media_bytes = get_media_content_from_dms(dst, doc_id)
-                        if media_bytes:
-                            thumbnail_path = create_thumbnail(doc_id, media_type, file_ext, media_bytes)
-                        else:
-                            logging.warning(f"Could not retrieve media content for doc {doc_id} to create thumbnail.")
 
                 except Exception as media_info_e:
-                    logging.error(f"Error processing media info/thumbnail for doc {doc_id}: {media_info_e}",
+                    logging.error(f"Error processing media info for doc {doc_id}: {media_info_e}",
                                   exc_info=True)
 
                 documents.append({

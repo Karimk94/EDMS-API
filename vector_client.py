@@ -22,7 +22,7 @@ client = chromadb.PersistentClient(path=CHROMA_DB_PATH,settings=Settings(anonymi
 # We create a wrapper class that matches what ChromaDB expects
 class ExternalEmbeddingFunction(embedding_functions.EmbeddingFunction):
     def __call__(self, input_texts: chromadb.Documents) -> chromadb.Embeddings:
-        logging.info(f"ExternalEmbeddingFunction: Requesting embeddings for {len(input_texts)} document(s) from external service.")
+        # logging.info(f"ExternalEmbeddingFunction: Requesting embeddings for {len(input_texts)} document(s) from external service.")
         embeddings = []
         for text in input_texts:
             try:
@@ -31,17 +31,17 @@ class ExternalEmbeddingFunction(embedding_functions.EmbeddingFunction):
                 embedding = api_client.get_embedding_from_service(text)
                 if embedding:
                     embeddings.append(embedding)
-                    logging.info(f"ExternalEmbeddingFunction: Successfully received embedding.")
+                    # logging.info(f"ExternalEmbeddingFunction: Successfully received embedding.")
                 else:
                     # Append a zero vector as a fallback if API fails for one item
-                    logging.warning(f"ExternalEmbeddingFunction: Failed to get embedding for text: {text[:70]}... Using zero vector.")
+                    # logging.warning(f"ExternalEmbeddingFunction: Failed to get embedding for text: {text[:70]}... Using zero vector.")
                     # Model dimension for 'all-MiniLM-L6-v2' is 384
                     embeddings.append([0.0] * 384) 
             except Exception as e:
-                logging.error(f"ExternalEmbeddingFunction: Error getting embedding: {e}", exc_info=True)
+                # logging.error(f"ExternalEmbeddingFunction: Error getting embedding: {e}", exc_info=True)
                 embeddings.append([0.0] * 384)
         
-        logging.info(f"ExternalEmbeddingFunction: Finished processing {len(input_texts)} embeddings.")
+        # logging.info(f"ExternalEmbeddingFunction: Finished processing {len(input_texts)} embeddings.")
         return embeddings
 
 # Initialize the external embedding function

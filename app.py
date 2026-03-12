@@ -1,5 +1,7 @@
 import logging
 import os
+import asyncio
+from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -8,6 +10,8 @@ from dotenv import load_dotenv
 
 # Import Routers
 from routes import auth, documents, media, tags, events, folders, favorites, memories, sharing, admin, profilesearch
+from slowapi import _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
 
 # Load environment variables
 load_dotenv()
@@ -18,7 +22,32 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 # --- Log Filtering ---
 logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
 
-app = FastAPI(title="EDMS Middleware API")
+# --- Background Cache Eviction ---
+from utils.cache_eviction import cleanup_video_cache
+
+async def periodic_cache_cleanup():
+    """Runs video cache cleanup every 6 hours."""
+    video_cache_path = os.path.join(os.getcwd(), 'video_cache')
+    while True:
+        try:
+            result = cleanup_video_cache(video_cache_path)
+            if result.get('deleted_count', 0) > 0:
+                logging.info(f"Cache cleanup: {result}")
+        except Exception as e:
+            logging.error(f"Cache cleanup error: {e}")
+        await asyncio.sleep(6 * 3600)  # Every 6 hours
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Modern lifespan handler replacing deprecated @app.on_event."""
+    asyncio.create_task(periodic_cache_cleanup())
+    yield
+
+app = FastAPI(title="EDMS Middleware API", lifespan=lifespan)
+
+# --- Rate Limiting ---
+app.state.limiter = auth.limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 # --- Static Files Setup ---
 # Create static directory if it doesn't exist
@@ -45,7 +74,9 @@ app.add_middleware(
     SessionMiddleware,
     secret_key=secret_key,
     max_age=5184000,
-    session_cookie="session"
+    session_cookie="session",
+    https_only=False,
+    same_site="lax"
 )
 
 # 2. CORS Middleware — restrict to configured frontend URL
@@ -76,25 +107,7 @@ app.include_router(profilesearch.router)
 def health_check():
     return {"status": "EDMS API is running"}
 
-# --- Background Cache Eviction ---
-import asyncio
-from utils.cache_eviction import cleanup_video_cache
 
-async def periodic_cache_cleanup():
-    """Runs video cache cleanup every 6 hours."""
-    video_cache_path = os.path.join(os.getcwd(), 'video_cache')
-    while True:
-        try:
-            result = cleanup_video_cache(video_cache_path)
-            if result.get('deleted_count', 0) > 0:
-                logging.info(f"Cache cleanup: {result}")
-        except Exception as e:
-            logging.error(f"Cache cleanup error: {e}")
-        await asyncio.sleep(6 * 3600)  # Every 6 hours
-
-@app.on_event("startup")
-async def startup_event():
-    asyncio.create_task(periodic_cache_cleanup())
 
 if __name__ == '__main__':
     import uvicorn
