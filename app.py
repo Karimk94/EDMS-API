@@ -9,7 +9,7 @@ from starlette.middleware.sessions import SessionMiddleware
 from dotenv import load_dotenv
 
 # Import Routers
-from routes import auth, documents, media, tags, events, folders, favorites, memories, sharing, admin, profilesearch
+from routes import auth, documents, media, tags, events, folders, favorites, memories, sharing, admin, ems_admin, profilesearch
 from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 
@@ -101,6 +101,7 @@ app.include_router(favorites.router)
 app.include_router(memories.router)
 app.include_router(sharing.router)
 app.include_router(admin.router)
+app.include_router(ems_admin.router)
 app.include_router(profilesearch.router)
 
 @app.get("/")
