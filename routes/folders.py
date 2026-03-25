@@ -4,8 +4,35 @@ from typing import Optional
 import wsdl_client
 from schemas.folders import CreateFolderRequest, RenameFolderRequest
 from utils.common import get_current_user
+from database import user_data
+import db_connector
 
 router = APIRouter()
+
+async def _resolve_edms_user_id(username):
+    """Helper to resolve the EDMS user ID from a username for quota operations."""
+    if not username:
+        return None
+    try:
+        people_id = await db_connector.get_user_system_id(username)
+        if people_id:
+            return await user_data.get_edms_user_id(people_id)
+    except Exception as e:
+        logging.warning(f"Could not resolve EDMS user ID for {username}: {e}")
+    return None
+
+def _get_file_size_from_dms(dst, doc_number):
+    """
+    Gets the file size of a document from the DMS by reading its content.
+    Returns the size in bytes, or 0 if the size cannot be determined.
+    """
+    try:
+        content_bytes = db_connector.get_media_content_from_dms(dst, doc_number)
+        if content_bytes:
+            return len(content_bytes)
+    except Exception as e:
+        logging.warning(f"Could not determine file size for doc {doc_number}: {e}")
+    return 0
 
 @router.get('/api/folders')
 async def api_list_folders(
@@ -122,23 +149,41 @@ async def api_delete_folder(folder_id: str, request: Request, force: bool = Fals
     if not dst:
         raise HTTPException(status_code=500, detail="Failed to authenticate")
 
+    # --- Resolve user for quota restoration ---
+    username = request.session['user'].get('username')
+    edms_user_id = await _resolve_edms_user_id(username)
+
+    # --- Get file size before deletion (for single file items) ---
+    file_size = _get_file_size_from_dms(dst, folder_id)
+
     try:
         # Try standard delete first
         success, message = wsdl_client.delete_document(dst, folder_id)
 
         if success:
+            # --- Restore Quota for single item ---
+            if edms_user_id and file_size > 0:
+                restore_ok, restore_msg = await user_data.restore_user_quota(edms_user_id, file_size)
             return {"message": "Folder deleted", "id": folder_id}
 
         # Check for specific "Referenced by" error to prompt user
         if "referenced by one or more folders" in message.lower() or "referenced" in message.lower():
             # Automatically proceed to force delete without confirmation
-            contents_deleted = await wsdl_client.delete_folder_contents(dst, folder_id, delete_root=True)
+            total_bytes_deleted = await wsdl_client.delete_folder_contents(dst, folder_id, delete_root=True)
 
-            if not contents_deleted:
+            if total_bytes_deleted is False:
                 raise HTTPException(
                     status_code=500,
                     detail="Failed to clear folder contents. Some items may still be referenced elsewhere. Check logs for details."
                 )
+
+            # --- Restore Quota for all recursively deleted files ---
+            # total_bytes_deleted only includes children sizes from recursive traversal.
+            # file_size (measured above) covers the root item itself (0 for actual folders).
+            bytes_freed = total_bytes_deleted if isinstance(total_bytes_deleted, int) else 0
+            bytes_freed += file_size
+            if edms_user_id and bytes_freed > 0:
+                restore_ok, restore_msg = await user_data.restore_user_quota(edms_user_id, bytes_freed)
 
             return {"message": "Folder and contents deleted", "id": folder_id}
 

@@ -505,7 +505,10 @@ async def get_root_folder_counts(dst, username=None):
 async def delete_folder_contents(dst, folder_id, delete_root=True):
     """
     Recursively empties a folder.
+    Returns: total bytes of deleted files (int) on success, or False on failure.
     """
+    import db_connector
+    total_bytes_deleted = 0
     wsdl_url = os.getenv("WSDL_URL")
     settings = Settings(strict=False, xml_huge_tree=True)
 
@@ -807,8 +810,20 @@ async def delete_folder_contents(dst, folder_id, delete_root=True):
 
             for d_id, n_type, s_id in items:
                 if n_type == 'F':
-                    await delete_folder_contents(dst, d_id, delete_root=True)
+                    sub_bytes = await delete_folder_contents(dst, d_id, delete_root=True)
+                    if sub_bytes is False:
+                        return False
+                    if isinstance(sub_bytes, int):
+                        total_bytes_deleted += sub_bytes
                 else:
+                    # Get file size before deleting
+                    try:
+                        content = db_connector.get_media_content_from_dms(dst, d_id)
+                        if content:
+                            total_bytes_deleted += len(content)
+                    except Exception:
+                        pass  # If we can't get the size, still proceed with deletion
+
                     success = force_delete_item(d_id, direct_link_id=s_id, known_parent_id=folder_id,
                                                 known_parent_ver=current_folder_version)
                     if not success:
@@ -819,6 +834,8 @@ async def delete_folder_contents(dst, folder_id, delete_root=True):
             return False
 
     if delete_root:
-        return force_delete_item(folder_id)
+        result = force_delete_item(folder_id)
+        if not result:
+            return False
 
-    return True
+    return total_bytes_deleted

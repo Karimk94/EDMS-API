@@ -147,6 +147,54 @@ async def deduct_user_quota(edms_user_id, amount_bytes):
         if conn:
             await conn.close()
 
+async def restore_user_quota(edms_user_id, amount_bytes):
+    """
+    Restores quota when a file is deleted.
+    Adds the given amount back to REMAINING_QUOTA, capped at the user's total QUOTA.
+    Returns: (Success (bool), Message (str))
+    """
+    if amount_bytes <= 0:
+        return True, "Nothing to restore"
+
+    conn = await get_async_connection()
+    if not conn:
+        return False, "Database connection failed"
+
+    try:
+        async with conn.cursor() as cursor:
+            await cursor.execute(
+                "SELECT REMAINING_QUOTA, COALESCE(QUOTA, :1) FROM LKP_EDMS_USR_DATA WHERE USER_ID = :2 FOR UPDATE",
+                [DEFAULT_QUOTA, edms_user_id]
+            )
+            row = await cursor.fetchone()
+
+            if row is None:
+                # No quota row exists — nothing to restore
+                return True, "No quota record found, skipping restore"
+
+            current_remaining = row[0]
+            total_quota = row[1]
+
+            # Cap restored value at total quota
+            new_remaining = min(current_remaining + amount_bytes, total_quota)
+
+            await cursor.execute(
+                "UPDATE LKP_EDMS_USR_DATA SET REMAINING_QUOTA = :1 WHERE USER_ID = :2",
+                [new_remaining, edms_user_id]
+            )
+
+            await conn.commit()
+            logging.info(f"Restored {amount_bytes} bytes for user {edms_user_id}. New remaining: {new_remaining}")
+            return True, "Quota restored"
+
+    except oracledb.Error as e:
+        logging.error(f"Oracle error in restore_user_quota: {e}", exc_info=True)
+        await conn.rollback()
+        return False, str(e)
+    finally:
+        if conn:
+            await conn.close()
+
 async def get_edms_user_id(people_system_id):
     """
     Looks up the EDMS user SYSTEM_ID from LKP_EDMS_USR_SECUR given a PEOPLE.SYSTEM_ID.
