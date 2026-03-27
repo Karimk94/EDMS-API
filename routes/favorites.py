@@ -1,14 +1,11 @@
-from fastapi import APIRouter, Request, HTTPException, Header
+from fastapi import APIRouter, Request, HTTPException, Header, Depends
 import db_connector
+from utils.common import get_current_user
 
 router = APIRouter()
 
 @router.post('/api/favorites/{doc_id}')
-async def add_favorite_route(doc_id: int, request: Request):
-    user = request.session.get('user')
-    if not user:
-        raise HTTPException(status_code=401, detail="Unauthorized")
-
+async def add_favorite_route(doc_id: int, request: Request, user=Depends(get_current_user)):
     user_id = user.get('username')
     success, message = await db_connector.add_favorite(user_id, doc_id)
     if success:
@@ -17,11 +14,7 @@ async def add_favorite_route(doc_id: int, request: Request):
         raise HTTPException(status_code=500, detail=message)
 
 @router.delete('/api/favorites/{doc_id}')
-async def remove_favorite_route(doc_id: int, request: Request):
-    user = request.session.get('user')
-    if not user:
-        raise HTTPException(status_code=401, detail="Unauthorized")
-
+async def remove_favorite_route(doc_id: int, request: Request, user=Depends(get_current_user)):
     user_id = user.get('username')
     success, message = await db_connector.remove_favorite(user_id, doc_id)
     if success:
@@ -34,12 +27,9 @@ async def get_favorites_route(
         request: Request,
         x_app_source: str = Header("unknown", alias="X-App-Source"),
         page: int = 1,
-        pageSize: int = 20
+        pageSize: int = 20,
+        user=Depends(get_current_user)
 ):
-    user = request.session.get('user')
-    if not user:
-        raise HTTPException(status_code=401, detail="Unauthorized")
-
     user_id = user.get('username')
     documents, total_rows = await db_connector.get_favorites(
         user_id, page, pageSize, app_source=x_app_source

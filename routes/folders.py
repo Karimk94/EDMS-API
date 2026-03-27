@@ -41,16 +41,14 @@ async def api_list_folders(
         scope: Optional[str] = None,
         media_type: Optional[str] = None,
         search: Optional[str] = None,
-        parent_id: Optional[str] = None
+        parent_id: Optional[str] = None,
+        user=Depends(get_current_user)
 ):
-    if 'user' not in request.session:
-        raise HTTPException(status_code=401, detail="Unauthorized")
-
     if parent_id in ['null', 'undefined', '']:
         parent_id = None
 
     # Get the current logged-in user's username for permission filtering
-    username = request.session['user'].get('username')
+    username = user.get('username')
 
     dst = wsdl_client.dms_system_login()
     if not dst:
@@ -66,11 +64,8 @@ async def api_list_folders(
         raise HTTPException(status_code=500, detail="Failed to list folder contents.")
 
 @router.post('/api/folders')
-async def api_create_folder(request: Request, data: CreateFolderRequest):
-    if 'user' not in request.session:
-        raise HTTPException(status_code=401, detail="Unauthorized")
-
-    username = request.session['user'].get('username')
+async def api_create_folder(request: Request, data: CreateFolderRequest, user=Depends(get_current_user)):
+    username = user.get('username')
 
     parent_id = data.parent_id
     if not parent_id or str(parent_id).strip() == "":
@@ -116,9 +111,7 @@ async def api_create_folder(request: Request, data: CreateFolderRequest):
         raise HTTPException(status_code=500, detail="Failed to create folder.")
 
 @router.put('/api/folders/{folder_id}')
-async def api_rename_folder(folder_id: str, request: Request, data: RenameFolderRequest):
-    if 'user' not in request.session:
-        raise HTTPException(status_code=401, detail="Unauthorized")
+async def api_rename_folder(folder_id: str, request: Request, data: RenameFolderRequest, user=Depends(get_current_user)):
 
     dst = wsdl_client.dms_system_login()
     if not dst:
@@ -141,16 +134,13 @@ async def api_rename_folder(folder_id: str, request: Request, data: RenameFolder
         raise HTTPException(status_code=500, detail="Failed to rename folder.")
 
 @router.delete('/api/folders/{folder_id}')
-async def api_delete_folder(folder_id: str, request: Request, force: bool = False):
-    if 'user' not in request.session:
-        raise HTTPException(status_code=401, detail="Unauthorized")
-
+async def api_delete_folder(folder_id: str, request: Request, force: bool = False, user=Depends(get_current_user)):
     dst = wsdl_client.dms_system_login()
     if not dst:
         raise HTTPException(status_code=500, detail="Failed to authenticate")
 
     # --- Resolve user for quota restoration ---
-    username = request.session['user'].get('username')
+    username = user.get('username')
     edms_user_id = await _resolve_edms_user_id(username)
 
     # --- Get file size before deletion (for single file items) ---
