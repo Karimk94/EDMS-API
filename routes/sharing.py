@@ -23,14 +23,18 @@ import secrets
 import wsdl_client
 from database.media import video_cache_dir
 
-from utils.common import send_otp_email, send_share_link_email, get_mimetype_for_media
+from utils.common import send_otp_email, send_share_link_email, get_mimetype_for_media, get_current_user
 from utils.watermark import apply_watermark_to_image, apply_watermark_to_pdf, apply_watermark_to_video, apply_watermark_to_video_async
+from slowapi import Limiter
+from slowapi.util import get_remote_address
 
 router = APIRouter()
+limiter = Limiter(key_func=get_remote_address)
 ALLOWED_DOMAIN = "@rta.ae"
 
 @router.post('/api/share/generate')
-async def generate_share_link(request: Request, req: ShareLinkCreateRequest):
+@limiter.limit("100/minute")
+async def generate_share_link(request: Request, req: ShareLinkCreateRequest, user=Depends(get_current_user)):
     """
     Generates a shareable link for a document or folder.
 
@@ -44,11 +48,6 @@ async def generate_share_link(request: Request, req: ShareLinkCreateRequest):
     """
     try:
         try:
-            user = request.session.get('user')
-
-            if not user:
-                raise HTTPException(status_code=401, detail="Unauthorized")
-
             user_info = await db_connector.get_user_details(user['username'])
 
             if not user_info:
@@ -232,7 +231,8 @@ async def get_share_info(token: str):
         raise HTTPException(status_code=500, detail="Failed to retrieve share info.")
 
 @router.post('/api/share/request-access/{token}')
-async def request_access_otp(token: str, req: ShareAccessRequest):
+@limiter.limit("5/minute")
+async def request_access_otp(request: Request, token: str, req: ShareAccessRequest):
     """
     Step 1: Validates domain/target email and sends OTP using Database for storage.
 
@@ -272,7 +272,8 @@ async def request_access_otp(token: str, req: ShareAccessRequest):
         raise HTTPException(status_code=500, detail="Failed to process OTP request.")
 
 @router.post('/api/share/verify-access/{token}')
-async def verify_access_otp(token: str, req: ShareVerifyRequest):
+@limiter.limit("10/minute")
+async def verify_access_otp(request: Request, token: str, req: ShareVerifyRequest):
     """
     Step 2: Verifies OTP via Database (or skips for restricted shares).
     Returns document info for file shares, or folder info for folder shares.
@@ -589,7 +590,7 @@ async def download_shared_document(
         if media_type == 'video':
             raw_cache_path = os.path.join(video_cache_dir, f"{document_id}{file_ext}")
             if os.path.exists(raw_cache_path):
-                logging.info(f"Using existing global raw cache for shared download: {document_id}{file_ext}")
+                # logging.info(f"Using existing global raw cache for shared download: {document_id}{file_ext}")
                 try:
                     with open(raw_cache_path, 'rb') as f:
                         file_bytes = f.read()
@@ -606,7 +607,7 @@ async def download_shared_document(
                 try:
                     with open(raw_cache_path, 'wb') as f:
                         f.write(file_bytes)
-                    logging.info(f"Populated global raw cache for: {document_id}{file_ext}")
+                    # logging.info(f"Populated global raw cache for: {document_id}{file_ext}")
                 except Exception as e:
                     logging.warning(f"Failed to populate global cache: {e}")
 

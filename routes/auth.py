@@ -1,11 +1,13 @@
-from fastapi import APIRouter, HTTPException, Request, Query
+from fastapi import APIRouter, HTTPException, Request, Query, Depends
 from fastapi.responses import JSONResponse
+from starlette.concurrency import run_in_threadpool
 import db_connector
 import wsdl_client
 from wsdl_client import users as wsdl_users
 from schemas.auth import LoginRequest, LangUpdateRequest, ThemeUpdateRequest, GroupMember, TrusteeResponse, Group
 from typing import List
 from services import processor
+from utils.common import get_current_user, get_session_token
 import logging
 from slowapi import Limiter
 from slowapi.util import get_remote_address
@@ -149,32 +151,32 @@ async def api_update_user_theme(request: Request, data: ThemeUpdateRequest):
 # --- Groups & Security Endpoints (Updated to use Session) ---
 
 @router.get("/api/groups/{group_id}/members", response_model=List[GroupMember])
-def get_group_members_route(group_id: str, request: Request):
-    token = processor.get_session_token(request)
-    members = wsdl_client.get_group_members(token, group_id)
+async def get_group_members_route(group_id: str, request: Request, user=Depends(get_current_user)):
+    token = get_session_token(request)
+    members = await run_in_threadpool(wsdl_client.get_group_members, token, group_id)
     return members
 
 @router.get("/api/document/{doc_id}/trustees", response_model=List[TrusteeResponse])
-def get_doc_trustees(doc_id: str, request: Request):
-    token = processor.get_session_token(request)
-    trustees = wsdl_client.get_object_trustees(token, doc_id)
+async def get_doc_trustees(doc_id: str, request: Request, user=Depends(get_current_user)):
+    token = get_session_token(request)
+    trustees = await run_in_threadpool(wsdl_client.get_object_trustees, token, doc_id)
     return trustees
 
 @router.get("/api/groups", response_model=dict)
-def get_groups(
+async def get_groups(
     request: Request,
     search: str = Query(""),
-    page: int = 1
+    page: int = 1,
+    user=Depends(get_current_user)
 ):
-    token = processor.get_session_token(request)
-    user = request.session.get('user')
+    token = get_session_token(request)
     username = user.get('username') if user else None
 
     if not username:
         raise HTTPException(status_code=401, detail="Not authenticated")
 
     # Get user's groups from DMS
-    user_groups = wsdl_client.get_groups_for_user(token, username)
+    user_groups = await run_in_threadpool(wsdl_client.get_groups_for_user, token, username)
     # logging.info(f"[/api/groups] User {username} has {len(user_groups)} direct groups: {[g.get('group_id') for g in user_groups]}")
 
     # Determine security level from their groups
@@ -189,7 +191,7 @@ def get_groups(
     # If admin (9), show all groups merged with user's groups.
     # Otherwise, show only user's groups.
     if security_level >= 9:
-        all_groups = wsdl_users.get_all_groups(token)
+        all_groups = await run_in_threadpool(wsdl_users.get_all_groups, token)
         # logging.info(f"[/api/groups] Admin mode: got {len(all_groups)} groups from get_all_groups")
         # Merge user's groups with all groups to ensure none are missed
         # (some groups might not be in v_groups view but user is still a member)
@@ -226,18 +228,19 @@ def get_groups(
     }
 
 @router.get("/api/groups/search_members", response_model=dict)
-def search_group_members(
+async def search_group_members(
         request: Request,
         search: str = Query(""),
         page: int = 1,
-        group_id: str = Query(None)
+        group_id: str = Query(None),
+        user=Depends(get_current_user)
 ):
-    token = processor.get_session_token(request)
+    token = get_session_token(request)
 
     # Use provided group_id or fallback
     target_group = group_id if group_id else "EDMS_TEST_GRP_2"
 
-    members = wsdl_client.search_users_in_group(token, target_group, search)
+    members = await run_in_threadpool(wsdl_client.search_users_in_group, token, target_group, search)
 
     # Manual Pagination since SOAP returns all
     start = (page - 1) * 20

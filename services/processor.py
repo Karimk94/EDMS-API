@@ -9,6 +9,29 @@ from fastapi import HTTPException, Request
 from starlette.concurrency import run_in_threadpool
 
 
+# --- Helper functions to reduce duplication ---
+
+def _extract_english_tags(json_str: str) -> list:
+    """Extracts english_tags from a JSON string with regex fallback."""
+    try:
+        data = json.loads(json_str)
+        return data.get('english_tags', [])
+    except json.JSONDecodeError:
+        match = re.search(r'"english_tags"\s*:\s*\[([^\]]+)\]', json_str, re.IGNORECASE)
+        if match:
+            raw = match.group(1)
+            return [tag.strip() for tag in raw.replace('"', '').split(',') if tag.strip()]
+        return []
+
+async def _translate_and_collect(tags: list) -> list:
+    """Translates tags to Arabic and returns keyword dicts."""
+    keywords = []
+    for tag in tags:
+        arabic = await run_in_threadpool(api_client.translate_text, tag)
+        keywords.append({'english': tag, 'arabic': arabic})
+    return keywords
+
+
 # --- Async wrappers for blocking api_client calls ---
 # api_client uses synchronous `requests` which blocks the event loop.
 # These wrappers offload them to a thread pool.
@@ -71,9 +94,7 @@ async def process_document(doc, dms_session_token):
             if video_summary.get('objects'):
                 caption_parts.extend(video_summary['objects'])
                 results['o_detected'] = 1
-                for obj in video_summary['objects']:
-                    arabic_translation = await async_translate_text(obj)
-                    keywords_to_insert.append({'english': obj, 'arabic': arabic_translation})
+                keywords_to_insert.extend(await _translate_and_collect(video_summary['objects']))
             if video_summary.get('faces'):
                 recognized_faces = await async_recognize_faces_from_list(video_summary['faces'])
                 unique_known_faces = {f.get('name').replace('_', ' ').title() for f in recognized_faces if
@@ -83,41 +104,19 @@ async def process_document(doc, dms_session_token):
                 results['face'] = 1
             if video_summary.get('transcript'):
                 tokenized_json_str = await async_tokenize_transcript(video_summary['transcript'])
-                english_tags = []
-                try:
-                    tokenized_data = json.loads(tokenized_json_str)
-                    english_tags = tokenized_data.get('english_tags', [])
-                except json.JSONDecodeError:
-                    english_match = re.search(r'"english_tags"\s*:\s*\[([^\]]+)\]', tokenized_json_str, re.IGNORECASE)
-                    if english_match:
-                        raw_english = english_match.group(1)
-                        english_tags = [tag.strip() for tag in raw_english.replace('"', '').split(',') if tag.strip()]
+                english_tags = _extract_english_tags(tokenized_json_str)
                 if english_tags:
                     caption_parts.extend(english_tags)
-                    for tag in english_tags:
-                        arabic_translation = await async_translate_text(tag)
-                        keywords_to_insert.append({'english': tag, 'arabic': arabic_translation})
+                    keywords_to_insert.extend(await _translate_and_collect(english_tags))
             if video_summary.get('ocr_texts'):
                 results['ocr'] = 1
                 for ocr_text in video_summary['ocr_texts']:
                     if not ocr_text: continue
                     tokenized_json_str = await async_tokenize_transcript(ocr_text)
-                    english_tags = []
-                    try:
-                        tokenized_data = json.loads(tokenized_json_str)
-                        english_tags = tokenized_data.get('english_tags', [])
-                    except json.JSONDecodeError:
-                        english_match = re.search(r'"english_tags"\s*:\s*\[([^\]]+)\]', tokenized_json_str,
-                                                  re.IGNORECASE)
-                        if english_match:
-                            raw_english = english_match.group(1)
-                            english_tags = [tag.strip() for tag in raw_english.replace('"', '').split(',') if
-                                            tag.strip()]
+                    english_tags = _extract_english_tags(tokenized_json_str)
                     if english_tags:
                         caption_parts.extend(english_tags)
-                        for tag in english_tags:
-                            arabic_translation = await async_translate_text(tag)
-                            keywords_to_insert.append({'english': tag, 'arabic': arabic_translation})
+                        keywords_to_insert.extend(await _translate_and_collect(english_tags))
             else:
                 results['ocr'] = 1
             if keywords_to_insert:
@@ -133,20 +132,10 @@ async def process_document(doc, dms_session_token):
             if ocr_text:
                 results['ocr'] = 1
                 tokenized_json_str = await async_tokenize_transcript(ocr_text)
-                english_tags = []
-                try:
-                    tokenized_data = json.loads(tokenized_json_str)
-                    english_tags = tokenized_data.get('english_tags', [])
-                except json.JSONDecodeError:
-                    english_match = re.search(r'"english_tags"\s*:\s*\[([^\]]+)\]', tokenized_json_str, re.IGNORECASE)
-                    if english_match:
-                        raw_english = english_match.group(1)
-                        english_tags = [tag.strip() for tag in raw_english.replace('"', '').split(',') if tag.strip()]
+                english_tags = _extract_english_tags(tokenized_json_str)
                 if english_tags:
                     caption_parts.extend(english_tags)
-                    for tag in english_tags:
-                        arabic_translation = await async_translate_text(tag)
-                        keywords_to_insert.append({'english': tag, 'arabic': arabic_translation})
+                    keywords_to_insert.extend(await _translate_and_collect(english_tags))
             else:
                 results['ocr'] = 1
             if keywords_to_insert:

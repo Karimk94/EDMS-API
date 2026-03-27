@@ -122,7 +122,7 @@ def _detect_ffmpeg_encoder():
     # Check hardware encoders
     for encoder in hw_encoders:
         if test_encoder(encoder):
-            logging.info(f"Hardware encoder confirmed working: {encoder}")
+            # logging.info(f"Hardware encoder confirmed working: {encoder}")
             return encoder, True
         else:
             logging.debug(f"Hardware encoder {encoder} present but failed runtime test")
@@ -350,7 +350,7 @@ def apply_watermark_to_video(video_bytes, watermark_text, filename):
                 else:
                     logging.warning("FFmpeg failed, falling back to MoviePy")
             # else:
-            #     logging.info("FFmpeg not available, using MoviePy")
+            # logging.info("FFmpeg not available, using MoviePy")
             
             # Fallback to MoviePy
             success = _apply_watermark_moviepy(temp_video_path, output_video_path, watermark_text, temp_dir)

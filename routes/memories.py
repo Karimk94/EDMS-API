@@ -1,7 +1,8 @@
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Depends
 from typing import Optional
 from datetime import datetime
 import db_connector
+from utils.common import get_current_user
 
 router = APIRouter()
 
@@ -9,7 +10,8 @@ router = APIRouter()
 async def api_get_memories(
         month: Optional[str] = None,
         day: Optional[str] = None,
-        limit: str = '5'
+        limit: str = '5',
+        user=Depends(get_current_user)
 ):
     try:
         current_dt = datetime.now()

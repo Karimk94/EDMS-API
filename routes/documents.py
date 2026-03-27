@@ -1,5 +1,6 @@
 from fastapi import APIRouter, Request, HTTPException, UploadFile, File, Form, BackgroundTasks, Header, Response, Depends
 from fastapi.responses import StreamingResponse
+from starlette.concurrency import run_in_threadpool
 from werkzeug.utils import secure_filename
 from typing import Optional
 from datetime import datetime
@@ -12,10 +13,14 @@ from utils.common import get_current_user, get_session_token, get_mimetype_for_m
 import wsdl_client
 from services.processor import process_document
 from utils.watermark import apply_watermark_to_image, apply_watermark_to_pdf, apply_watermark_to_video, apply_watermark_to_video_async
+from slowapi import Limiter
+from slowapi.util import get_remote_address
+from utils.sanitize import sanitize_text, sanitize_filename
 from schemas.documents import ProcessUploadRequest, UpdateMetadataRequest, UpdateAbstractRequest, LinkEventRequest, SetTrusteesRequest
 from database import user_data
 
 router = APIRouter()
+limiter = Limiter(key_func=get_remote_address)
 
 # --- Helper for Background Task ---
 async def run_db_update(result_data):
@@ -73,7 +78,8 @@ async def api_get_documents(
         raise HTTPException(status_code=500, detail="Failed to fetch documents due to server error.")
 
 @router.post('/process-batch')
-async def process_batch(background_tasks: BackgroundTasks, user=Depends(get_current_user)):
+@limiter.limit("3/minute")
+async def process_batch(request: Request, background_tasks: BackgroundTasks, user=Depends(get_current_user)):
     dms_session_token = db_connector.dms_system_login()
     if not dms_session_token:
         raise HTTPException(status_code=500, detail="Failed to authenticate with DMS.")
@@ -106,6 +112,7 @@ async def process_batch(background_tasks: BackgroundTasks, user=Depends(get_curr
 
 
 @router.post('/api/upload_document')
+@limiter.limit("10/minute")
 async def api_upload_document(request: Request, file: UploadFile = File(...), docname: Optional[str] = Form(None),
                               abstract: str = Form("Uploaded via EDMS Viewer"),
                               event_id: Optional[str] = Form(None), parent_id: Optional[str] = Form(None),
@@ -145,8 +152,15 @@ async def api_upload_document(request: Request, file: UploadFile = File(...), do
 
     final_docname = docname.strip() if docname and docname.strip() else os.path.splitext(original_filename)[0]
 
-    parsed_event_id = int(event_id) if event_id else None
-    if parent_id and parent_id.lower() in ['null', 'undefined', '']:
+    # Sanitize user-provided text to prevent stored XSS
+    final_docname = sanitize_filename(final_docname) or final_docname
+    abstract = sanitize_text(abstract) or abstract
+
+    try:
+        parsed_event_id = int(event_id) if event_id else None
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=400, detail="Invalid event_id. Must be a number.")
+    if parent_id and str(parent_id).strip().lower() in ['null', 'undefined', '']:
         parent_id = None
 
     dst = wsdl_client.dms_system_login()
@@ -200,13 +214,7 @@ async def api_process_uploaded_documents(data: ProcessUploadRequest, background_
     return results
 
 @router.get('/api/document/{docnumber}')
-async def get_document_file(docnumber: int, request: Request):
-    """
-    View document inline.
-    Updated to use db_connector for better media type resolution and correct file extensions.
-    """
-    if 'user' not in request.session:
-        raise HTTPException(status_code=401, detail="Unauthorized")
+async def get_document_file(docnumber: int, request: Request, user=Depends(get_current_user)):
 
     dst = wsdl_client.dms_system_login()
     if not dst:
@@ -259,6 +267,10 @@ async def api_update_metadata(data: UpdateMetadataRequest, user=Depends(get_curr
     if data.abstract is None and data.date_taken is None:
         raise HTTPException(status_code=400, detail='At least one field must be provided.')
 
+    # Sanitize abstract text to prevent stored XSS
+    if data.abstract is not None:
+        data.abstract = sanitize_text(data.abstract)
+
     new_date_taken = None
     update_date = False
 
@@ -285,13 +297,7 @@ async def api_update_metadata(data: UpdateMetadataRequest, user=Depends(get_curr
         raise HTTPException(status_code=500, detail=message)
 
 @router.get('/api/download_watermarked/{doc_id}')
-async def api_download_watermarked(doc_id: int, request: Request):
-    """
-    Downloads document.
-    Updated to correct filename extensions and Content-Types for Office documents.
-    """
-    if 'user' not in request.session:
-        raise HTTPException(status_code=401, detail="Unauthorized")
+async def api_download_watermarked(doc_id: int, request: Request, user=Depends(get_current_user)):
 
     username = request.session['user'].get('username', 'Unknown')
     system_id = await db_connector.get_user_system_id(username) or "UNKNOWN"
@@ -398,13 +404,14 @@ async def get_document_event(doc_id: int, user=Depends(get_current_user)):
     return event_info if event_info else {}
 
 @router.post('/api/document/{doc_id}/security')
-def set_document_security(doc_id: str, data: SetTrusteesRequest, request: Request):
+async def set_document_security(doc_id: str, data: SetTrusteesRequest, request: Request, user=Depends(get_current_user)):
     """
     Sets the trustees for a specific document or folder using the unified session token.
     """
     token = get_session_token(request)
 
-    success, message = wsdl_client.set_trustees(
+    success, message = await run_in_threadpool(
+        wsdl_client.set_trustees,
         dst=token,
         doc_id=doc_id,
         library=data.library,

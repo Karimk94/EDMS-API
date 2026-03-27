@@ -224,7 +224,7 @@ async def fetch_documents_from_oracle(page=1, page_size=20, search_term=None, da
         text_clause = None
 
         if vector_doc_ids:
-            logging.info(f"Using {len(vector_doc_ids)} doc_ids from vector search.")
+            # logging.info(f"Using {len(vector_doc_ids)} doc_ids from vector search.")
             vector_placeholders = ','.join([f":vec_id_{i}" for i in range(len(vector_doc_ids))])
             vector_clause = f"p.docnumber IN ({vector_placeholders})"
             for i, doc_id in enumerate(vector_doc_ids):
@@ -492,7 +492,7 @@ async def update_document_processing_status(docnumber, new_abstract, o_detected,
 
             # --- VECTOR INDEXING HOOK (Blocking Call) ---
             if status == 3 and vector_client:
-                logging.info(f"Queueing vector update for doc_id {docnumber}.")
+                # logging.info(f"Queueing vector update for doc_id {docnumber}.")
                 try:
                     vector_client.add_or_update_document(docnumber, new_abstract)
                 except Exception as e:

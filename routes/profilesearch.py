@@ -1,8 +1,9 @@
-from fastapi import APIRouter, Request, HTTPException, Query
+from fastapi import APIRouter, Request, HTTPException, Query, Depends
 from pydantic import BaseModel
 from typing import Optional, List
 from database import profilesearch
 import logging
+from utils.common import get_current_user
 
 router = APIRouter()
 
@@ -26,13 +27,9 @@ class MultiSearchRequest(BaseModel):
 
 
 @router.get('/api/profilesearch/scopes')
-async def get_search_scopes(request: Request):
+async def get_search_scopes(request: Request, user=Depends(get_current_user)):
     """Returns the available search scopes for the current user."""
     try:
-        user = request.session.get('user')
-        if not user:
-            raise HTTPException(status_code=401, detail="Unauthorized")
-
         user_id = user.get('username')
         scopes = await profilesearch.fetch_search_scopes(user_id)
         return {"scopes": scopes}
@@ -42,16 +39,12 @@ async def get_search_scopes(request: Request):
 
 
 @router.get('/api/profilesearch/types')
-async def get_search_types(request: Request, scope: Optional[str] = None):
+async def get_search_types(request: Request, scope: Optional[str] = None, user=Depends(get_current_user)):
     """
     Returns the available search types for the current user.
     Optionally filtered by scope.
     """
     try:
-        user = request.session.get('user')
-        if not user:
-            raise HTTPException(status_code=401, detail="Unauthorized")
-
         user_id = user.get('username')
         types = await profilesearch.fetch_search_types(user_id, scope=scope)
         return {"types": types}
@@ -61,16 +54,12 @@ async def get_search_types(request: Request, scope: Optional[str] = None):
 
 
 @router.post('/api/profilesearch/search')
-async def search_documents_multi(request: Request, body: MultiSearchRequest):
+async def search_documents_multi(request: Request, body: MultiSearchRequest, user=Depends(get_current_user)):
     """
     Multi-criteria search. Accepts scope, an array of criteria (AND logic),
     a global date range, and pagination.
     """
     try:
-        user = request.session.get('user')
-        if not user:
-            raise HTTPException(status_code=401, detail="Unauthorized")
-
         user_id = user.get('username')
 
         criteria_dicts = [c.dict() for c in body.criteria]
@@ -99,7 +88,6 @@ async def search_documents_multi(request: Request, body: MultiSearchRequest):
         raise HTTPException(status_code=500, detail="Search failed")
 
 
-# Keep legacy GET endpoint for backwards compatibility
 @router.get('/api/profilesearch/search')
 async def search_documents_legacy(
     request: Request,
@@ -113,14 +101,11 @@ async def search_documents_legacy(
     date_from: Optional[str] = None,
     date_to: Optional[str] = None,
     page: int = 1,
-    pageSize: int = 20
+    pageSize: int = 20,
+    user=Depends(get_current_user)
 ):
     """Legacy single-criterion GET search (kept for backwards compatibility)."""
     try:
-        user = request.session.get('user')
-        if not user:
-             raise HTTPException(status_code=401, detail="Unauthorized")
-
         user_id = user.get('username')
 
         documents, total_rows = await profilesearch.search_documents(

@@ -6,6 +6,11 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# --- Custom Exception ---
+class DatabaseConnectionError(Exception):
+    """Raised when a database connection cannot be acquired."""
+    pass
+
 # --- Logging Setup ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -41,18 +46,16 @@ def _get_sync_pool():
         password = os.getenv('DB_PASSWORD')
         dsn = _get_dsn()
         if not all([user, password, dsn]):
-            logging.error("Database connection details missing in environment variables.")
-            return None
+            raise DatabaseConnectionError("Database connection details missing in environment variables.")
         try:
             _sync_pool = oracledb.create_pool(
                 user=user, password=password, dsn=dsn,
-                min=2, max=10, increment=1
+                min=2, max=10, increment=1,
+                timeout=30, getmode=oracledb.POOL_GETMODE_TIMEDWAIT, wait_timeout=10000
             )
-            # logging.info("Synchronous Oracle connection pool created.")
         except oracledb.Error as ex:
             error, = ex.args
-            logging.error(f"Failed to create sync pool: {error.message}")
-            return None
+            raise DatabaseConnectionError(f"Failed to create sync pool: {error.message}")
     return _sync_pool
 
 async def _get_async_pool():
@@ -63,40 +66,32 @@ async def _get_async_pool():
         password = os.getenv('DB_PASSWORD')
         dsn = _get_dsn()
         if not all([user, password, dsn]):
-            logging.error("Database connection details missing in environment variables.")
-            return None
+            raise DatabaseConnectionError("Database connection details missing in environment variables.")
         try:
             _async_pool = oracledb.create_pool_async(
                 user=user, password=password, dsn=dsn,
-                min=2, max=10, increment=1
+                min=2, max=10, increment=1,
+                timeout=30, getmode=oracledb.POOL_GETMODE_TIMEDWAIT, wait_timeout=10000
             )
-            # logging.info("Asynchronous Oracle connection pool created.")
         except oracledb.Error as ex:
             error, = ex.args
-            logging.error(f"Failed to create async pool: {error.message}")
-            return None
+            raise DatabaseConnectionError(f"Failed to create async pool: {error.message}")
     return _async_pool
 
 def get_connection():
     """Acquires a connection from the synchronous pool."""
     pool = _get_sync_pool()
-    if not pool:
-        return None
     try:
         return pool.acquire()
     except oracledb.Error as ex:
         error, = ex.args
-        logging.error(f"DB pool acquire error: {error.message} (Code: {error.code})")
-        return None
+        raise DatabaseConnectionError(f"DB pool acquire error: {error.message} (Code: {error.code})")
 
 async def get_async_connection():
     """Acquires a connection from the asynchronous pool."""
     pool = await _get_async_pool()
-    if not pool:
-        return None
     try:
         return await pool.acquire()
     except oracledb.Error as ex:
         error, = ex.args
-        logging.error(f"Async DB pool acquire error: {error.message} (Code: {error.code})")
-        return None
+        raise DatabaseConnectionError(f"Async DB pool acquire error: {error.message} (Code: {error.code})")
