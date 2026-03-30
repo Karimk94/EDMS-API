@@ -2,6 +2,7 @@ from fastapi import APIRouter, HTTPException, Request, Query
 from typing import List
 from pydantic import BaseModel
 import logging
+import wsdl_client
 from database import admin as admin_db
 from database import tab_permissions as tab_perms_db
 from schemas.auth import EdmsUserResponse, AddEdmsUserRequest, SecurityLevelResponse, PeopleSearchResult, UpdateEdmsUserRequest
@@ -10,11 +11,12 @@ router = APIRouter()
 
 # Allowlist of usernames that can access admin panel regardless of security level
 # Add usernames in lowercase
-ADMIN_ALLOWLIST = ['test_user1', 'okool_kaabdulwahed', 'okool_arfelous']
+ADMIN_ALLOWLIST = ['test_user1', 'okool_kaabdulwahed', 'okool_arfelous', 'dmedms']
+EMS_ADMIN_GROUP_ID = 'EMS_ADMIN'
 
 
 def check_admin_access(request: Request) -> bool:
-    """Check if current user has admin access (Editor+, Admin, or in allowlist)."""
+    """Check if current user has admin access (Editor+, Admin, allowlist, or EMS_ADMIN group)."""
     user = request.session.get('user')
     if not user:
         return False
@@ -29,6 +31,27 @@ def check_admin_access(request: Request) -> bool:
     # Check security level (Editor or Admin)
     if security_level in ['Editor', 'Admin']:
         return True
+
+    # Fast path: cached group membership from login/session refresh
+    if user.get('is_ems_admin_group_member') is True:
+        return True
+
+    # Check DMS group membership for EMS admin group
+    token = user.get('token')
+    username = user.get('username')
+    if token and username:
+        try:
+            user_groups = wsdl_client.get_groups_for_user(token, username)
+            target_group = EMS_ADMIN_GROUP_ID.upper()
+            for group in user_groups or []:
+                group_id = str(group.get('group_id', '')).strip().upper()
+                group_name = str(group.get('group_name', '')).strip().upper()
+                if group_id == target_group or group_name == target_group:
+                    user['is_ems_admin_group_member'] = True
+                    request.session['user'] = user
+                    return True
+        except Exception as exc:
+            logging.warning(f"Failed to validate EMS admin group membership for user {username}: {exc}")
     
     return False
 

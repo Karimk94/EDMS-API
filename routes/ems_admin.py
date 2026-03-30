@@ -1,5 +1,6 @@
 from fastapi import APIRouter, HTTPException, Request
 import logging
+import wsdl_client
 from database.ems_admin import (
     get_agencies,
     get_sections,
@@ -15,10 +16,11 @@ from database.ems_admin import (
 )
 
 router = APIRouter()
+EMS_ADMIN_GROUP_ID = 'EMS_ADMIN'
 
 # --- Authorization Helper ---
 async def check_admin_access(request: Request) -> bool:
-    """Check if user has admin access."""
+    """Check if user has admin access (Editor/Admin or EMS_ADMIN group)."""
     if "user" not in request.session:
         return False
     
@@ -26,7 +28,30 @@ async def check_admin_access(request: Request) -> bool:
     security_level = user.get("security_level", "")
     
     # Check if user has Editor or Admin security level
-    return security_level in ["Editor", "Admin"]
+    if security_level in ["Editor", "Admin"]:
+        return True
+
+    # Fast path: cached group membership from login/session refresh
+    if user.get("is_ems_admin_group_member") is True:
+        return True
+
+    token = user.get("token")
+    username = user.get("username")
+    if token and username:
+        try:
+            user_groups = wsdl_client.get_groups_for_user(token, username)
+            target_group = EMS_ADMIN_GROUP_ID.upper()
+            for group in user_groups or []:
+                group_id = str(group.get("group_id", "")).strip().upper()
+                group_name = str(group.get("group_name", "")).strip().upper()
+                if group_id == target_group or group_name == target_group:
+                    user["is_ems_admin_group_member"] = True
+                    request.session["user"] = user
+                    return True
+        except Exception as exc:
+            logging.warning(f"Failed to validate EMS admin group membership for user {username}: {exc}")
+
+    return False
 
 
 # --- AGENCIES ---

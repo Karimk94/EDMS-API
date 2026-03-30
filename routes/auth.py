@@ -17,6 +17,24 @@ router = APIRouter()
 
 # Rate limiter for login endpoint — keyed by client IP
 limiter = Limiter(key_func=get_remote_address)
+EMS_ADMIN_GROUP_ID = 'EMS_ADMIN'
+
+
+def _extract_group_membership_flags(user_groups: list) -> dict:
+    """Derive cached group membership flags from DMS groups payload."""
+    target_group = EMS_ADMIN_GROUP_ID.upper()
+    is_ems_admin_group_member = False
+
+    for group in user_groups or []:
+        group_id = str(group.get('group_id', '')).strip().upper()
+        group_name = str(group.get('group_name', '')).strip().upper()
+        if group_id == target_group or group_name == target_group:
+            is_ems_admin_group_member = True
+            break
+
+    return {
+        'is_ems_admin_group_member': is_ems_admin_group_member,
+    }
 
 @router.post('/api/auth/login')
 @limiter.limit("5/minute")
@@ -29,9 +47,12 @@ async def login(request: Request, creds: LoginRequest):
             raise HTTPException(status_code=403, detail="User doesn't have smart EDMS account")
 
         # Get user's groups from DMS (proven working query)
+        group_flags = {'is_ems_admin_group_member': False}
         try:
             user_groups = wsdl_client.get_groups_for_user(dst, creds.username)
             # logging.info(f"User {creds.username} belongs to groups: {[g.get('group_id') for g in user_groups]}")
+
+            group_flags = _extract_group_membership_flags(user_groups)
 
             security_level = processor.determine_security_from_groups(user_groups)
             security_str = {9: 'Admin', 5: 'Editor', 0: 'Viewer'}.get(security_level, 'Viewer')
@@ -65,7 +86,8 @@ async def login(request: Request, creds: LoginRequest):
             'dms_security_level': security_level,  # Numeric for logic
             'lang': db_prefs.get('lang', 'en') if db_prefs else 'en',
             'theme': db_prefs.get('theme', 'light') if db_prefs else 'light',
-            'tab_permissions': tab_permissions
+            'tab_permissions': tab_permissions,
+            **group_flags,
         }
 
         request.session['user'] = user_details
@@ -90,6 +112,8 @@ async def get_user(request: Request):
             # Preserve token if it exists in session but not in db details
             if 'token' in user_session:
                 user_details['token'] = user_session['token']
+            if 'is_ems_admin_group_member' in user_session:
+                user_details['is_ems_admin_group_member'] = user_session['is_ems_admin_group_member']
 
             # Fetch tab permissions — per-user
             security_level = user_details.get('security_level', 'Viewer')
