@@ -8,9 +8,11 @@ from database.media import (
 )
 from database.documents import (
     fetch_documents_from_oracle, get_documents_to_process,
+    get_documents_to_process_count,
     get_specific_documents_for_processing, check_processing_status,
     update_document_processing_status, update_abstract_with_vips,
-    update_document_metadata, get_folder_system_ids
+    update_document_metadata, get_folder_system_ids,
+    reset_processing_attempts
 )
 from database.tags import (
     add_person_to_lkp, fetch_lkp_persons, fetch_all_tags,

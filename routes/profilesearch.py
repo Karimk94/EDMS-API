@@ -1,11 +1,13 @@
 from fastapi import APIRouter, Request, HTTPException, Query, Depends
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import Optional, List
 from database import profilesearch
 import logging
 from utils.common import get_current_user
+from utils.ttl_cache import TTLCache
 
 router = APIRouter()
+metadata_cache = TTLCache(default_ttl_seconds=300, max_items=512)
 
 
 class SearchCriterion(BaseModel):
@@ -22,8 +24,8 @@ class MultiSearchRequest(BaseModel):
     criteria: List[SearchCriterion]
     date_from: Optional[str] = None
     date_to: Optional[str] = None
-    page: int = 1
-    page_size: int = 20
+    page: int = Field(default=1, ge=1)
+    page_size: int = Field(default=20, ge=1, le=50)
 
 
 @router.get('/api/profilesearch/scopes')
@@ -31,7 +33,13 @@ async def get_search_scopes(request: Request, user=Depends(get_current_user)):
     """Returns the available search scopes for the current user."""
     try:
         user_id = user.get('username')
+        cache_key = f"profilesearch:scopes:{str(user_id).strip().lower()}"
+        cached_value = metadata_cache.get(cache_key)
+        if cached_value is not None:
+            return {"scopes": cached_value}
+
         scopes = await profilesearch.fetch_search_scopes(user_id)
+        metadata_cache.set(cache_key, scopes)
         return {"scopes": scopes}
     except Exception as e:
         logging.error(f"Error fetching search scopes: {e}")
@@ -46,7 +54,14 @@ async def get_search_types(request: Request, scope: Optional[str] = None, user=D
     """
     try:
         user_id = user.get('username')
+        normalized_scope = (scope or 'all').strip().lower()
+        cache_key = f"profilesearch:types:{str(user_id).strip().lower()}:{normalized_scope}"
+        cached_value = metadata_cache.get(cache_key)
+        if cached_value is not None:
+            return {"types": cached_value}
+
         types = await profilesearch.fetch_search_types(user_id, scope=scope)
+        metadata_cache.set(cache_key, types)
         return {"types": types}
     except Exception as e:
         logging.error(f"Error fetching search types: {e}")
@@ -62,12 +77,41 @@ async def search_documents_multi(request: Request, body: MultiSearchRequest, use
     try:
         user_id = user.get('username')
 
-        criteria_dicts = [c.dict() for c in body.criteria]
+        # Normalize criteria and protect backend from broad accidental scans.
+        normalized_criteria = []
+        for c in body.criteria:
+            trimmed_keyword = (c.keyword or "").strip()
+            trimmed_match = (c.match_type or "like").strip()
+            if not c.field_name:
+                continue
+
+            # Skip empty criteria rows produced by UI placeholders.
+            if not trimmed_keyword:
+                continue
+
+            if len(trimmed_keyword) < 2 and trimmed_match in ["like", "startsWith"]:
+                raise HTTPException(status_code=400, detail="Keyword must be at least 2 characters.")
+
+            normalized_criteria.append({
+                "field_name": c.field_name,
+                "keyword": trimmed_keyword,
+                "match_type": trimmed_match,
+                "search_form": c.search_form,
+                "search_field": c.search_field,
+                "display_field": c.display_field,
+            })
+
+        if len(normalized_criteria) > 6:
+            normalized_criteria = normalized_criteria[:6]
+
+        has_date_filter = bool((body.date_from or "").strip() or (body.date_to or "").strip())
+        if not normalized_criteria and not has_date_filter:
+            raise HTTPException(status_code=400, detail="At least one search criterion or date filter is required.")
 
         documents, total_rows = await profilesearch.search_documents_multi(
             user_id=user_id,
             scope=body.scope,
-            criteria=criteria_dicts,
+            criteria=normalized_criteria,
             date_from=body.date_from,
             date_to=body.date_to,
             page=body.page,

@@ -8,6 +8,8 @@ pycache/
 /temp_thumbnail_cache
 /video_cache
 /chroma_db
+/database/processing_queue.sqlite3
+/database/processing_queue.sqlite3-*
 __pycache__/
 *.pyc
 

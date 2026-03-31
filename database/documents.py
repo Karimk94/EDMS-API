@@ -458,6 +458,34 @@ async def get_documents_to_process():
         if conn:
             await conn.close()
 
+
+async def get_documents_to_process_count():
+    """Gets the total count of Oracle TAGGING_QUEUE candidates pending processing."""
+    conn = await get_async_connection()
+    if not conn:
+        return 0
+
+    try:
+        async with conn.cursor() as cursor:
+            sql = """
+            SELECT COUNT(1)
+            FROM PROFILE p
+            LEFT JOIN TAGGING_QUEUE q ON p.docnumber = q.docnumber
+            WHERE p.form = :form_id
+              AND p.docnumber >= 19677386 --19662092
+              AND (q.STATUS <> 3 OR q.STATUS IS NULL)
+              AND (q.ATTEMPTS <= 3 OR q.ATTEMPTS IS NULL)
+            """
+            await cursor.execute(sql, {'form_id': 2740})
+            row = await cursor.fetchone()
+            return int(row[0] or 0) if row else 0
+    except Exception as e:
+        logging.error(f"Failed to count pending Oracle processing documents: {e}", exc_info=True)
+        return 0
+    finally:
+        if conn:
+            await conn.close()
+
 async def update_document_processing_status(docnumber, new_abstract, o_detected, ocr, face, status, error, transcript,
                                             attempts):
     """Updates the processing status of a document in the database with robust transaction handling."""
@@ -698,6 +726,46 @@ async def check_processing_status(docnumbers):
     except (oracledb.Error, ValueError) as e:
         logging.error(f"Error in check_processing_status: {e}", exc_info=True)
         return docnumbers
+    finally:
+        if conn:
+            await conn.close()
+
+async def reset_processing_attempts(docnumbers):
+    """Resets TAGGING_QUEUE attempts/status for selected docs before retrying jobs."""
+    if not docnumbers:
+        return 0
+
+    conn = await get_async_connection()
+    if not conn:
+        logging.error("Failed to get DB connection in reset_processing_attempts.")
+        return 0
+
+    try:
+        int_docnumbers = [int(d) for d in docnumbers]
+        async with conn.cursor() as cursor:
+            bind_names = [f":doc_{i}" for i in range(len(int_docnumbers))]
+            bind_vars = {f"doc_{i}": val for i, val in enumerate(int_docnumbers)}
+
+            sql = f"""
+            UPDATE TAGGING_QUEUE
+            SET ATTEMPTS = 0,
+                STATUS = 1,
+                ERROR = NULL,
+                LAST_UPDATE = SYSDATE
+            WHERE DOCNUMBER IN ({','.join(bind_names)})
+            """
+
+            await cursor.execute(sql, bind_vars)
+            updated_rows = cursor.rowcount or 0
+            await conn.commit()
+            return int(updated_rows)
+    except (oracledb.Error, ValueError) as e:
+        logging.error(f"Error in reset_processing_attempts: {e}", exc_info=True)
+        try:
+            await conn.rollback()
+        except Exception:
+            pass
+        return 0
     finally:
         if conn:
             await conn.close()

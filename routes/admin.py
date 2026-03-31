@@ -6,6 +6,8 @@ import wsdl_client
 from database import admin as admin_db
 from database import tab_permissions as tab_perms_db
 from schemas.auth import EdmsUserResponse, AddEdmsUserRequest, SecurityLevelResponse, PeopleSearchResult, UpdateEdmsUserRequest
+from services.processing_queue import processing_queue, set_worker_paused, is_worker_paused, request_worker_drain, get_worker_mode, set_worker_mode
+import db_connector
 
 router = APIRouter()
 
@@ -155,6 +157,161 @@ async def check_access(request: Request):
     
     has_access = check_admin_access(request)
     return {"has_access": has_access, "username": user.get('username')}
+
+
+@router.get("/api/admin/processing-queue/status")
+async def get_processing_queue_status(request: Request):
+    """Returns local processing queue status for admin monitoring."""
+    if not check_admin_access(request):
+        raise HTTPException(status_code=403, detail="Access denied. Admin privileges required.")
+
+    summary = processing_queue.get_status_summary()
+    failures = processing_queue.get_recent_failures(limit=8)
+    in_progress = processing_queue.get_recent_jobs_by_status(status="in_progress", limit=8)
+    last_mode_change = processing_queue.get_last_worker_mode_change()
+
+    # Show a small preview of Oracle TAGGING_QUEUE candidates so admins can
+    # verify pending upstream work even when local worker queue is empty/paused.
+    oracle_pending = await db_connector.get_documents_to_process()
+    oracle_pending_count = await db_connector.get_documents_to_process_count()
+    queued_preview = [
+        {
+            "docnumber": int(row.get("docnumber")),
+            "attempts": int(row.get("attempts") or 0),
+            "error": "",
+            "updated_at": "-",
+            "status": "queued",
+        }
+        for row in oracle_pending
+        if row.get("docnumber") is not None
+    ]
+
+    return {
+        "summary": summary,
+        "recent_failures": failures,
+        "recent_in_progress": in_progress,
+        "recent_queued": queued_preview,
+        "oracle_queued_count": oracle_pending_count,
+        "source_counts": {
+            "local_failed": int(summary.get("failed", 0)),
+            "local_in_progress": int(summary.get("in_progress", 0)),
+            "oracle_queued": int(oracle_pending_count),
+        },
+        "worker_paused": is_worker_paused(),
+        "worker_mode": get_worker_mode(),
+        "last_mode_change": last_mode_change,
+    }
+
+
+@router.post("/api/admin/processing-queue/worker/pause")
+async def pause_processing_worker(request: Request):
+    """Pause local queue worker without stopping the API process."""
+    if not check_admin_access(request):
+        raise HTTPException(status_code=403, detail="Access denied. Admin privileges required.")
+
+    actor = ((request.session.get('user') or {}).get('username') or 'unknown')
+    set_worker_mode("paused", actor=actor, reason="manual pause")
+    paused = set_worker_paused(True)
+    return {"message": "Processing worker paused.", "worker_paused": paused}
+
+
+@router.post("/api/admin/processing-queue/worker/resume")
+async def resume_processing_worker(request: Request):
+    """Resume local queue worker after a pause."""
+    if not check_admin_access(request):
+        raise HTTPException(status_code=403, detail="Access denied. Admin privileges required.")
+
+    actor = ((request.session.get('user') or {}).get('username') or 'unknown')
+    set_worker_mode("running", actor=actor, reason="manual resume")
+    paused = set_worker_paused(False)
+    return {"message": "Processing worker resumed.", "worker_paused": paused}
+
+
+@router.post("/api/admin/processing-queue/worker/drain")
+async def drain_processing_worker(request: Request):
+    """Gracefully drain current work, then transition worker to paused."""
+    if not check_admin_access(request):
+        raise HTTPException(status_code=403, detail="Access denied. Admin privileges required.")
+
+    actor = ((request.session.get('user') or {}).get('username') or 'unknown')
+    mode = request_worker_drain()
+    set_worker_mode(mode, actor=actor, reason="manual drain")
+    return {"message": "Processing worker set to draining mode.", "worker_mode": mode}
+
+
+@router.post("/api/admin/processing-queue/retry-failed")
+async def retry_failed_queue_jobs(
+    request: Request,
+    limit: int = Query(100, ge=1, le=1000)
+):
+    """Retry failed local queue jobs and reset Oracle TAGGING_QUEUE attempts for those docs."""
+    if not check_admin_access(request):
+        raise HTTPException(status_code=403, detail="Access denied. Admin privileges required.")
+
+    failed_docnumbers = processing_queue.get_failed_docnumbers(limit=limit)
+    if not failed_docnumbers:
+        return {
+            "message": "No failed jobs to retry.",
+            "failed_found": 0,
+            "db_reset_count": 0,
+            "requeued": 0,
+        }
+
+    db_reset_count = await db_connector.reset_processing_attempts(failed_docnumbers)
+    retry_result = processing_queue.retry_failed_jobs(failed_docnumbers)
+    return {
+        "message": "Failed jobs requeued.",
+        "failed_found": len(failed_docnumbers),
+        "db_reset_count": db_reset_count,
+        "requeued": int(retry_result.get("requeued", 0)),
+    }
+
+
+@router.delete("/api/admin/processing-queue/completed")
+async def clear_completed_queue_jobs(
+    request: Request,
+    older_than_hours: int = Query(24, ge=0, le=24 * 365)
+):
+    """Remove completed jobs from local queue table to keep it lean."""
+    if not check_admin_access(request):
+        raise HTTPException(status_code=403, detail="Access denied. Admin privileges required.")
+
+    result = processing_queue.purge_completed_jobs(older_than_hours=older_than_hours)
+    return {
+        "message": "Completed queue jobs cleared.",
+        "deleted": int(result.get("deleted", 0)),
+        "older_than_hours": int(result.get("older_than_hours", older_than_hours)),
+    }
+
+
+class RetryQueueDocsRequest(BaseModel):
+    docnumbers: List[int]
+
+
+@router.post("/api/admin/processing-queue/retry-selected")
+async def retry_selected_queue_jobs(request: Request, body: RetryQueueDocsRequest):
+    """Retry selected queue jobs by docnumber and reset Oracle attempts for those docs."""
+    if not check_admin_access(request):
+        raise HTTPException(status_code=403, detail="Access denied. Admin privileges required.")
+
+    selected = []
+    for doc in body.docnumbers:
+        try:
+            selected.append(int(doc))
+        except (TypeError, ValueError):
+            continue
+
+    if not selected:
+        raise HTTPException(status_code=400, detail="No valid docnumbers provided.")
+
+    db_reset_count = await db_connector.reset_processing_attempts(selected)
+    retry_result = processing_queue.retry_failed_jobs(selected)
+    return {
+        "message": "Selected jobs requeued.",
+        "selected_count": len(selected),
+        "db_reset_count": db_reset_count,
+        "requeued": int(retry_result.get("requeued", 0)),
+    }
 
 
 # --- Tab Permissions Endpoints (Per-User) ---

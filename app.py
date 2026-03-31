@@ -1,6 +1,9 @@
 import logging
 import os
 import asyncio
+import time
+import uuid
+import json
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -24,6 +27,7 @@ logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
 
 # --- Background Cache Eviction ---
 from utils.cache_eviction import cleanup_video_cache
+from services.processing_queue import processing_worker_loop
 
 async def periodic_cache_cleanup():
     """Runs video cache cleanup every 6 hours."""
@@ -40,8 +44,17 @@ async def periodic_cache_cleanup():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Modern lifespan handler replacing deprecated @app.on_event."""
-    asyncio.create_task(periodic_cache_cleanup())
-    yield
+    cache_cleanup_task = asyncio.create_task(periodic_cache_cleanup())
+    queue_stop_event = asyncio.Event()
+    queue_worker_task = asyncio.create_task(processing_worker_loop(queue_stop_event))
+
+    try:
+        yield
+    finally:
+        queue_stop_event.set()
+        cache_cleanup_task.cancel()
+        queue_worker_task.cancel()
+        await asyncio.gather(cache_cleanup_task, queue_worker_task, return_exceptions=True)
 
 app = FastAPI(title="EDMS Middleware API", lifespan=lifespan)
 
@@ -112,6 +125,40 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         return response
 
 app.add_middleware(SecurityHeadersMiddleware)
+
+
+class RequestMetricsMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: StarletteRequest, call_next):
+        request_id = request.headers.get("X-Request-ID") or str(uuid.uuid4())
+        started_at = time.perf_counter()
+        response: StarletteResponse | None = None
+
+        status_code = 500
+        try:
+            response = await call_next(request)
+            status_code = response.status_code
+            return response
+        finally:
+            duration_ms = round((time.perf_counter() - started_at) * 1000, 2)
+            session_obj = request.scope.get("session") or {}
+            user = (session_obj.get("user") or {}).get("username", "anonymous")
+
+            payload = {
+                "event": "http_request",
+                "request_id": request_id,
+                "method": request.method,
+                "path": request.url.path,
+                "status_code": status_code,
+                "duration_ms": duration_ms,
+                "user": user,
+            }
+            # logging.info(json.dumps(payload, ensure_ascii=True))
+
+            if response is not None:
+                response.headers["X-Request-ID"] = request_id
+
+
+app.add_middleware(RequestMetricsMiddleware)
 
 # --- Register Routes ---
 app.include_router(auth.router)

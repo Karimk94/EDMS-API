@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Request, HTTPException, UploadFile, File, Form, BackgroundTasks, Header, Response, Depends
+from fastapi import APIRouter, Request, HTTPException, UploadFile, File, Form, Header, Response, Depends
 from fastapi.responses import StreamingResponse
 from starlette.concurrency import run_in_threadpool
 from werkzeug.utils import secure_filename
@@ -11,7 +11,7 @@ import logging
 import db_connector
 from utils.common import get_current_user, get_session_token, get_mimetype_for_media
 import wsdl_client
-from services.processor import process_document
+from services.processing_queue import processing_queue
 from utils.watermark import apply_watermark_to_image, apply_watermark_to_pdf, apply_watermark_to_video, apply_watermark_to_video_async
 from slowapi import Limiter
 from slowapi.util import get_remote_address
@@ -21,10 +21,6 @@ from database import user_data
 
 router = APIRouter()
 limiter = Limiter(key_func=get_remote_address)
-
-# --- Helper for Background Task ---
-async def run_db_update(result_data):
-    await db_connector.update_document_processing_status(**result_data)
 
 # --- Routes ---
 
@@ -79,36 +75,20 @@ async def api_get_documents(
 
 @router.post('/process-batch')
 @limiter.limit("3/minute")
-async def process_batch(request: Request, background_tasks: BackgroundTasks, user=Depends(get_current_user)):
-    dms_session_token = db_connector.dms_system_login()
-    if not dms_session_token:
-        raise HTTPException(status_code=500, detail="Failed to authenticate with DMS.")
-
+async def process_batch(request: Request, user=Depends(get_current_user)):
     documents = await db_connector.get_documents_to_process()
     if not documents:
-        return {"status": "success", "message": "No new documents to process.", "processed_count": 0}
+        return {"status": "success", "message": "No new documents to queue.", "queued_count": 0}
 
-    # Process documents in parallel with a concurrency limit of 3
-    import asyncio
-    semaphore = asyncio.Semaphore(3)
+    docnumbers = [int(doc['docnumber']) for doc in documents if doc.get('docnumber')]
+    queue_result = processing_queue.enqueue_docnumbers(docnumbers, source="process-batch")
 
-    async def process_with_limit(doc):
-        async with semaphore:
-            return await process_document(doc, dms_session_token)
-
-    results = await asyncio.gather(*[process_with_limit(doc) for doc in documents], return_exceptions=True)
-
-    processed_count = 0
-    for result_data in results:
-        if isinstance(result_data, Exception):
-            logging.error(f"Batch processing error: {result_data}")
-            continue
-        background_tasks.add_task(run_db_update, result_data)
-        if result_data.get('status') == 3:
-            processed_count += 1
-
-    return {"status": "success", "message": f"Processing completed for {len(documents)} documents.",
-            "processed_count": processed_count}
+    return {
+        "status": "success",
+        "message": "Documents queued for background processing.",
+        "queued_count": int(queue_result.get("inserted", 0)) + int(queue_result.get("requeued", 0)),
+        "details": queue_result,
+    }
 
 
 @router.post('/api/upload_document')
@@ -190,28 +170,24 @@ async def api_upload_document(request: Request, file: UploadFile = File(...), do
         raise HTTPException(status_code=500, detail="Failed to upload file to DMS.")
 
 @router.post('/api/process_uploaded_documents')
-async def api_process_uploaded_documents(data: ProcessUploadRequest, background_tasks: BackgroundTasks, user=Depends(get_current_user)):
-    dms_session_token = db_connector.dms_system_login()
-    if not dms_session_token:
-        raise HTTPException(status_code=500, detail="Failed to authenticate.")
+async def api_process_uploaded_documents(data: ProcessUploadRequest, user=Depends(get_current_user)):
+    if not data.docnumbers:
+        return {"processed": [], "failed": [], "in_progress": []}
 
-    results = {"processed": [], "failed": [], "in_progress": []}
-    docs_to_process = await db_connector.get_specific_documents_for_processing(data.docnumbers)
+    queue_result = processing_queue.enqueue_docnumbers(data.docnumbers, source="upload")
+    queued_ids = []
+    for raw_doc in data.docnumbers:
+        try:
+            queued_ids.append(int(raw_doc))
+        except (TypeError, ValueError):
+            continue
 
-    for doc in docs_to_process:
-        result_data = await process_document(doc, dms_session_token)
-        # For uploaded processing, we add to background tasks to update DB
-        background_tasks.add_task(run_db_update, result_data)
-
-        # Immediate status reporting (prediction based on process_document result)
-        if result_data['status'] == 3:
-            results["processed"].append(doc['docnumber'])
-        elif result_data['status'] == 2:
-            results["failed"].append(doc['docnumber'])
-        else:
-            results["in_progress"].append(doc['docnumber'])
-
-    return results
+    return {
+        "processed": [],
+        "failed": [],
+        "in_progress": queued_ids,
+        "queue_details": queue_result,
+    }
 
 @router.get('/api/document/{docnumber}')
 async def get_document_file(docnumber: int, request: Request, user=Depends(get_current_user)):
