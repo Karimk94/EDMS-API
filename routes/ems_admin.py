@@ -19,6 +19,14 @@ router = APIRouter()
 EMS_ADMIN_GROUP_ID = 'EMS_ADMIN'
 
 # --- Authorization Helper ---
+def _has_ems_admin_tab_access(user: dict) -> bool:
+    tab_permissions = user.get("tab_permissions") or []
+    for perm in tab_permissions:
+        if str(perm.get("tab_key", "")).strip().lower() == "ems_admin" and bool(perm.get("can_read")):
+            return True
+    return False
+
+
 async def check_admin_access(request: Request) -> bool:
     """Check if user has admin access (Editor/Admin or EMS_ADMIN group)."""
     if "user" not in request.session:
@@ -33,6 +41,10 @@ async def check_admin_access(request: Request) -> bool:
 
     # Fast path: cached group membership from login/session refresh
     if user.get("is_ems_admin_group_member") is True:
+        return True
+
+    # Per-user tab visibility/access flag
+    if _has_ems_admin_tab_access(user):
         return True
 
     token = user.get("token")
@@ -52,6 +64,17 @@ async def check_admin_access(request: Request) -> bool:
             logging.warning(f"Failed to validate EMS admin group membership for user {username}: {exc}")
 
     return False
+
+
+@router.get("/api/ems-admin/check-access")
+async def check_ems_admin_access(request: Request):
+    """Check if current user can access EMS admin area."""
+    if "user" not in request.session:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+
+    has_access = await check_admin_access(request)
+    user = request.session.get("user", {})
+    return {"has_access": has_access, "username": user.get("username")}
 
 
 # --- AGENCIES ---
@@ -79,6 +102,7 @@ async def get_agencies_endpoint(request: Request):
 async def get_sections_endpoint(
     request: Request,
     name: str = "",
+    disabled: str = "N",
     page: int = 1,
     per_page: int = 10
 ):
@@ -87,7 +111,7 @@ async def get_sections_endpoint(
         raise HTTPException(status_code=403, detail="Access denied")
     
     try:
-        result = await get_sections(name=name, page=page, per_page=per_page)
+        result = await get_sections(name=name, disabled=disabled, page=page, per_page=per_page)
         return {
             **result,
             "success": True
@@ -163,15 +187,16 @@ async def update_section_endpoint(request: Request, data: dict):
 async def get_departments_endpoint(
     request: Request,
     name: str = "",
+    agency_id: int = None,
     page: int = 1,
     per_page: int = 10
 ):
-    """Get departments with pagination and search."""
+    """Get departments with pagination, search, and agency filter."""
     if not await check_admin_access(request):
         raise HTTPException(status_code=403, detail="Access denied")
     
     try:
-        result = await get_departments(name=name, page=page, per_page=per_page)
+        result = await get_departments(name=name, agency_id=agency_id, page=page, per_page=per_page)
         return {
             **result,
             "success": True

@@ -4,7 +4,7 @@ from database.connection import get_async_connection
 
 
 # All valid tab keys in the application
-VALID_TAB_KEYS = ['recent', 'folders', 'profilesearch']
+VALID_TAB_KEYS = ['recent', 'folders', 'profilesearch', 'ems_admin']
 
 
 async def get_tab_permissions_for_user(user_id: int):
@@ -139,6 +139,8 @@ async def create_default_permissions_for_user(user_id: int):
     try:
         async with conn.cursor() as cursor:
             for tab in VALID_TAB_KEYS:
+                default_can_read = 0 if tab == 'ems_admin' else 1
+                default_can_write = 0
                 merge_query = """
                     MERGE INTO LKP_SEDMS_SECURITY tp
                     USING (
@@ -149,14 +151,16 @@ async def create_default_permissions_for_user(user_id: int):
                     ON (tp.USER_ID = src.UID_VAL AND tp.TAB_KEY = src.TK_VAL)
                     WHEN NOT MATCHED THEN
                         INSERT (SYSTEM_ID, USER_ID, TAB_KEY, CAN_READ, CAN_WRITE, DISABLED)
-                        VALUES (src.NEXT_ID, :user_id2, :tab_key2, 1, 0, 'N')
+                        VALUES (src.NEXT_ID, :user_id2, :tab_key2, :can_read, :can_write, 'N')
                 """
                 await cursor.execute(
                     merge_query,
                     user_id=user_id,
                     tab_key=tab,
                     user_id2=user_id,
-                    tab_key2=tab
+                    tab_key2=tab,
+                    can_read=default_can_read,
+                    can_write=default_can_write
                 )
             await conn.commit()
             return True, "Default permissions created"

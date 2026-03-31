@@ -18,6 +18,7 @@ router = APIRouter()
 # Rate limiter for login endpoint — keyed by client IP
 limiter = Limiter(key_func=get_remote_address)
 EMS_ADMIN_GROUP_ID = 'EMS_ADMIN'
+DOCS_SUPERVISORS_GROUP_ID = 'DOCS_SUPERVISORS'
 
 
 def _extract_group_membership_flags(user_groups: list) -> dict:
@@ -35,6 +36,55 @@ def _extract_group_membership_flags(user_groups: list) -> dict:
     return {
         'is_ems_admin_group_member': is_ems_admin_group_member,
     }
+
+
+def _is_member_of_group(user_groups: list, target_group_id: str) -> bool:
+    """Case-insensitive group membership check against both id and name."""
+    target_group = str(target_group_id or '').strip().upper()
+    if not target_group:
+        return False
+
+    for group in user_groups or []:
+        group_id = str(group.get('group_id', '')).strip().upper()
+        group_name = str(group.get('group_name', '')).strip().upper()
+        if group_id == target_group or group_name == target_group:
+            return True
+
+    return False
+
+
+def _is_group_active(group: dict) -> bool:
+    """Treat groups as active unless an explicit inactive flag/value is present."""
+    for key in ('is_active', 'active', 'status'):
+        if key in group:
+            value = group.get(key)
+            if value is None:
+                return True
+            if isinstance(value, bool):
+                return value
+            normalized = str(value).strip().lower()
+            return normalized not in {'0', 'false', 'inactive', 'disabled', 'n'}
+
+    return True
+
+
+def _ensure_ems_admin_tab_permission(tab_permissions: list, is_ems_admin_group_member: bool) -> list:
+    """Ensure EMS admin group members can always see/access EMS admin tab."""
+    permissions = list(tab_permissions or [])
+    if not is_ems_admin_group_member:
+        return permissions
+
+    has_existing = False
+    for perm in permissions:
+        if str(perm.get('tab_key', '')).lower() == 'ems_admin':
+            perm['can_read'] = True
+            has_existing = True
+            break
+
+    if not has_existing:
+        permissions.append({'tab_key': 'ems_admin', 'can_read': True, 'can_write': False})
+
+    return permissions
 
 @router.post('/api/auth/login')
 @limiter.limit("5/minute")
@@ -75,6 +125,11 @@ async def login(request: Request, creds: LoginRequest):
                 tab_permissions = await db_connector.get_tab_permissions_for_user(people_system_id)
             else:
                 tab_permissions = []
+
+        tab_permissions = _ensure_ems_admin_tab_permission(
+            tab_permissions,
+            group_flags.get('is_ems_admin_group_member', False)
+        )
 
         # Use already fetched db_user for preferences
         db_prefs = db_user
@@ -125,6 +180,11 @@ async def get_user(request: Request):
                     user_details['tab_permissions'] = await db_connector.get_tab_permissions_for_user(people_system_id)
                 else:
                     user_details['tab_permissions'] = []
+
+            user_details['tab_permissions'] = _ensure_ems_admin_tab_permission(
+                user_details.get('tab_permissions', []),
+                user_details.get('is_ems_admin_group_member', False)
+            )
 
             request.session['user'] = user_details
 
@@ -191,6 +251,7 @@ async def get_groups(
     request: Request,
     search: str = Query(""),
     page: int = 1,
+    limit: int = Query(0, ge=0),
     user=Depends(get_current_user)
 ):
     token = get_session_token(request)
@@ -212,9 +273,10 @@ async def get_groups(
         user['dms_security_level'] = security_level
         request.session['user'] = user
 
-    # If admin (9), show all groups merged with user's groups.
-    # Otherwise, show only user's groups.
-    if security_level >= 9:
+    # Admins and DOCS_SUPERVISORS can assign permissions across all groups.
+    # Other users are limited to their direct groups.
+    is_docs_supervisor = _is_member_of_group(user_groups, DOCS_SUPERVISORS_GROUP_ID)
+    if security_level >= 9 or is_docs_supervisor:
         all_groups = await run_in_threadpool(wsdl_users.get_all_groups, token)
         # logging.info(f"[/api/groups] Admin mode: got {len(all_groups)} groups from get_all_groups")
         # Merge user's groups with all groups to ensure none are missed
@@ -229,22 +291,29 @@ async def get_groups(
         all_groups = user_groups
         # logging.info(f"[/api/groups] Non-admin mode: returning {len(all_groups)} user groups")
 
+    # Keep only active groups when the source provides an activity marker.
+    active_groups = [g for g in all_groups if _is_group_active(g)]
+
     # Filter by search term
     if search:
         search_lower = search.lower()
         filtered_groups = [
-            g for g in all_groups
+            g for g in active_groups
             if search_lower in (g.get('group_name') or g.get('name') or '').lower()
         ]
     else:
-        filtered_groups = all_groups
+        filtered_groups = active_groups
 
-    # Pagination Logic
-    limit = 20
-    start = (page - 1) * limit
-    end = start + limit
-    paged_groups = filtered_groups[start:end]
-    has_more = len(filtered_groups) > end
+    # Default behavior is to return all matching groups for dropdown clients.
+    # Optional pagination remains available when limit > 0 is explicitly provided.
+    if limit > 0:
+        start = max(page - 1, 0) * limit
+        end = start + limit
+        paged_groups = filtered_groups[start:end]
+        has_more = len(filtered_groups) > end
+    else:
+        paged_groups = filtered_groups
+        has_more = False
 
     return {
         "options": paged_groups,
