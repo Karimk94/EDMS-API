@@ -165,6 +165,21 @@ async def api_upload_document(request: Request, file: UploadFile = File(...), do
         if user and 'edms_user_id' in locals():
             await user_data.deduct_user_quota(edms_user_id, file_size)
         # --------------------
+
+        # --- Set uploader as initial trustee (full control) ---
+        if username:
+            trustees = [{'username': username, 'rights': 255, 'flag': 2}]
+            success, message = wsdl_client.set_trustees(
+                dst=dst,
+                doc_id=str(new_doc_number),
+                library='RTA_MAIN',
+                trustees=trustees,
+                security_enabled='1'
+            )
+            if not success:
+                logging.warning(f"Failed to set security on uploaded document {new_doc_number}: {message}")
+        # -------------------------------------------------------
+
         return {"success": True, "docnumber": new_doc_number, "filename": original_filename}
     else:
         raise HTTPException(status_code=500, detail="Failed to upload file to DMS.")
