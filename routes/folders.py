@@ -2,7 +2,7 @@ import logging
 from fastapi import APIRouter, Request, HTTPException, Header, Depends
 from typing import Optional
 import wsdl_client
-from schemas.folders import CreateFolderRequest, RenameFolderRequest
+from schemas.folders import CreateFolderRequest, RenameFolderRequest, MoveItemsRequest
 from utils.common import get_current_user
 from database import user_data
 import db_connector
@@ -185,3 +185,57 @@ async def api_delete_folder(folder_id: str, request: Request, force: bool = Fals
     except Exception as e:
         logging.error(f"Error in api_delete_folder: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Failed to delete folder.")
+
+
+@router.post('/api/folders/move-items')
+async def api_move_items_to_folder(data: MoveItemsRequest, request: Request, user=Depends(get_current_user)):
+    item_ids = [str(i).strip() for i in (data.item_ids or []) if str(i).strip()]
+    if not item_ids:
+        raise HTTPException(status_code=400, detail='item_ids is required')
+
+    destination_parent_id = data.destination_parent_id
+    if destination_parent_id in ['null', 'undefined', '']:
+        destination_parent_id = None
+
+    dst = wsdl_client.dms_system_login()
+    if not dst:
+        raise HTTPException(status_code=500, detail='Failed to authenticate with DMS')
+
+    moved_ids = []
+    failed = []
+
+    try:
+        for item_id in item_ids:
+            display_name = None
+            if data.item_names and isinstance(data.item_names, dict):
+                display_name = data.item_names.get(item_id)
+
+            if not display_name:
+                try:
+                    filename, _, _ = await db_connector.get_media_info_from_dms(dst, int(item_id))
+                    display_name = filename
+                except Exception:
+                    display_name = None
+
+            ok, message = wsdl_client.move_item_to_parent(
+                dst=dst,
+                doc_number=item_id,
+                new_parent_id=destination_parent_id,
+                display_name=display_name,
+            )
+
+            if ok:
+                moved_ids.append(item_id)
+            else:
+                failed.append({'id': item_id, 'error': message or 'Failed to move'})
+
+        return {
+            'message': 'Move completed',
+            'moved_count': len(moved_ids),
+            'failed_count': len(failed),
+            'moved_ids': moved_ids,
+            'failed': failed,
+        }
+    except Exception as e:
+        logging.error(f"Error in api_move_items_to_folder: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail='Failed to move items.')

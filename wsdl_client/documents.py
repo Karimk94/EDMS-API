@@ -2,7 +2,7 @@ import os
 import logging
 from zeep.exceptions import Fault
 from .base import get_soap_client, find_client_with_operation
-from .config import DMS_USER
+from .config import DMS_USER, SMART_EDMS_ROOT_ID
 from zeep import xsd, Settings, Client
 from lxml import etree
 
@@ -432,6 +432,154 @@ def delete_document(dst, doc_number, force=False):
         except Fault as f:
             return False, f.message or str(f)
     except Exception as e:
+        return False, str(e)
+
+
+def move_item_to_parent(dst, doc_number, new_parent_id, display_name=None):
+    """
+    Moves an existing document/folder item into another parent folder by:
+    1) deleting existing ContentItem links (where-used), then
+    2) creating one ContentItem link under destination parent.
+    """
+    try:
+        svc_client = get_soap_client('BasicHttpBinding_IDMSvc')
+        del_client = find_client_with_operation('DeleteObject') or svc_client
+        enum_client = find_client_with_operation('NewEnum') or svc_client
+
+        string_type = svc_client.get_type('{http://www.w3.org/2001/XMLSchema}string')
+        int_type = svc_client.get_type('{http://www.w3.org/2001/XMLSchema}int')
+        string_array_type = svc_client.get_type(
+            '{http://schemas.microsoft.com/2003/10/Serialization/Arrays}ArrayOfstring')
+
+        target_parent_id = new_parent_id if new_parent_id and str(new_parent_id).strip() else SMART_EDMS_ROOT_ID
+
+        links_to_remove = []
+        coll_names = string_array_type(['%TARGET_LIBRARY', 'DOCNUMBER', '%CONTENTS_DIRECTIVE'])
+        coll_values = {'anyType': [
+            xsd.AnyObject(string_type, 'RTA_MAIN'),
+            xsd.AnyObject(string_type, str(doc_number)),
+            xsd.AnyObject(string_type, '%CONTENTS_WHERE_USED')
+        ]}
+
+        coll_call = {
+            'call': {
+                'dstIn': dst,
+                'objectType': 'ContentsCollection',
+                'properties': {
+                    'propertyCount': 3,
+                    'propertyNames': coll_names,
+                    'propertyValues': coll_values
+                }
+            }
+        }
+
+        coll_reply = svc_client.service.CreateObject(**coll_call)
+        collection_id = None
+        if coll_reply and coll_reply.resultCode == 0 and coll_reply.retProperties:
+            collection_id = coll_reply.retProperties.propertyValues.anyType[0]
+
+        if collection_id:
+            enum_reply = enum_client.service.NewEnum(call={'dstIn': dst, 'collectionID': collection_id})
+
+            if enum_reply and enum_reply.resultCode == 0 and enum_reply.enumID:
+                next_reply = enum_client.service.NextData(
+                    call={'dstIn': dst, 'enumID': enum_reply.enumID, 'elementCount': 1000}
+                )
+
+                if next_reply and next_reply.resultCode in [0, 1] and next_reply.genericItemsData:
+                    g_data = next_reply.genericItemsData
+                    prop_names = g_data.propertyNames.string
+                    rows = g_data.propertyRows.ArrayOfanyType
+
+                    idx_sys = prop_names.index('SYSTEM_ID') if 'SYSTEM_ID' in prop_names else -1
+                    idx_par = prop_names.index('PARENT') if 'PARENT' in prop_names else -1
+                    idx_pver = prop_names.index('PARENT_VERSION') if 'PARENT_VERSION' in prop_names else -1
+
+                    if idx_sys != -1 and rows:
+                        for row in rows:
+                            try:
+                                links_to_remove.append({
+                                    'SYSTEM_ID': row.anyType[idx_sys],
+                                    'PARENT': row.anyType[idx_par] if idx_par != -1 else None,
+                                    'PARENT_VERSION': row.anyType[idx_pver] if idx_pver != -1 else None,
+                                })
+                            except Exception:
+                                continue
+
+                try:
+                    enum_client.service.ReleaseObject(call={'objectID': enum_reply.enumID})
+                except Exception:
+                    pass
+
+            try:
+                svc_client.service.ReleaseObject(call={'objectID': collection_id})
+            except Exception:
+                pass
+
+        for link in links_to_remove:
+            prop_names_list = ['%TARGET_LIBRARY', 'SYSTEM_ID']
+            prop_values_list = [
+                xsd.AnyObject(string_type, 'RTA_MAIN'),
+                xsd.AnyObject(int_type, int(link['SYSTEM_ID']))
+            ]
+
+            if link.get('PARENT'):
+                prop_names_list.append('PARENT')
+                prop_values_list.append(xsd.AnyObject(string_type, str(link['PARENT'])))
+            if link.get('PARENT_VERSION'):
+                prop_names_list.append('PARENT_VERSION')
+                prop_values_list.append(xsd.AnyObject(string_type, str(link['PARENT_VERSION'])))
+
+            del_link_call = {
+                'call': {
+                    'dstIn': dst,
+                    'objectType': 'ContentItem',
+                    'properties': {
+                        'propertyCount': len(prop_names_list),
+                        'propertyNames': string_array_type(prop_names_list),
+                        'propertyValues': {'anyType': prop_values_list}
+                    }
+                }
+            }
+
+            del_resp = del_client.service.DeleteObject(**del_link_call)
+            if not del_resp or del_resp.resultCode != 0:
+                err = getattr(del_resp, 'errorDoc', 'Failed to delete existing link') if del_resp else 'Failed to delete existing link'
+                return False, str(err)
+
+        parent_ver = get_doc_version_info(dst, target_parent_id)
+        link_display_name = display_name.strip() if isinstance(display_name, str) and display_name.strip() else str(doc_number)
+
+        ci_names = string_array_type(
+            ['%TARGET_LIBRARY', 'PARENT', 'PARENT_VERSION', 'DOCNUMBER', '%FOLDERITEM_LIBRARY_NAME', 'DISPLAYNAME',
+             'VERSION_TYPE'])
+        ci_values = {'anyType': [
+            xsd.AnyObject(string_type, 'RTA_MAIN'),
+            xsd.AnyObject(string_type, str(target_parent_id)),
+            xsd.AnyObject(string_type, str(parent_ver)),
+            xsd.AnyObject(string_type, str(doc_number)),
+            xsd.AnyObject(string_type, 'RTA_MAIN'),
+            xsd.AnyObject(string_type, link_display_name),
+            xsd.AnyObject(string_type, 'R')
+        ]}
+
+        link_reply = svc_client.service.CreateObject(call={
+            'dstIn': dst,
+            'objectType': 'ContentItem',
+            'properties': {
+                'propertyCount': 7,
+                'propertyNames': ci_names,
+                'propertyValues': ci_values
+            }
+        })
+
+        if link_reply and link_reply.resultCode == 0:
+            return True, 'Moved'
+
+        err = getattr(link_reply, 'errorDoc', 'Failed to create destination link') if link_reply else 'Failed to create destination link'
+        return False, str(err)
+    except Exception as e:
+        logging.error(f"move_item_to_parent failed for doc {doc_number}: {e}", exc_info=True)
         return False, str(e)
 
 def rename_document(dst, doc_id, new_name):
