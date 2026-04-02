@@ -4,6 +4,54 @@ from .base import get_soap_client, find_client_with_operation
 from .utils import parse_user_result_buffer, parse_group_members_buffer, parse_groups_buffer, \
     clean_string, is_likely_user_id, looks_like_full_name
 import logging
+import os
+import time
+
+GROUPS_CACHE_TTL_SECONDS = int(os.getenv('GROUPS_CACHE_TTL_SECONDS', '180'))
+GROUPS_CACHE_MAX_ENTRIES = int(os.getenv('GROUPS_CACHE_MAX_ENTRIES', '1000'))
+_groups_for_user_cache = {}
+
+
+def _groups_cache_key(dst, username, library):
+    return f"{dst}|{str(username).upper()}|{library}"
+
+
+def _clone_groups(groups):
+    # Return a defensive copy so callers cannot mutate cache entries.
+    return [dict(g) for g in groups]
+
+
+def _get_cached_groups(dst, username, library):
+    key = _groups_cache_key(dst, username, library)
+    cached = _groups_for_user_cache.get(key)
+    if not cached:
+        return None
+
+    if cached['expires_at'] <= time.time():
+        _groups_for_user_cache.pop(key, None)
+        return None
+
+    return _clone_groups(cached['value'])
+
+
+def _set_cached_groups(dst, username, library, groups):
+    # Opportunistic cleanup when cache grows.
+    if len(_groups_for_user_cache) >= GROUPS_CACHE_MAX_ENTRIES:
+        now = time.time()
+        expired_keys = [k for k, v in _groups_for_user_cache.items() if v['expires_at'] <= now]
+        for k in expired_keys[: max(1, len(expired_keys))]:
+            _groups_for_user_cache.pop(k, None)
+
+        # If still too large, evict a few oldest entries.
+        if len(_groups_for_user_cache) >= GROUPS_CACHE_MAX_ENTRIES:
+            oldest = sorted(_groups_for_user_cache.items(), key=lambda item: item[1]['expires_at'])[:50]
+            for k, _ in oldest:
+                _groups_for_user_cache.pop(k, None)
+
+    _groups_for_user_cache[_groups_cache_key(dst, username, library)] = {
+        'expires_at': time.time() + GROUPS_CACHE_TTL_SECONDS,
+        'value': _clone_groups(groups),
+    }
 
 def is_valid_group_id(gid):
     """
@@ -1270,6 +1318,13 @@ def get_groups_for_user(dst, username, library='RTA_MAIN'):
     """
     ADMIN_GROUPS = {'DOCS_SUPERVISORS', 'ADMINS'}
 
+    if not username:
+        return []
+
+    cached_groups = _get_cached_groups(dst, username, library)
+    if cached_groups is not None:
+        return cached_groups
+
     group_ids = []
     seen = set()
     is_admin = False
@@ -1353,11 +1408,17 @@ def get_groups_for_user(dst, username, library='RTA_MAIN'):
 
     # If user is admin, return ALL groups
     if is_admin:
-        return get_all_groups(dst, library)
+        all_groups = get_all_groups(dst, library)
+        _set_cached_groups(dst, username, library, all_groups)
+        return _clone_groups(all_groups)
 
     # Return user's groups
     if group_ids:
-        return [{'group_id': gid, 'group_name': gid} for gid in group_ids]
+        user_groups = [{'group_id': gid, 'group_name': gid} for gid in group_ids]
+        _set_cached_groups(dst, username, library, user_groups)
+        return _clone_groups(user_groups)
 
     # Fallback: return all groups (if couldn't determine user's groups)
-    return get_all_groups(dst, library)
+    fallback_groups = get_all_groups(dst, library)
+    _set_cached_groups(dst, username, library, fallback_groups)
+    return _clone_groups(fallback_groups)

@@ -1,10 +1,17 @@
 import logging
+from collections import deque
 from .base import get_soap_client, find_client_with_operation
 from .config import SMART_EDMS_ROOT_ID, DMS_USER
 from .utils import parse_binary_result_buffer
 from .documents import get_doc_version_info
 import os
 from zeep import Client, Settings, xsd
+
+IMAGE_EXTS = {'jpg', 'jpeg', 'png', 'gif', 'bmp', 'tif', 'tiff', 'webp', 'heic'}
+VIDEO_EXTS = {'mp4', 'mov', 'avi', 'mkv', 'wmv', 'flv', 'webm', '3gp'}
+PDF_LIKE_EXTS = {'pdf', 'doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx', 'txt'}
+FOLDER_TRAILING_SUFFIXES = (' D', ' N', ' F')
+IMAGE_VIDEO_TYPES = {'image', 'video'}
 
 def create_dms_folder(dst, folder_name, description="", parent_id=None, user_id=None):
     target_parent_id = parent_id if parent_id and str(parent_id).strip() else SMART_EDMS_ROOT_ID
@@ -59,9 +66,14 @@ async def get_recursive_doc_ids(dst, media_type_filter=None, search_term=None, s
     
     root_node = start_node if start_node else SMART_EDMS_ROOT_ID
     matching_docs = []
-    folder_queue = [root_node]
+    folder_queue = deque([root_node])
+    queued_folders = {str(root_node)}
     processed_folders = set()
     MAX_FOLDERS_TO_SCAN = 100
+    permission_cache = {}
+    username_upper = username.upper() if username else None
+    search_term_lower = search_term.lower() if search_term else None
+    filter_files_only = media_type_filter == 'files'
 
     # Get user's groups for permission checking if not already provided
     if username and user_groups is None:
@@ -71,6 +83,7 @@ async def get_recursive_doc_ids(dst, media_type_filter=None, search_term=None, s
         except Exception as e:
             logging.warning(f"Could not fetch groups for user {username}: {e}")
             user_groups = []
+    user_groups_set = set(user_groups) if user_groups else set()
     
     def folder_has_permission(folder_id):
         """Check if user has permission to see this folder based on trustees."""
@@ -80,23 +93,32 @@ async def get_recursive_doc_ids(dst, media_type_filter=None, search_term=None, s
         
         if not username:
             return True  # No user filtering if username not provided
+
+        folder_id_str = str(folder_id)
+        if folder_id_str in permission_cache:
+            return permission_cache[folder_id_str]
         
         try:
-            trustees = get_object_trustees(dst, folder_id)
+            trustees = get_object_trustees(dst, folder_id_str)
             if not trustees:
+                permission_cache[folder_id_str] = True
                 return True  # No trustees means folder is accessible to all
             
             # Check if user is directly in trustees list or via group
             for trustee in trustees:
                 trustee_name = trustee.get('username', '').upper()
-                if trustee_name == username.upper():
+                if trustee_name == username_upper:
+                    permission_cache[folder_id_str] = True
                     return True
-                if user_groups and trustee_name in user_groups:
+                if user_groups_set and trustee_name in user_groups_set:
+                    permission_cache[folder_id_str] = True
                     return True
             
+            permission_cache[folder_id_str] = False
             return False
         except Exception as e:
             logging.warning(f"Could not check permissions for folder {folder_id}: {e}")
+            permission_cache[folder_id_str] = True
             return True  # On error, allow access
 
     search_client = get_soap_client('BasicHttpBinding_IDMSvc')
@@ -108,7 +130,8 @@ async def get_recursive_doc_ids(dst, media_type_filter=None, search_term=None, s
     try:
         while folder_queue:
             if len(processed_folders) >= MAX_FOLDERS_TO_SCAN: break
-            current_folder_id = folder_queue.pop(0)
+            current_folder_id = folder_queue.popleft()
+            queued_folders.discard(str(current_folder_id))
             if current_folder_id in processed_folders: continue
             processed_folders.add(current_folder_id)
 
@@ -159,11 +182,11 @@ async def get_recursive_doc_ids(dst, media_type_filter=None, search_term=None, s
                             media_type = 'folder' if is_folder else 'resolve'
                             if not is_folder and len(props) > 6 and props[6]:
                                 dos_ext = str(props[6]).lower().replace('.', '').strip()
-                                if dos_ext in ['jpg', 'jpeg', 'png', 'gif', 'bmp', 'tif', 'tiff', 'webp', 'heic']:
+                                if dos_ext in IMAGE_EXTS:
                                     media_type = 'image'
-                                elif dos_ext in ['mp4', 'mov', 'avi', 'mkv', 'wmv', 'flv', 'webm', '3gp']:
+                                elif dos_ext in VIDEO_EXTS:
                                     media_type = 'video'
-                                elif dos_ext in ['pdf', 'doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx', 'txt']:
+                                elif dos_ext in PDF_LIKE_EXTS:
                                     media_type = 'pdf'
                             items_batch.append({'id': str(doc_id), 'name': name, 'media_type': media_type,
                                                 'type': 'folder' if is_folder else 'file'})
@@ -182,14 +205,16 @@ async def get_recursive_doc_ids(dst, media_type_filter=None, search_term=None, s
 
                 ids_to_resolve = []
                 for item in items_batch:
+                    item_name_lower = item['name'].lower() if search_term_lower else None
                     if item.get('type') == 'folder' or item.get('media_type') == 'folder':
                         # Check permission before adding folder to queue
                         if not folder_has_permission(item['id']):
                             continue  # Skip folders the user doesn't have permission to see
                         
-                        if item['id'] not in processed_folders and item['id'] not in folder_queue:
+                        if item['id'] not in processed_folders and item['id'] not in queued_folders:
                             folder_queue.append(item['id'])
-                        if search_term and search_term.lower() in item['name'].lower():
+                            queued_folders.add(item['id'])
+                        if search_term_lower and search_term_lower in item_name_lower:
                             item['thumbnail_url'] = f"cache/{item['id']}.jpg"
                             matching_docs.append(item)
                         continue
@@ -199,13 +224,13 @@ async def get_recursive_doc_ids(dst, media_type_filter=None, search_term=None, s
                         continue
 
                     is_match = True
-                    if search_term and search_term.lower() not in item['name'].lower():
+                    if search_term_lower and search_term_lower not in item_name_lower:
                         is_match = False
 
                     if is_match and media_type_filter:
                         item_media_type = item.get('media_type')
-                        if media_type_filter == 'files':
-                            if item_media_type in ['image', 'video']:
+                        if filter_files_only:
+                            if item_media_type in IMAGE_VIDEO_TYPES:
                                 is_match = False
                         else:
                             if item_media_type != media_type_filter:
@@ -227,15 +252,15 @@ async def get_recursive_doc_ids(dst, media_type_filter=None, search_term=None, s
 
                             media_match = True
                             if media_type_filter:
-                                if media_type_filter == 'files':
-                                    if r_type in ['image', 'video']:
+                                if filter_files_only:
+                                    if r_type in IMAGE_VIDEO_TYPES:
                                         media_match = False
                                 else:
                                     if r_type != media_type_filter:
                                         media_match = False
 
                             search_match = True
-                            if search_term and search_term.lower() not in resolve_item['name'].lower():
+                            if search_term_lower and search_term_lower not in resolve_item['name'].lower():
                                 search_match = False
 
                             if media_match and search_match:
@@ -262,6 +287,8 @@ async def list_folder_contents(dst, parent_id=None, app_source=None, scope=None,
     from .users import get_object_trustees, get_groups_for_user
     
     items = []
+    permission_cache = {}
+    username_upper = username.upper() if username else None
     if parent_id == 'images':
         media_type = 'image'
         scope = 'folders'
@@ -286,29 +313,39 @@ async def list_folder_contents(dst, parent_id=None, app_source=None, scope=None,
             user_groups = [g.get('group_id', '').upper() for g in groups_data if g.get('group_id')]
         except Exception as e:
             logging.warning(f"Could not fetch groups for user {username}: {e}")
+    user_groups_set = set(user_groups) if user_groups else set()
     
     def user_has_permission(folder_id):
         """Check if user has permission to see this folder based on trustees."""
         if not username:
             return True  # No user filtering if username not provided
+
+        folder_id_str = str(folder_id)
+        if folder_id_str in permission_cache:
+            return permission_cache[folder_id_str]
         
         try:
-            trustees = get_object_trustees(dst, folder_id)
+            trustees = get_object_trustees(dst, folder_id_str)
             if not trustees:
+                permission_cache[folder_id_str] = True
                 return True  # No trustees means folder is accessible to all
             
             # Check if user is directly in trustees list
             for trustee in trustees:
                 trustee_name = trustee.get('username', '').upper()
-                if trustee_name == username.upper():
+                if trustee_name == username_upper:
+                    permission_cache[folder_id_str] = True
                     return True
                 # Check if any of user's groups is in trustees list
-                if trustee_name in user_groups:
+                if trustee_name in user_groups_set:
+                    permission_cache[folder_id_str] = True
                     return True
             
+            permission_cache[folder_id_str] = False
             return False
         except Exception as e:
             logging.warning(f"Could not check permissions for folder {folder_id}: {e}")
+            permission_cache[folder_id_str] = True
             return True  # On error, allow access
 
     if (scope == 'folders' and media_type) or search_term:
@@ -387,8 +424,8 @@ async def list_folder_contents(dst, parent_id=None, app_source=None, scope=None,
                         node_type = props[2]
                         is_folder = (node_type == 'F')
                         media_type_item = 'folder' if is_folder else 'resolve'
-                        if name_str.endswith(' D') or name_str.endswith(' N') or name_str.endswith(
-                                ' F'): name_str = name_str[:-2]
+                        if name_str.endswith(FOLDER_TRAILING_SUFFIXES):
+                            name_str = name_str[:-2]
                         items.append({'id': str(doc_id), 'name': name_str, 'type': 'folder' if is_folder else 'file',
                                       'media_type': media_type_item, 'node_type': str(node_type), 'is_standard': False})
                     except Exception:

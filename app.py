@@ -10,6 +10,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.sessions import SessionMiddleware
 from dotenv import load_dotenv
+from database.connection import ensure_performance_indexes
 
 # Import Routers
 from routes import auth, documents, media, tags, events, folders, favorites, memories, sharing, admin, ems_admin, profilesearch
@@ -44,6 +45,10 @@ async def periodic_cache_cleanup():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Modern lifespan handler replacing deprecated @app.on_event."""
+    index_result = ensure_performance_indexes()
+    if index_result.get('created'):
+        logging.info(f"Performance indexes created: {index_result['created']}")
+
     cache_cleanup_task = asyncio.create_task(periodic_cache_cleanup())
     queue_stop_event = asyncio.Event()
     queue_worker_task = asyncio.create_task(processing_worker_loop(queue_stop_event))

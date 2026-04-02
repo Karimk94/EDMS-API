@@ -87,6 +87,67 @@ def get_connection():
         error, = ex.args
         raise DatabaseConnectionError(f"DB pool acquire error: {error.message} (Code: {error.code})")
 
+
+def ensure_performance_indexes():
+    """
+    Best-effort index creation for hot query paths.
+    - Idempotent: checks USER_INDEXES first.
+    - Safe: logs and continues on permission errors.
+    """
+    index_ddls = [
+        (
+            'IDX_FOLDER_ITEM_PARENT_NODE',
+            'CREATE INDEX IDX_FOLDER_ITEM_PARENT_NODE ON FOLDER_ITEM (PARENT, NODE_TYPE)'
+        ),
+    ]
+
+    conn = None
+    created = []
+    skipped = []
+    errors = []
+
+    try:
+        conn = get_connection()
+        with conn.cursor() as cursor:
+            for index_name, ddl in index_ddls:
+                try:
+                    cursor.execute(
+                        "SELECT COUNT(1) FROM USER_INDEXES WHERE INDEX_NAME = :name",
+                        {'name': index_name.upper()}
+                    )
+                    exists = (cursor.fetchone() or [0])[0] > 0
+                    if exists:
+                        skipped.append(f"{index_name}:exists")
+                        continue
+
+                    cursor.execute(ddl)
+                    created.append(index_name)
+                    logging.info(f"Created performance index: {index_name}")
+                except oracledb.Error as ex:
+                    error, = ex.args
+                    # 955: name is already used by an existing object
+                    # 1031: insufficient privileges
+                    # 942: table or view does not exist
+                    if error.code == 955:
+                        skipped.append(f"{index_name}:already-exists")
+                    elif error.code in (1031, 942):
+                        skipped.append(f"{index_name}:permission-or-missing-table")
+                        logging.warning(
+                            f"Skipping index {index_name} (code {error.code}): {error.message}"
+                        )
+                    else:
+                        errors.append(f"{index_name}:{error.code}")
+                        logging.error(
+                            f"Failed creating index {index_name} (code {error.code}): {error.message}"
+                        )
+    except Exception as e:
+        logging.warning(f"Index initialization skipped due to startup DB error: {e}")
+    finally:
+        if conn:
+            conn.close()
+
+    return {'created': created, 'skipped': skipped, 'errors': errors}
+
 async def get_async_connection():
     """Acquires a connection from the asynchronous pool."""
     pool = await _get_async_pool()

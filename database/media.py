@@ -2,6 +2,7 @@ import os
 import io
 import shutil
 import logging
+import time
 import oracledb
 from datetime import datetime
 from PIL import Image
@@ -11,6 +12,76 @@ from zeep import Client, Settings
 from zeep.exceptions import Fault
 import wsdl_client
 from database.connection import get_connection, get_async_connection
+
+APPS_BUCKET_TTL_SECONDS = int(os.getenv('APPS_CACHE_TTL_SECONDS', '600'))
+ORACLE_IN_CLAUSE_LIMIT = 900
+
+IMAGE_EXTS = {'jpg', 'jpeg', 'png', 'gif', 'bmp', 'tif', 'tiff', 'webp', 'heic', 'ico', 'jfif'}
+VIDEO_EXTS = {'mp4', 'mov', 'avi', 'mkv', 'wmv', 'flv', 'webm', 'm4v', '3gp', 'ts', 'mts', '3g2'}
+PDF_EXTS = {'pdf', 'doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx', 'txt', 'rtf', 'csv', 'zip', 'rar', '7z'}
+
+DOC_IMAGE_EXTS = {'jpg', 'jpeg', 'png', 'gif', 'bmp', 'tif', 'tiff', 'webp', 'heic'}
+DOC_VIDEO_EXTS = {'mp4', 'mov', 'avi', 'wmv', 'mkv', 'flv', 'webm', '3gp'}
+DOC_PDF_EXTS = {'pdf'}
+DOC_WORD_EXTS = {'doc', 'docx'}
+DOC_EXCEL_EXTS = {'xls', 'xlsx', 'ods', 'xlsm'}
+DOC_PPT_EXTS = {'ppt', 'pptx', 'odp', 'pps', 'ppsx'}
+DOC_TEXT_EXTS = {'txt', 'csv', 'json', 'xml', 'log', 'md'}
+DOC_ZIP_EXTS = {'zip', 'rar', '7z', 'tar', 'gz'}
+
+_apps_bucket_cache = {
+    'expires_at': 0.0,
+    'image_ids': [],
+    'video_ids': [],
+    'pdf_ids': []
+}
+
+
+def _build_app_buckets(apps_rows):
+    image_app_ids = []
+    video_app_ids = []
+    pdf_app_ids = []
+
+    for app_id, ext in apps_rows:
+        if not ext:
+            continue
+        clean_ext = str(ext).lower().replace('.', '').strip()
+        str_id = str(app_id).strip()
+        if clean_ext in IMAGE_EXTS:
+            image_app_ids.append(str_id)
+        elif clean_ext in VIDEO_EXTS:
+            video_app_ids.append(str_id)
+        elif clean_ext in PDF_EXTS:
+            pdf_app_ids.append(str_id)
+
+    return image_app_ids, video_app_ids, pdf_app_ids
+
+
+def _get_cached_app_buckets(cursor):
+    now = time.time()
+    if _apps_bucket_cache['expires_at'] > now:
+        return (
+            _apps_bucket_cache['image_ids'],
+            _apps_bucket_cache['video_ids'],
+            _apps_bucket_cache['pdf_ids']
+        )
+
+    id_column = 'SYSTEM_ID'
+    try:
+        cursor.execute(f"SELECT {id_column}, DEFAULT_EXTENSION FROM APPS")
+        apps_rows = cursor.fetchall()
+    except oracledb.DatabaseError:
+        id_column = 'APPLICATION'
+        cursor.execute(f"SELECT {id_column}, DEFAULT_EXTENSION FROM APPS")
+        apps_rows = cursor.fetchall()
+
+    image_app_ids, video_app_ids, pdf_app_ids = _build_app_buckets(apps_rows)
+    _apps_bucket_cache['image_ids'] = image_app_ids
+    _apps_bucket_cache['video_ids'] = video_app_ids
+    _apps_bucket_cache['pdf_ids'] = pdf_app_ids
+    _apps_bucket_cache['expires_at'] = now + APPS_BUCKET_TTL_SECONDS
+
+    return image_app_ids, video_app_ids, pdf_app_ids
 
 # --- Cache Directory Setup ---
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -310,33 +381,7 @@ async def get_media_type_counts(app_source='unknown', scope=None, username=None)
 
     try:
         with conn.cursor() as cursor:
-            id_column = "SYSTEM_ID"
-            try:
-                cursor.execute(f"SELECT {id_column}, DEFAULT_EXTENSION FROM APPS")
-                apps_rows = cursor.fetchall()
-            except oracledb.DatabaseError:
-                id_column = "APPLICATION"
-                cursor.execute(f"SELECT {id_column}, DEFAULT_EXTENSION FROM APPS")
-                apps_rows = cursor.fetchall()
-
-            image_exts = {'jpg', 'jpeg', 'png', 'gif', 'bmp', 'tif', 'tiff', 'webp', 'heic', 'ico', 'jfif'}
-            video_exts = {'mp4', 'mov', 'avi', 'mkv', 'wmv', 'flv', 'webm', 'm4v', '3gp', 'ts', 'mts', '3g2'}
-            pdf_exts = {'pdf', 'doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx', 'txt', 'rtf', 'csv', 'zip', 'rar', '7z'}
-
-            image_app_ids = []
-            video_app_ids = []
-            pdf_app_ids = []
-
-            for app_id, ext in apps_rows:
-                if not ext: continue
-                clean_ext = str(ext).lower().replace('.', '').strip()
-                str_id = str(app_id).strip()
-                if clean_ext in image_exts:
-                    image_app_ids.append(str_id)
-                elif clean_ext in video_exts:
-                    video_app_ids.append(str_id)
-                elif clean_ext in pdf_exts:
-                    pdf_app_ids.append(str_id)
+            image_app_ids, video_app_ids, pdf_app_ids = _get_cached_app_buckets(cursor)
 
             def build_app_id_clause(ids):
                 if not ids: return "1=0"
@@ -376,46 +421,69 @@ async def resolve_media_types_from_db(doc_ids):
     resolved_map = {}
     try:
         with conn.cursor() as cursor:
-            ids_str = ",".join(str(int(did)) for did in doc_ids)
-            sql = f"""
-                SELECT p.DOCNUMBER, a.DEFAULT_EXTENSION
-                FROM PROFILE p
-                LEFT JOIN APPS a ON p.APPLICATION = a.SYSTEM_ID
-                WHERE p.DOCNUMBER IN ({ids_str})
-            """
-            cursor.execute(sql)
-            rows = cursor.fetchall()
+            valid_doc_ids = []
+            for did in doc_ids:
+                try:
+                    valid_doc_ids.append(int(did))
+                except Exception:
+                    continue
 
-            image_exts = {'jpg', 'jpeg', 'png', 'gif', 'bmp', 'tif', 'tiff', 'webp', 'heic'}
-            video_exts = {'mp4', 'mov', 'avi', 'wmv', 'mkv', 'flv', 'webm', '3gp'}
-            pdf_exts = {'pdf'}
-            word_exts = {'doc', 'docx'}
-            excel_exts = {'xls', 'xlsx', 'ods', 'xlsm'}
-            ppt_exts = {'ppt', 'pptx', 'odp', 'pps', 'ppsx'}
-            text_exts = {'txt', 'csv', 'json', 'xml', 'log', 'md'}
-            zip_exts = {'zip', 'rar', '7z', 'tar', 'gz'}
+            if not valid_doc_ids:
+                return {}
 
-            for doc_id, ext in rows:
-                media_type = 'file'
-                if ext:
-                    clean_ext = str(ext).lower().replace('.', '').strip()
-                    if clean_ext in image_exts:
-                        media_type = 'image'
-                    elif clean_ext in video_exts:
-                        media_type = 'video'
-                    elif clean_ext in pdf_exts:
-                        media_type = 'pdf'
-                    elif clean_ext in word_exts:
-                        media_type = 'docx'
-                    elif clean_ext in excel_exts:
-                        media_type = 'excel'
-                    elif clean_ext in ppt_exts:
-                        media_type = 'powerpoint'
-                    elif clean_ext in text_exts:
-                        media_type = 'text'
-                    elif clean_ext in zip_exts:
-                        media_type = 'zip'
-                resolved_map[str(doc_id)] = media_type
+            join_column = 'SYSTEM_ID'
+
+            for start in range(0, len(valid_doc_ids), ORACLE_IN_CLAUSE_LIMIT):
+                chunk = valid_doc_ids[start:start + ORACLE_IN_CLAUSE_LIMIT]
+                bind_names = [f"id{i}" for i in range(len(chunk))]
+                in_clause = ",".join(f":{name}" for name in bind_names)
+                bind_params = {name: value for name, value in zip(bind_names, chunk)}
+
+                sql = f"""
+                    SELECT p.DOCNUMBER, a.DEFAULT_EXTENSION
+                    FROM PROFILE p
+                    LEFT JOIN APPS a ON p.APPLICATION = a.{join_column}
+                    WHERE p.DOCNUMBER IN ({in_clause})
+                """
+
+                try:
+                    cursor.execute(sql, bind_params)
+                except oracledb.DatabaseError:
+                    if join_column == 'SYSTEM_ID':
+                        join_column = 'APPLICATION'
+                        sql = f"""
+                            SELECT p.DOCNUMBER, a.DEFAULT_EXTENSION
+                            FROM PROFILE p
+                            LEFT JOIN APPS a ON p.APPLICATION = a.{join_column}
+                            WHERE p.DOCNUMBER IN ({in_clause})
+                        """
+                        cursor.execute(sql, bind_params)
+                    else:
+                        raise
+
+                rows = cursor.fetchall()
+
+                for doc_id, ext in rows:
+                    media_type = 'file'
+                    if ext:
+                        clean_ext = str(ext).lower().replace('.', '').strip()
+                        if clean_ext in DOC_IMAGE_EXTS:
+                            media_type = 'image'
+                        elif clean_ext in DOC_VIDEO_EXTS:
+                            media_type = 'video'
+                        elif clean_ext in DOC_PDF_EXTS:
+                            media_type = 'pdf'
+                        elif clean_ext in DOC_WORD_EXTS:
+                            media_type = 'docx'
+                        elif clean_ext in DOC_EXCEL_EXTS:
+                            media_type = 'excel'
+                        elif clean_ext in DOC_PPT_EXTS:
+                            media_type = 'powerpoint'
+                        elif clean_ext in DOC_TEXT_EXTS:
+                            media_type = 'text'
+                        elif clean_ext in DOC_ZIP_EXTS:
+                            media_type = 'zip'
+                    resolved_map[str(doc_id)] = media_type
     except Exception as e:
         logging.error(f"Error resolving media types: {e}")
     finally:

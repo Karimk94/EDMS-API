@@ -284,7 +284,8 @@ async def verify_document_in_folder(root_folder_docnumber: str, doc_id: str) -> 
 
 async def build_breadcrumb_path(root_folder_docnumber: str, current_folder_docnumber: str) -> list:
     """
-    Builds the breadcrumb path from root to current folder.
+    Builds the breadcrumb path from root to current folder efficiently.
+    Uses a single database connection for all lookups instead of N separate connections.
     Both parameters are DOCNUMBERs.
     """
     if str(root_folder_docnumber) == str(current_folder_docnumber):
@@ -294,6 +295,82 @@ async def build_breadcrumb_path(root_folder_docnumber: str, current_folder_docnu
             'name': folder_info.get('name', 'Shared Folder') if folder_info else 'Shared Folder'
         }]
 
+    # Collect all docnumbers in the path first
+    docnumbers = [current_folder_docnumber]
+    current_docnumber = current_folder_docnumber
+    max_depth = 50
+
+    conn = await get_async_connection()
+    if not conn:
+        # Fallback to old method if connection fails
+        return await _build_breadcrumb_path_fallback(root_folder_docnumber, current_folder_docnumber)
+
+    try:
+        async with conn.cursor() as cursor:
+            for _ in range(max_depth):
+                # Get parent docnumber for current folder
+                await cursor.execute(
+                    """SELECT PARENT FROM FOLDER_ITEM
+                       WHERE DOCNUMBER = :docnumber AND NODE_TYPE = :node_type""",
+                    {'docnumber': current_docnumber, 'node_type': NODE_TYPE_FOLDER}
+                )
+                row = await cursor.fetchone()
+                if not row or not row[0]:
+                    break
+
+                parent_docnumber = str(row[0])
+                if parent_docnumber not in docnumbers:
+                    docnumbers.append(parent_docnumber)
+
+                if str(parent_docnumber) == str(root_folder_docnumber):
+                    docnumbers.insert(0, str(root_folder_docnumber))
+                    break
+
+                current_docnumber = parent_docnumber
+
+            # Now batch-fetch all folder info in one query
+            if not docnumbers:
+                return [{'id': root_folder_docnumber, 'name': 'Shared Folder'}]
+
+            placeholders = ','.join([f":{i}" for i in range(len(docnumbers))])
+            query_params = {str(i): docnumber for i, docnumber in enumerate(docnumbers)}
+
+            await cursor.execute(
+                f"""SELECT fi.DOCNUMBER, fi.DISPLAYNAME, p.DOCNAME
+                    FROM FOLDER_ITEM fi
+                    LEFT JOIN PROFILE p ON fi.DOCNUMBER = p.DOCNUMBER
+                    WHERE fi.DOCNUMBER IN ({placeholders}) AND fi.NODE_TYPE = :node_type""",
+                {**query_params, 'node_type': NODE_TYPE_FOLDER}
+            )
+            rows = await cursor.fetchall()
+
+            # Build a map of docnumber -> folder info
+            folder_map = {}
+            for row in rows:
+                docnumber, display_name, docname = row
+                folder_map[str(docnumber)] = display_name or docname or f'Folder {docnumber}'
+
+            # Build path in correct order
+            path = []
+            for docnumber in docnumbers:
+                path.append({
+                    'id': str(docnumber),
+                    'name': folder_map.get(str(docnumber), 'Folder')
+                })
+
+            return path if path else [{'id': root_folder_docnumber, 'name': 'Shared Folder'}]
+
+    except Exception as e:
+        logging.error(f"Error building breadcrumb path: {e}")
+        return [{'id': root_folder_docnumber, 'name': 'Shared Folder'}]
+    finally:
+        await conn.close()
+
+
+async def _build_breadcrumb_path_fallback(root_folder_docnumber: str, current_folder_docnumber: str) -> list:
+    """
+    Fallback method for build_breadcrumb_path (old method, slower but reliable).
+    """
     path = []
     current_docnumber = current_folder_docnumber
     max_depth = 50
