@@ -166,9 +166,25 @@ async def api_upload_document(request: Request, file: UploadFile = File(...), do
             await user_data.deduct_user_quota(edms_user_id, file_size)
         # --------------------
 
-        # --- Set uploader as initial trustee (full control) ---
+        # --- Set security: inherit parent folder trustees + ensure uploader has full control ---
         if username:
-            trustees = [{'username': username, 'rights': 255, 'flag': 2}]
+            trustees = []
+            if parent_id:
+                try:
+                    parent_trustees = wsdl_client.get_object_trustees(dst, str(parent_id))
+                    if parent_trustees:
+                        trustees = list(parent_trustees)
+                except Exception as te:
+                    logging.warning(f"Could not fetch parent trustees for document {new_doc_number}: {te}")
+
+            # Ensure the uploader is present with full control
+            uploader_in_list = any(
+                str(t.get('username', '')).upper() == str(username).upper()
+                for t in trustees
+            )
+            if not uploader_in_list:
+                trustees.append({'username': username, 'rights': 255, 'flag': 2})
+
             success, message = wsdl_client.set_trustees(
                 dst=dst,
                 doc_id=str(new_doc_number),

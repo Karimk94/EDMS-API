@@ -1,11 +1,18 @@
+import io
 import logging
+import os
+import zipfile
+
 from fastapi import APIRouter, Request, HTTPException, Header, Depends
+from fastapi.responses import StreamingResponse
 from typing import Optional
 import wsdl_client
 from schemas.folders import CreateFolderRequest, RenameFolderRequest, MoveItemsRequest
 from utils.common import get_current_user
-from database import user_data
+from database import user_data, folders as db_folders
 import db_connector
+
+ZIP_SIZE_LIMIT_BYTES = 100 * 1024 * 1024  # 100 MB
 
 router = APIRouter()
 
@@ -85,14 +92,24 @@ async def api_create_folder(request: Request, data: CreateFolderRequest, user=De
             user_id=username
         )
         if new_folder_id:
-            # Set security so only the creator can see the folder
-            trustees = [
-                {
-                    'username': username,
-                    'rights': 255,  # Full control
-                    'flag': 2  # User (not group)
-                }
-            ]
+            # Build trustee list: start from parent folder's trustees then add/ensure creator
+            trustees = []
+            if parent_id:
+                try:
+                    parent_trustees = wsdl_client.get_object_trustees(dst, str(parent_id))
+                    if parent_trustees:
+                        trustees = list(parent_trustees)
+                except Exception as te:
+                    logging.warning(f"Could not fetch parent trustees for folder {parent_id}: {te}")
+
+            # Ensure the creator is present with full control
+            creator_in_list = any(
+                str(t.get('username', '')).upper() == str(username).upper()
+                for t in trustees
+            )
+            if not creator_in_list:
+                trustees.append({'username': username, 'rights': 255, 'flag': 2})
+
             success, message = wsdl_client.set_trustees(
                 dst=dst,
                 doc_id=str(new_folder_id),
@@ -239,3 +256,82 @@ async def api_move_items_to_folder(data: MoveItemsRequest, request: Request, use
     except Exception as e:
         logging.error(f"Error in api_move_items_to_folder: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail='Failed to move items.')
+
+
+@router.get('/api/folders/{folder_id}/download-zip')
+async def api_download_folder_zip(folder_id: str, request: Request, user=Depends(get_current_user)):
+    """
+    Downloads the direct file contents of a folder as a ZIP archive.
+    Subfolders are intentionally skipped — only files in the immediate folder are included.
+    Rejects the request if the total uncompressed size exceeds 100 MB.
+    """
+    dst = wsdl_client.dms_system_login()
+    if not dst:
+        raise HTTPException(status_code=500, detail='Failed to authenticate with DMS')
+
+    try:
+        root_info = await db_folders.get_folder_by_docnumber(folder_id)
+        root_name = root_info['name'] if root_info else folder_id
+    except Exception:
+        root_name = folder_id
+
+    # Only collect direct files — subfolders are skipped by design
+    try:
+        direct_files = await db_folders.get_folder_files(folder_id)
+    except Exception as e:
+        logging.error(f"Failed to list files in folder {folder_id}: {e}")
+        raise HTTPException(status_code=500, detail='Failed to list folder contents')
+
+    file_entries: list[tuple[str, str]] = [
+        (f['id'], f['name']) for f in direct_files
+    ]
+
+    if not file_entries:
+        raise HTTPException(status_code=404, detail='Folder has no files to download')
+
+    # Download all files and build the ZIP in memory, guarding the 100 MB limit
+    zip_buffer = io.BytesIO()
+    total_bytes = 0
+
+    try:
+        with zipfile.ZipFile(zip_buffer, mode='w', compression=zipfile.ZIP_DEFLATED, allowZip64=True) as zf:
+            for doc_id, archive_path in file_entries:
+                try:
+                    content, dms_filename = wsdl_client.get_image_by_docnumber(dst, doc_id)
+                except Exception as e:
+                    logging.warning(f"Skipping doc {doc_id} in ZIP (download error): {e}")
+                    continue
+
+                if not content:
+                    continue
+
+                # Ensure the archive path has the correct file extension from DMS
+                _, dms_ext = os.path.splitext(dms_filename or '')
+                if dms_ext:
+                    base, existing_ext = os.path.splitext(archive_path)
+                    if existing_ext.lower() != dms_ext.lower():
+                        archive_path = base + dms_ext
+
+                total_bytes += len(content)
+                if total_bytes > ZIP_SIZE_LIMIT_BYTES:
+                    raise HTTPException(
+                        status_code=413,
+                        detail='Folder exceeds the 100 MB download limit. Please download individual files instead.'
+                    )
+
+                zf.writestr(archive_path, bytes(content))
+    except HTTPException:
+        raise
+    except Exception as e:
+        logging.error(f"Error building ZIP for folder {folder_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail='Failed to build ZIP archive')
+
+    zip_buffer.seek(0)
+    safe_name = root_name.replace('"', '').replace('/', '_').replace('\\', '_') or folder_id
+    content_disposition = f'attachment; filename="{safe_name}.zip"'
+
+    return StreamingResponse(
+        iter([zip_buffer.read()]),
+        media_type='application/zip',
+        headers={'Content-Disposition': content_disposition}
+    )
