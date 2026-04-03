@@ -12,7 +12,7 @@ from utils.common import get_current_user
 from database import user_data, folders as db_folders
 import db_connector
 
-ZIP_SIZE_LIMIT_BYTES = 100 * 1024 * 1024  # 100 MB
+ZIP_SIZE_LIMIT_BYTES = 300 * 1024 * 1024  # 300 MB
 
 router = APIRouter()
 
@@ -316,7 +316,7 @@ async def api_download_folder_zip(folder_id: str, request: Request, user=Depends
                 if total_bytes > ZIP_SIZE_LIMIT_BYTES:
                     raise HTTPException(
                         status_code=413,
-                        detail='Folder exceeds the 100 MB download limit. Please download individual files instead.'
+                        detail='Folder exceeds the 300 MB download limit. Please download individual files instead.'
                     )
 
                 zf.writestr(archive_path, bytes(content))

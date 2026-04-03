@@ -114,6 +114,9 @@ from starlette.requests import Request as StarletteRequest
 from starlette.responses import Response as StarletteResponse
 
 class SecurityHeadersMiddleware(BaseHTTPMiddleware):
+    # Paths that are intentionally embedded in iframes — skip X-Frame-Options
+    EMBEDDABLE_PATHS = ("/api/pdf/",)
+
     async def dispatch(self, request: StarletteRequest, call_next):
         response: StarletteResponse = await call_next(request)
         response.headers["Content-Security-Policy"] = (
@@ -125,8 +128,10 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
             "connect-src 'self'"
         )
         response.headers["X-Content-Type-Options"] = "nosniff"
-        response.headers["X-Frame-Options"] = "DENY"
         response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+        # Allow embedding only for routes explicitly designed for iframe use
+        if not any(request.url.path.startswith(p) for p in self.EMBEDDABLE_PATHS):
+            response.headers["X-Frame-Options"] = "DENY"
         return response
 
 app.add_middleware(SecurityHeadersMiddleware)
@@ -142,6 +147,7 @@ class RequestMetricsMiddleware(BaseHTTPMiddleware):
         try:
             response = await call_next(request)
             status_code = response.status_code
+            response.headers["X-Request-ID"] = request_id
             return response
         finally:
             duration_ms = round((time.perf_counter() - started_at) * 1000, 2)
@@ -158,12 +164,6 @@ class RequestMetricsMiddleware(BaseHTTPMiddleware):
                 "user": user,
             }
             # logging.info(json.dumps(payload, ensure_ascii=True))
-
-            if response is not None:
-                response.headers["X-Request-ID"] = request_id
-
-
-app.add_middleware(RequestMetricsMiddleware)
 
 # --- Register Routes ---
 app.include_router(auth.router)

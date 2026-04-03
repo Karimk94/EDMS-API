@@ -18,44 +18,13 @@ EMS_ADMIN_GROUP_ID = 'EMS_ADMIN'
 
 
 def check_admin_access(request: Request) -> bool:
-    """Check if current user has admin access (Editor+, Admin, allowlist, or EMS_ADMIN group)."""
+    """Check if current user has admin access (allowlist only)."""
     user = request.session.get('user')
     if not user:
         return False
     
     username = user.get('username', '').lower()
-    security_level = user.get('security_level', '')
-    
-    # Check allowlist first
-    if username in ADMIN_ALLOWLIST:
-        return True
-    
-    # Check security level (Editor or Admin)
-    if security_level in ['Editor', 'Admin']:
-        return True
-
-    # Fast path: cached group membership from login/session refresh
-    if user.get('is_ems_admin_group_member') is True:
-        return True
-
-    # Check DMS group membership for EMS admin group
-    token = user.get('token')
-    username = user.get('username')
-    if token and username:
-        try:
-            user_groups = wsdl_client.get_groups_for_user(token, username)
-            target_group = EMS_ADMIN_GROUP_ID.upper()
-            for group in user_groups or []:
-                group_id = str(group.get('group_id', '')).strip().upper()
-                group_name = str(group.get('group_name', '')).strip().upper()
-                if group_id == target_group or group_name == target_group:
-                    user['is_ems_admin_group_member'] = True
-                    request.session['user'] = user
-                    return True
-        except Exception as exc:
-            logging.warning(f"Failed to validate EMS admin group membership for user {username}: {exc}")
-    
-    return False
+    return username in ADMIN_ALLOWLIST
 
 
 @router.get("/api/admin/users")
