@@ -167,12 +167,28 @@ async def get_user(request: Request):
             # Preserve token if it exists in session but not in db details
             if 'token' in user_session:
                 user_details['token'] = user_session['token']
-            if 'is_ems_admin_group_member' in user_session:
-                user_details['is_ems_admin_group_member'] = user_session['is_ems_admin_group_member']
+
+            # Refresh EMS admin group membership. If it was already True, keep
+            # it (fast path). If it's False/missing (e.g. WSDL was down at
+            # login), re-check so users are not permanently locked out.
+            if user_session.get('is_ems_admin_group_member') is True:
+                user_details['is_ems_admin_group_member'] = True
+            else:
+                token = user_session.get('token')
+                if token:
+                    try:
+                        user_groups = wsdl_client.get_groups_for_user(token, user_session['username'])
+                        group_flags = _extract_group_membership_flags(user_groups)
+                        user_details['is_ems_admin_group_member'] = group_flags.get('is_ems_admin_group_member', False)
+                    except Exception as _wsdl_err:
+                        logging.warning(f"Could not refresh EMS admin group membership for {user_session.get('username')}: {_wsdl_err}")
+                        user_details['is_ems_admin_group_member'] = user_session.get('is_ems_admin_group_member', False)
+                else:
+                    user_details['is_ems_admin_group_member'] = user_session.get('is_ems_admin_group_member', False)
 
             # Fetch tab permissions — per-user
             security_level = user_details.get('security_level', 'Viewer')
-            if security_level == 'Admin':
+            if str(security_level).lower() == 'admin':
                 user_details['tab_permissions'] = db_connector.get_admin_full_permissions()
             else:
                 people_system_id = user_details.get('people_system_id')
@@ -264,7 +280,7 @@ async def get_groups(
     user_groups = await run_in_threadpool(wsdl_client.get_groups_for_user, token, username)
     # logging.info(f"[/api/groups] User {username} has {len(user_groups)} direct groups: {[g.get('group_id') for g in user_groups]}")
 
-    # Determine security level from their groups
+    # Determine security level from their groups (for session bookkeeping only)
     security_level = processor.determine_security_from_groups(user_groups)
     # logging.info(f"[/api/groups] User {username} security_level={security_level}")
 
@@ -273,10 +289,14 @@ async def get_groups(
         user['dms_security_level'] = security_level
         request.session['user'] = user
 
-    # Admins and DOCS_SUPERVISORS can assign permissions across all groups.
-    # Other users are limited to their direct groups.
+    # Only explicitly privileged groups may see all groups.
+    # EMS_ADMIN  → application-level administrators (hardcoded constant)
+    # DOCS_SUPERVISORS → document supervisors (hardcoded constant)
+    # Any other membership — including groups that happen to carry a name like
+    # 'ADMIN' or 'ADMINISTRATOR' in the DMS — must NOT grant this access.
+    is_ems_admin = _is_member_of_group(user_groups, EMS_ADMIN_GROUP_ID)
     is_docs_supervisor = _is_member_of_group(user_groups, DOCS_SUPERVISORS_GROUP_ID)
-    if security_level >= 9 or is_docs_supervisor:
+    if is_ems_admin or is_docs_supervisor:
         all_groups = await run_in_threadpool(wsdl_users.get_all_groups, token)
         # logging.info(f"[/api/groups] Admin mode: got {len(all_groups)} groups from get_all_groups")
         # Merge user's groups with all groups to ensure none are missed

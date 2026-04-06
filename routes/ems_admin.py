@@ -28,30 +28,31 @@ def _has_ems_admin_tab_access(user: dict) -> bool:
 
 
 async def check_admin_access(request: Request) -> bool:
-    """Check if user has admin access (Editor/Admin or EMS_ADMIN group)."""
+    """Check if user has admin access (EMS_ADMIN group or hardcoded admins)."""
     if "user" not in request.session:
         return False
     
     user = request.session.get("user", {})
-    security_level = user.get("security_level", "")
+    username = str(user.get("username", "")).strip().lower()
     
-    # Check if user has Editor or Admin security level
-    if security_level in ["Editor", "Admin"]:
+    # HARDCODED LIST OF USERNAMES
+    HARDCODED_EMS_ADMINS = [
+        "admin",
+        # Add other hardcoded usernames here
+    ]
+    
+    if username in [u.lower() for u in HARDCODED_EMS_ADMINS]:
         return True
 
     # Fast path: cached group membership from login/session refresh
     if user.get("is_ems_admin_group_member") is True:
         return True
 
-    # Per-user tab visibility/access flag
-    if _has_ems_admin_tab_access(user):
-        return True
-
     token = user.get("token")
-    username = user.get("username")
-    if token and username:
+    original_username = user.get("username")
+    if token and original_username:
         try:
-            user_groups = wsdl_client.get_groups_for_user(token, username)
+            user_groups = wsdl_client.get_groups_for_user(token, original_username)
             target_group = EMS_ADMIN_GROUP_ID.upper()
             for group in user_groups or []:
                 group_id = str(group.get("group_id", "")).strip().upper()
@@ -61,14 +62,21 @@ async def check_admin_access(request: Request) -> bool:
                     request.session["user"] = user
                     return True
         except Exception as exc:
-            logging.warning(f"Failed to validate EMS admin group membership for user {username}: {exc}")
+            logging.warning(f"Failed to validate EMS admin group membership for user {original_username}: {exc}")
 
     return False
 
 
+from fastapi import Response
+
 @router.get("/api/ems-admin/check-access")
-async def check_ems_admin_access(request: Request):
+async def check_ems_admin_access(request: Request, response: Response):
     """Check if current user can access EMS admin area."""
+    # Ensure no caching for this endpoint
+    response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    response.headers["Pragma"] = "no-cache"
+    response.headers["Expires"] = "0"
+    
     if "user" not in request.session:
         raise HTTPException(status_code=401, detail="Not authenticated")
 
