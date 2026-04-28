@@ -4,6 +4,7 @@ import wsdl_client
 import smtplib
 import os
 import logging
+from urllib.parse import quote
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from datetime import datetime
@@ -29,6 +30,16 @@ def get_mimetype_for_media(media_type: str, file_ext: str = '') -> tuple[str, st
         'doc': ('application/vnd.openxmlformats-officedocument.wordprocessingml.document', 'attachment'),
     }
     return mapping.get(media_type, ('application/octet-stream', 'attachment'))
+
+def build_content_disposition(filename: str, disposition: str = 'attachment') -> str:
+    """
+    Build a RFC 5987-compatible Content-Disposition value that is safe for
+    non-Latin filenames while preserving an ASCII fallback for older clients.
+    """
+    safe_filename = (filename or 'download').replace('"', '').replace('\r', '').replace('\n', '')
+    ascii_fallback = re.sub(r'[^A-Za-z0-9._ -]', '_', safe_filename).strip(' .') or 'download'
+    encoded_filename = quote(safe_filename, safe='')
+    return f"{disposition}; filename=\"{ascii_fallback}\"; filename*=UTF-8''{encoded_filename}"
 
 # --- Reusable company logo loader ---
 def load_company_logo_base64() -> str:

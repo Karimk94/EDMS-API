@@ -29,17 +29,16 @@ async def get_next_system_id_sequence():
 
 
 async def get_next_secid():
-    """Generate next SECID for companies (pattern: A0001, A0002, ..., A9999, B0001, etc.)."""
+    """Generate next SECID globally (pattern: A0001, A0002, ..., A9999, B0001, etc.)."""
     conn = await get_async_connection()
     if not conn:
         return None
     
     try:
         async with conn.cursor() as cursor:
-            # Get the last SECID for the fixed SECTION_DEPTID
+            # Get the last SECID globally
             await cursor.execute(
-                "SELECT SECID FROM LKP_SECTION WHERE DEPTID = :deptid ORDER BY SECID DESC FETCH NEXT 1 ROW ONLY",
-                deptid=SECTION_DEPTID
+                "SELECT SECID FROM LKP_SECTION ORDER BY SYSTEM_ID DESC FETCH NEXT 1 ROW ONLY"
             )
             result = await cursor.fetchone()
             
@@ -531,7 +530,7 @@ async def get_ems_sections(dept_system_id: int = None, name: str = "", page: int
                         LAST_UPDATE,
                         SYSTEM_ID,
                         DEPTID,
-                        ROW_NUMBER() OVER (ORDER BY NAME) as rn
+                        ROW_NUMBER() OVER (ORDER BY SECID ASC) as rn
                     FROM LKP_SECTION
                     WHERE 1=1 {search_condition}
                 )
@@ -570,13 +569,18 @@ async def get_ems_sections(dept_system_id: int = None, name: str = "", page: int
     }
 
 
-async def add_ems_section(ems_code: str, name: str, translation: str, dept_system_id: int):
+async def add_ems_section(name: str, translation: str, dept_system_id: int):
     """Add a new EMS section within a department."""
     conn = await get_async_connection()
     if not conn:
         return False, "Failed to connect to database"
 
     try:
+        # Generate new SECID (numeric string)
+        new_secid = await get_next_secid()
+        if not new_secid:
+            return False, "Failed to generate SECID"
+        
         # Generate new SYSTEM_ID from sequence
         new_system_id = await get_next_system_id_sequence()
         if new_system_id is None:
@@ -589,14 +593,14 @@ async def add_ems_section(ems_code: str, name: str, translation: str, dept_syste
             """
             await cursor.execute(
                 query,
-                secid=ems_code,
+                secid=new_secid,
                 system_id=new_system_id,
                 name=name,
                 translation=translation,
                 parent_dept_system_id=dept_system_id
             )
             await conn.commit()
-            return True, f"EMS Section created with ID {ems_code}"
+            return True, f"EMS Section created with ID {new_secid}"
     except oracledb.Error as ex:
         error, = ex.args
         logging.error(f"Error adding EMS section: {error.message}")

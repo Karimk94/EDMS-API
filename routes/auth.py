@@ -23,18 +23,20 @@ DOCS_SUPERVISORS_GROUP_ID = 'DOCS_SUPERVISORS'
 
 def _extract_group_membership_flags(user_groups: list) -> dict:
     """Derive cached group membership flags from DMS groups payload."""
-    target_group = EMS_ADMIN_GROUP_ID.upper()
     is_ems_admin_group_member = False
+    is_docs_supervisor = False
 
     for group in user_groups or []:
         group_id = str(group.get('group_id', '')).strip().upper()
         group_name = str(group.get('group_name', '')).strip().upper()
-        if group_id == target_group or group_name == target_group:
+        if group_id == EMS_ADMIN_GROUP_ID.upper() or group_name == EMS_ADMIN_GROUP_ID.upper():
             is_ems_admin_group_member = True
-            break
+        if group_id == DOCS_SUPERVISORS_GROUP_ID.upper() or group_name == DOCS_SUPERVISORS_GROUP_ID.upper():
+            is_docs_supervisor = True
 
     return {
         'is_ems_admin_group_member': is_ems_admin_group_member,
+        'is_docs_supervisor': is_docs_supervisor,
     }
 
 
@@ -66,6 +68,23 @@ def _is_group_active(group: dict) -> bool:
             return normalized not in {'0', 'false', 'inactive', 'disabled', 'n'}
 
     return True
+
+
+def _normalize_group_identifier(value: str) -> str:
+    return str(value or '').strip().upper()
+
+
+async def _get_user_group_access_context(token: str, username: str) -> tuple[list, bool, set[str]]:
+    user_groups = await run_in_threadpool(wsdl_client.get_groups_for_user, token, username)
+    is_docs_supervisor = _is_member_of_group(user_groups, DOCS_SUPERVISORS_GROUP_ID)
+
+    allowed_group_ids = set()
+    for group in user_groups or []:
+        allowed_group_ids.add(_normalize_group_identifier(group.get('group_id')))
+        allowed_group_ids.add(_normalize_group_identifier(group.get('group_name')))
+
+    allowed_group_ids.discard('')
+    return user_groups, is_docs_supervisor, allowed_group_ids
 
 
 def _ensure_ems_admin_tab_permission(tab_permissions: list, is_ems_admin_group_member: bool) -> list:
@@ -168,23 +187,19 @@ async def get_user(request: Request):
             if 'token' in user_session:
                 user_details['token'] = user_session['token']
 
-            # Refresh EMS admin group membership. If it was already True, keep
-            # it (fast path). If it's False/missing (e.g. WSDL was down at
-            # login), re-check so users are not permanently locked out.
-            if user_session.get('is_ems_admin_group_member') is True:
-                user_details['is_ems_admin_group_member'] = True
-            else:
-                token = user_session.get('token')
-                if token:
-                    try:
-                        user_groups = wsdl_client.get_groups_for_user(token, user_session['username'])
-                        group_flags = _extract_group_membership_flags(user_groups)
-                        user_details['is_ems_admin_group_member'] = group_flags.get('is_ems_admin_group_member', False)
-                    except Exception as _wsdl_err:
-                        logging.warning(f"Could not refresh EMS admin group membership for {user_session.get('username')}: {_wsdl_err}")
-                        user_details['is_ems_admin_group_member'] = user_session.get('is_ems_admin_group_member', False)
-                else:
+            token = user_session.get('token')
+            if token:
+                try:
+                    user_groups = wsdl_client.get_groups_for_user(token, user_session['username'])
+                    group_flags = _extract_group_membership_flags(user_groups)
+                    user_details.update(group_flags)
+                except Exception as _wsdl_err:
+                    logging.warning(f"Could not refresh group membership flags for {user_session.get('username')}: {_wsdl_err}")
                     user_details['is_ems_admin_group_member'] = user_session.get('is_ems_admin_group_member', False)
+                    user_details['is_docs_supervisor'] = user_session.get('is_docs_supervisor', False)
+            else:
+                user_details['is_ems_admin_group_member'] = user_session.get('is_ems_admin_group_member', False)
+                user_details['is_docs_supervisor'] = user_session.get('is_docs_supervisor', False)
 
             # Fetch tab permissions — per-user
             security_level = user_details.get('security_level', 'Viewer')
@@ -253,6 +268,15 @@ async def api_update_user_theme(request: Request, data: ThemeUpdateRequest):
 @router.get("/api/groups/{group_id}/members", response_model=List[GroupMember])
 async def get_group_members_route(group_id: str, request: Request, user=Depends(get_current_user)):
     token = get_session_token(request)
+    username = user.get('username') if user else None
+
+    if not username:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+
+    _, is_docs_supervisor, allowed_group_ids = await _get_user_group_access_context(token, username)
+    if not is_docs_supervisor and _normalize_group_identifier(group_id) not in allowed_group_ids:
+        raise HTTPException(status_code=403, detail="You can only view members of your own groups")
+
     members = await run_in_threadpool(wsdl_client.get_group_members, token, group_id)
     return members
 
@@ -277,7 +301,7 @@ async def get_groups(
         raise HTTPException(status_code=401, detail="Not authenticated")
 
     # Get user's groups from DMS
-    user_groups = await run_in_threadpool(wsdl_client.get_groups_for_user, token, username)
+    user_groups, is_docs_supervisor, _ = await _get_user_group_access_context(token, username)
     # logging.info(f"[/api/groups] User {username} has {len(user_groups)} direct groups: {[g.get('group_id') for g in user_groups]}")
 
     # Determine security level from their groups (for session bookkeeping only)
@@ -294,9 +318,7 @@ async def get_groups(
     # DOCS_SUPERVISORS → document supervisors (hardcoded constant)
     # Any other membership — including groups that happen to carry a name like
     # 'ADMIN' or 'ADMINISTRATOR' in the DMS — must NOT grant this access.
-    is_ems_admin = _is_member_of_group(user_groups, EMS_ADMIN_GROUP_ID)
-    is_docs_supervisor = _is_member_of_group(user_groups, DOCS_SUPERVISORS_GROUP_ID)
-    if is_ems_admin or is_docs_supervisor:
+    if is_docs_supervisor:
         all_groups = await run_in_threadpool(wsdl_users.get_all_groups, token)
         # logging.info(f"[/api/groups] Admin mode: got {len(all_groups)} groups from get_all_groups")
         # Merge user's groups with all groups to ensure none are missed
@@ -349,11 +371,19 @@ async def search_group_members(
         user=Depends(get_current_user)
 ):
     token = get_session_token(request)
+    username = user.get('username') if user else None
 
-    # Use provided group_id or fallback
-    target_group = group_id if group_id else "EDMS_TEST_GRP_2"
+    if not username:
+        raise HTTPException(status_code=401, detail="Not authenticated")
 
-    members = await run_in_threadpool(wsdl_client.search_users_in_group, token, target_group, search)
+    if not group_id:
+        raise HTTPException(status_code=400, detail="group_id is required")
+
+    _, is_docs_supervisor, allowed_group_ids = await _get_user_group_access_context(token, username)
+    if not is_docs_supervisor and _normalize_group_identifier(group_id) not in allowed_group_ids:
+        raise HTTPException(status_code=403, detail="You can only search members in your own groups")
+
+    members = await run_in_threadpool(wsdl_client.search_users_in_group, token, group_id, search)
 
     # Manual Pagination since SOAP returns all
     start = (page - 1) * 20

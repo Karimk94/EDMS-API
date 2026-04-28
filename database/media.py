@@ -88,9 +88,11 @@ BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 thumbnail_cache_dir = os.path.join(BASE_DIR, 'thumbnail_cache')
 video_cache_dir = os.path.join(BASE_DIR, 'video_cache')
 temp_thumbnail_cache_dir = os.path.join(BASE_DIR, 'temp_thumbnail_cache')
+download_cache_dir = os.path.join(BASE_DIR, 'download_cache')
 if not os.path.exists(thumbnail_cache_dir): os.makedirs(thumbnail_cache_dir)
 if not os.path.exists(video_cache_dir): os.makedirs(video_cache_dir)
 if not os.path.exists(temp_thumbnail_cache_dir): os.makedirs(temp_thumbnail_cache_dir)
+if not os.path.exists(download_cache_dir): os.makedirs(download_cache_dir)
 
 def dms_system_login():
     """Logs into the DMS SOAP service using system credentials."""
@@ -271,6 +273,12 @@ def get_media_content_from_dms(dst, doc_number):
 def get_dms_stream_details(dst, doc_number):
     return wsdl_client.get_dms_stream_details(dst, doc_number)
 
+def get_download_cache_path(doc_number, file_ext):
+    normalized_ext = file_ext or ''
+    if normalized_ext and not normalized_ext.startswith('.'):
+        normalized_ext = f'.{normalized_ext}'
+    return os.path.join(download_cache_dir, f"{doc_number}{normalized_ext}")
+
 def stream_and_cache_generator(obj_client, stream_id, content_id, final_cache_path):
     """Generator for streaming data."""
     temp_cache_path = final_cache_path + ".tmp"
@@ -293,6 +301,30 @@ def stream_and_cache_generator(obj_client, stream_id, content_id, final_cache_pa
         except:
             pass
         if os.path.exists(temp_cache_path): os.remove(temp_cache_path)
+
+def cache_document_stream_to_file(dst, doc_number, final_cache_path):
+    """Streams a document from DMS into a local cache file without buffering it in memory."""
+    os.makedirs(os.path.dirname(final_cache_path), exist_ok=True)
+
+    if os.path.exists(final_cache_path):
+        return True
+
+    stream_details = get_dms_stream_details(dst, doc_number)
+    if not stream_details:
+        return False
+
+    try:
+        for _ in stream_and_cache_generator(
+            obj_client=stream_details['obj_client'],
+            stream_id=stream_details['stream_id'],
+            content_id=stream_details['content_id'],
+            final_cache_path=final_cache_path,
+        ):
+            pass
+        return os.path.exists(final_cache_path)
+    except Exception as e:
+        logging.error(f"Failed to cache streamed document {doc_number}: {e}")
+        return False
 
 def create_thumbnail(doc_number, media_type, file_ext, media_bytes, is_temp=False):
     """Creates a thumbnail from media bytes and saves it to the cache."""

@@ -1313,10 +1313,10 @@ def get_groups_for_user(dst, username, library='RTA_MAIN'):
     - criteria: USER_ID = {username}
     - retProperties: GROUP_ID, DISABLED
 
-    If user belongs to DOCS_SUPERVISORS or ADMINS group, returns ALL groups.
+    If user belongs to DOCS_SUPERVISORS, returns ALL groups.
     Otherwise returns only the groups the user belongs to.
     """
-    ADMIN_GROUPS = {'DOCS_SUPERVISORS', 'ADMINS'}
+    ADMIN_GROUPS = {'DOCS_SUPERVISORS'}
 
     if not username:
         return []
@@ -1406,7 +1406,7 @@ def get_groups_for_user(dst, username, library='RTA_MAIN'):
     except Exception:
         pass
 
-    # If user is admin, return ALL groups
+    # Only DOCS_SUPERVISORS may enumerate all groups.
     if is_admin:
         all_groups = get_all_groups(dst, library)
         _set_cached_groups(dst, username, library, all_groups)
@@ -1418,7 +1418,8 @@ def get_groups_for_user(dst, username, library='RTA_MAIN'):
         _set_cached_groups(dst, username, library, user_groups)
         return _clone_groups(user_groups)
 
-    # Fallback: return all groups (if couldn't determine user's groups)
-    fallback_groups = get_all_groups(dst, library)
-    _set_cached_groups(dst, username, library, fallback_groups)
-    return _clone_groups(fallback_groups)
+    # No groups found — return empty list (principle of least privilege)
+    logging.warning(f"[users.py] Could not determine groups for user '{username}'; returning empty list.")
+    empty = []
+    _set_cached_groups(dst, username, library, empty)
+    return empty

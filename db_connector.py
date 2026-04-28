@@ -2,9 +2,10 @@ from database.connection import get_async_connection, get_connection, BLOCKLIST
 from database.media import (
     dms_system_login, get_media_info_from_dms, get_media_content_from_dms,
     stream_document_from_dms, get_dms_stream_details, stream_and_cache_generator,
+    cache_document_stream_to_file, get_download_cache_path,
     create_thumbnail, clear_thumbnail_cache, clear_video_cache, get_media_type_counts,
     resolve_media_types_from_db, get_app_id_from_extension, get_exif_date,
-    thumbnail_cache_dir, video_cache_dir, temp_thumbnail_cache_dir
+    thumbnail_cache_dir, video_cache_dir, temp_thumbnail_cache_dir, download_cache_dir
 )
 from database.documents import (
     fetch_documents_from_oracle, get_documents_to_process,

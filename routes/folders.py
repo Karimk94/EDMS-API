@@ -8,7 +8,7 @@ from fastapi.responses import StreamingResponse
 from typing import Optional
 import wsdl_client
 from schemas.folders import CreateFolderRequest, RenameFolderRequest, MoveItemsRequest
-from utils.common import get_current_user
+from utils.common import get_current_user, build_content_disposition
 from database import user_data, folders as db_folders
 import db_connector
 
@@ -40,6 +40,24 @@ def _get_file_size_from_dms(dst, doc_number):
     except Exception as e:
         logging.warning(f"Could not determine file size for doc {doc_number}: {e}")
     return 0
+
+async def _get_folder_direct_file_size_sum(dst, folder_id):
+    """
+    Sums the sizes of direct file children for a folder.
+    Subfolders are handled separately by the delete guard.
+    """
+    total_size = 0
+
+    try:
+        folder_files = await db_folders.get_folder_files(folder_id)
+        for file_item in folder_files:
+            file_id = file_item.get('id')
+            if file_id:
+                total_size += _get_file_size_from_dms(dst, file_id)
+    except Exception as e:
+        logging.warning(f"Could not calculate direct file size sum for folder {folder_id}: {e}")
+
+    return total_size
 
 @router.get('/api/folders')
 async def api_list_folders(
@@ -160,17 +178,30 @@ async def api_delete_folder(folder_id: str, request: Request, force: bool = Fals
     username = user.get('username')
     edms_user_id = await _resolve_edms_user_id(username)
 
-    # --- Get file size before deletion (for single file items) ---
-    file_size = _get_file_size_from_dms(dst, folder_id)
+    folder_info = await db_folders.get_folder_by_id(folder_id)
+    is_folder = folder_info is not None
+
+    # --- Get total bytes to restore before deletion ---
+    bytes_freed = 0
+    if is_folder:
+        child_folders = await db_folders.get_folder_children(folder_id)
+        if child_folders:
+            raise HTTPException(
+                status_code=409,
+                detail="This folder cannot be deleted because it contains subfolders."
+            )
+
+        bytes_freed = await _get_folder_direct_file_size_sum(dst, folder_id)
+    else:
+        bytes_freed = _get_file_size_from_dms(dst, folder_id)
 
     try:
         # Try standard delete first
         success, message = wsdl_client.delete_document(dst, folder_id)
 
         if success:
-            # --- Restore Quota for single item ---
-            if edms_user_id and file_size > 0:
-                restore_ok, restore_msg = await user_data.restore_user_quota(edms_user_id, file_size)
+            if edms_user_id and bytes_freed > 0:
+                await user_data.restore_user_quota(edms_user_id, bytes_freed)
             return {"message": "Folder deleted", "id": folder_id}
 
         # Check for specific "Referenced by" error to prompt user
@@ -185,12 +216,12 @@ async def api_delete_folder(folder_id: str, request: Request, force: bool = Fals
                 )
 
             # --- Restore Quota for all recursively deleted files ---
-            # total_bytes_deleted only includes children sizes from recursive traversal.
-            # file_size (measured above) covers the root item itself (0 for actual folders).
             bytes_freed = total_bytes_deleted if isinstance(total_bytes_deleted, int) else 0
-            bytes_freed += file_size
+            if not is_folder:
+                bytes_freed += _get_file_size_from_dms(dst, folder_id)
+
             if edms_user_id and bytes_freed > 0:
-                restore_ok, restore_msg = await user_data.restore_user_quota(edms_user_id, bytes_freed)
+                await user_data.restore_user_quota(edms_user_id, bytes_freed)
 
             return {"message": "Folder and contents deleted", "id": folder_id}
 
@@ -263,7 +294,7 @@ async def api_download_folder_zip(folder_id: str, request: Request, user=Depends
     """
     Downloads the direct file contents of a folder as a ZIP archive.
     Subfolders are intentionally skipped — only files in the immediate folder are included.
-    Rejects the request if the total uncompressed size exceeds 100 MB.
+    Rejects the request if the total uncompressed size exceeds 500 MB.
     """
     dst = wsdl_client.dms_system_login()
     if not dst:
@@ -316,7 +347,7 @@ async def api_download_folder_zip(folder_id: str, request: Request, user=Depends
                 if total_bytes > ZIP_SIZE_LIMIT_BYTES:
                     raise HTTPException(
                         status_code=413,
-                        detail='Folder exceeds the 300 MB download limit. Please download individual files instead.'
+                        detail='Folder exceeds the 500 MB download limit. Please download individual files instead.'
                     )
 
                 zf.writestr(archive_path, bytes(content))
@@ -328,7 +359,7 @@ async def api_download_folder_zip(folder_id: str, request: Request, user=Depends
 
     zip_buffer.seek(0)
     safe_name = root_name.replace('"', '').replace('/', '_').replace('\\', '_') or folder_id
-    content_disposition = f'attachment; filename="{safe_name}.zip"'
+    content_disposition = build_content_disposition(f'{safe_name}.zip', 'attachment')
 
     return StreamingResponse(
         iter([zip_buffer.read()]),

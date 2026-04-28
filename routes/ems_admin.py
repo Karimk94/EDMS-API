@@ -36,16 +36,17 @@ async def check_admin_access(request: Request) -> bool:
     username = str(user.get("username", "")).strip().lower()
     
     # HARDCODED LIST OF USERNAMES
-    HARDCODED_EMS_ADMINS = [
-        "admin",
-        # Add other hardcoded usernames here
-    ]
+    HARDCODED_EMS_ADMINS = ['test_user1', 'okool_kaabdulwahed', 'okool_arfelous', 'dmedms']
     
     if username in [u.lower() for u in HARDCODED_EMS_ADMINS]:
         return True
 
     # Fast path: cached group membership from login/session refresh
     if user.get("is_ems_admin_group_member") is True:
+        return True
+
+    # Check if user has ems_admin tab permission enabled by an admin
+    if _has_ems_admin_tab_access(user):
         return True
 
     token = user.get("token")
@@ -327,15 +328,14 @@ async def add_ems_section_endpoint(request: Request, data: dict):
         raise HTTPException(status_code=403, detail="Access denied")
     
     try:
-        ems_code = data.get("ems_code")
         name = data.get("name")
         translation = data.get("translation", "")
         dept_system_id = data.get("dept_system_id")
         
-        if not ems_code or not name or not dept_system_id:
-            raise HTTPException(status_code=400, detail="EMS Code, name, and department are required")
+        if not name or not dept_system_id:
+            raise HTTPException(status_code=400, detail="Name and department are required")
         
-        success, message = await add_ems_section(ems_code, name, translation, dept_system_id)
+        success, message = await add_ems_section(name, translation, dept_system_id)
         
         if not success:
             raise HTTPException(status_code=400, detail=message)

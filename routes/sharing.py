@@ -23,7 +23,7 @@ import secrets
 import wsdl_client
 from database.media import video_cache_dir
 
-from utils.common import send_otp_email, send_share_link_email, get_mimetype_for_media, get_current_user
+from utils.common import send_otp_email, send_share_link_email, get_mimetype_for_media, get_current_user, build_content_disposition
 from utils.watermark import apply_watermark_to_image, apply_watermark_to_pdf, apply_watermark_to_video, apply_watermark_to_video_async
 from slowapi import Limiter
 from slowapi.util import get_remote_address
@@ -297,19 +297,24 @@ async def verify_access_otp(request: Request, token: str, req: ShareVerifyReques
         target_email = share_info.get('target_email')
         is_restricted = target_email is not None
 
-        # OTP verification is always required
         if req.skip_otp:
-            raise HTTPException(
-                status_code=400,
-                detail="OTP verification is required for all shares"
-            )
+            if not is_restricted:
+                raise HTTPException(
+                    status_code=400,
+                    detail="OTP can only be skipped for restricted shares"
+                )
+            if viewer_email != target_email.strip().lower():
+                raise HTTPException(
+                    status_code=403,
+                    detail="This link is restricted to a specific recipient."
+                )
+        else:
+            # Verify and consume OTP for open shares or when explicitly required.
+            is_valid = await sharing_db.verify_otp(token, viewer_email, req.otp)
 
-        # Verify and Consume OTP in one go
-        is_valid = await sharing_db.verify_otp(token, viewer_email, req.otp)
-
-        if not is_valid:
-            # Note: This generic message covers expired, used, or wrong OTPs for security
-            raise HTTPException(status_code=400, detail="Invalid or expired OTP.")
+            if not is_valid:
+                # Note: This generic message covers expired, used, or wrong OTPs for security
+                raise HTTPException(status_code=400, detail="Invalid or expired OTP.")
 
         await sharing_db.log_share_access(share_info['share_id'], viewer_email)
 
@@ -583,6 +588,34 @@ async def download_shared_document(
         if file_ext and not filename.lower().endswith(file_ext.lower()):
             filename = f"{filename}{file_ext}"
 
+        needs_watermark = media_type in ['image', 'pdf', 'video']
+
+        if not needs_watermark:
+            mimetype, _ = get_mimetype_for_media(media_type, file_ext)
+            cache_path = db_connector.get_download_cache_path(document_id, file_ext)
+            if not os.path.exists(cache_path):
+                did_cache = db_connector.cache_document_stream_to_file(dst, document_id, cache_path)
+                if not did_cache:
+                    file_bytes = db_connector.get_media_content_from_dms(dst, document_id)
+                    if not file_bytes:
+                        raise HTTPException(status_code=500, detail="Failed to retrieve document content")
+                    temp_path = f"{cache_path}.tmp"
+                    with open(temp_path, 'wb') as cache_file:
+                        cache_file.write(file_bytes)
+                    os.replace(temp_path, cache_path)
+
+            await sharing_db.log_share_access(share_info['share_id'], viewer_email)
+
+            return FileResponse(
+                cache_path,
+                media_type=mimetype,
+                headers={
+                    "Content-Disposition": build_content_disposition(filename, 'attachment'),
+                    "Access-Control-Expose-Headers": "Content-Disposition",
+                    "Accept-Ranges": "bytes"
+                }
+            )
+
         # 6. Get content (Check Cache -> Download -> Populate Cache)
         file_bytes = None
         raw_cache_path = None
@@ -639,7 +672,7 @@ async def download_shared_document(
             io.BytesIO(processed_bytes),
             media_type=mimetype,
             headers={
-                "Content-Disposition": f'attachment; filename="{filename}"',
+                "Content-Disposition": build_content_disposition(filename, 'attachment'),
                 "Access-Control-Expose-Headers": "Content-Disposition"
             }
         )

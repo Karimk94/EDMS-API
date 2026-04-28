@@ -13,7 +13,7 @@ from dotenv import load_dotenv
 from database.connection import ensure_performance_indexes
 
 # Import Routers
-from routes import auth, documents, media, tags, events, folders, favorites, memories, sharing, admin, ems_admin, profilesearch
+from routes import auth, documents, media, tags, events, folders, favorites, memories, sharing, admin, ems_admin, profilesearch, edms_people
 from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 
@@ -178,6 +178,7 @@ app.include_router(sharing.router)
 app.include_router(admin.router)
 app.include_router(ems_admin.router)
 app.include_router(profilesearch.router)
+app.include_router(edms_people.router)
 
 @app.get("/")
 def health_check():

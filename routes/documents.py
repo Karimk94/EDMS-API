@@ -1,5 +1,5 @@
 from fastapi import APIRouter, Request, HTTPException, UploadFile, File, Form, Header, Response, Depends
-from fastapi.responses import StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from starlette.concurrency import run_in_threadpool
 from werkzeug.utils import secure_filename
 from typing import Optional
@@ -9,7 +9,7 @@ import io
 import mimetypes
 import logging
 import db_connector
-from utils.common import get_current_user, get_session_token, get_mimetype_for_media
+from utils.common import get_current_user, get_session_token, get_mimetype_for_media, build_content_disposition
 import wsdl_client
 from services.processing_queue import processing_queue
 from utils.watermark import apply_watermark_to_image, apply_watermark_to_pdf, apply_watermark_to_video, apply_watermark_to_video_async
@@ -21,6 +21,13 @@ from database import user_data
 
 router = APIRouter()
 limiter = Limiter(key_func=get_remote_address)
+
+
+def _write_cached_download_fallback(cache_path, content_bytes):
+    temp_path = f"{cache_path}.tmp"
+    with open(temp_path, 'wb') as cache_file:
+        cache_file.write(content_bytes)
+    os.replace(temp_path, cache_path)
 
 # --- Routes ---
 
@@ -235,35 +242,40 @@ async def get_document_file(docnumber: int, request: Request, user=Depends(get_c
         if file_ext and not filename.lower().endswith(file_ext.lower()):
             filename = f"{filename}{file_ext}"
 
-        # Get content
-        # Get content stream
-        # file_bytes = db_connector.get_media_content_from_dms(dst, docnumber)
-        stream_generator, stream_filename = db_connector.stream_document_from_dms(dst, docnumber)
+        mimetype, disposition = get_mimetype_for_media(media_type, file_ext)
 
-        if stream_generator:
-            # Determine correct content type using centralized MIME logic
-            mimetype, disposition = get_mimetype_for_media(media_type, file_ext)
-            
-            # Use filename from stream if DB filename was missing (unlikely given get_media_info check)
-            if not filename and stream_filename:
-                filename = stream_filename
+        if disposition == 'attachment':
+            cache_path = db_connector.get_download_cache_path(docnumber, file_ext)
+            if not os.path.exists(cache_path):
+                did_cache = db_connector.cache_document_stream_to_file(dst, docnumber, cache_path)
+                if not did_cache:
+                    file_bytes = db_connector.get_media_content_from_dms(dst, docnumber)
+                    if not file_bytes:
+                        raise HTTPException(status_code=404, detail="Document not found")
+                    _write_cached_download_fallback(cache_path, file_bytes)
 
-            return StreamingResponse(
-                stream_generator,
+            return FileResponse(
+                cache_path,
                 media_type=mimetype,
-                headers={"Content-Disposition": f'{disposition}; filename="{filename}"'}
+                headers={
+                    "Content-Disposition": build_content_disposition(filename, disposition),
+                    "Access-Control-Expose-Headers": "Content-Disposition",
+                    "Accept-Ranges": "bytes"
+                }
             )
-        else:
-            # Fallback to old method if streaming setup fails
-            file_bytes, filename = wsdl_client.get_document_from_dms(dst, docnumber)
-            if file_bytes:
-                mimetype = mimetypes.guess_type(filename)[0] or 'application/octet-stream'
-                return StreamingResponse(
-                    io.BytesIO(file_bytes),
-                    media_type=mimetype,
-                    headers={"Content-Disposition": f"inline; filename={filename}"}
-                )
+
+        file_bytes = db_connector.get_media_content_from_dms(dst, docnumber)
+        if not file_bytes:
             raise HTTPException(status_code=404, detail="Document not found")
+
+        return StreamingResponse(
+            io.BytesIO(file_bytes),
+            media_type=mimetype,
+            headers={
+                "Content-Disposition": build_content_disposition(filename, disposition),
+                "Access-Control-Expose-Headers": "Content-Disposition"
+            }
+        )
 
     except Exception as e:
         logging.error(f"Error in get_document_file: {e}")
@@ -326,31 +338,25 @@ async def api_download_watermarked(doc_id: int, request: Request, user=Depends(g
     needs_watermark = media_type in ['image', 'pdf', 'video']
 
     if not needs_watermark:
-        # --- STREAMING PATH (No Watermark) ---
-        stream_generator, stream_filename = db_connector.stream_document_from_dms(dst, doc_id)
-        if stream_generator:
-            mimetype = 'application/octet-stream'
-            if media_type == 'excel':
-                mimetype = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-            elif media_type == 'zip':
-                mimetype = "application/zip"
-            elif media_type == 'powerpoint':
-                mimetype = "application/vnd.openxmlformats-officedocument.presentationml.presentation"
-            elif media_type == 'text':
-                mimetype = "text/plain"
-            
-            # Use filename from stream if DB filename was missing
-            if not filename and stream_filename:
-                filename = stream_filename
+        mimetype, _ = get_mimetype_for_media(media_type, file_ext)
+        cache_path = db_connector.get_download_cache_path(doc_id, file_ext)
+        if not os.path.exists(cache_path):
+            did_cache = db_connector.cache_document_stream_to_file(dst, doc_id, cache_path)
+            if not did_cache:
+                file_bytes = db_connector.get_media_content_from_dms(dst, doc_id)
+                if not file_bytes:
+                    raise HTTPException(status_code=500, detail="Failed to retrieve content")
+                _write_cached_download_fallback(cache_path, file_bytes)
 
-            return StreamingResponse(
-                stream_generator,
-                media_type=mimetype,
-                headers={
-                    "Content-Disposition": f'attachment; filename="{filename}"',
-                    "Access-Control-Expose-Headers": "Content-Disposition"
-                }
-            )
+        return FileResponse(
+            cache_path,
+            media_type=mimetype,
+            headers={
+                "Content-Disposition": build_content_disposition(filename, 'attachment'),
+                "Access-Control-Expose-Headers": "Content-Disposition",
+                "Accept-Ranges": "bytes"
+            }
+        )
     
     # --- PROCESSING PATH (Watermark Required or Fallback) ---
     file_bytes = db_connector.get_media_content_from_dms(dst, doc_id)
@@ -383,7 +389,7 @@ async def api_download_watermarked(doc_id: int, request: Request, user=Depends(g
         io.BytesIO(processed_bytes),
         media_type=mimetype,
         headers={
-            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Content-Disposition": build_content_disposition(filename, 'attachment'),
             "Access-Control-Expose-Headers": "Content-Disposition"
         }
     )
@@ -413,9 +419,20 @@ async def get_document_event(doc_id: int, user=Depends(get_current_user)):
 @router.post('/api/document/{doc_id}/security')
 async def set_document_security(doc_id: str, data: SetTrusteesRequest, request: Request, user=Depends(get_current_user)):
     """
-    Sets the trustees for a specific document or folder using the unified session token.
+    Sets the trustees for a specific document or folder.
+    Falls back to system token if user session token is expired.
     """
-    token = get_session_token(request)
+    # Try user's session token first; fall back to system token if missing/expired
+    token = None
+    try:
+        token = get_session_token(request)
+    except Exception:
+        pass
+
+    if not token:
+        token = wsdl_client.dms_system_login()
+        if not token:
+            raise HTTPException(status_code=500, detail="Failed to authenticate with DMS.")
 
     success, message = await run_in_threadpool(
         wsdl_client.set_trustees,
@@ -426,7 +443,22 @@ async def set_document_security(doc_id: str, data: SetTrusteesRequest, request: 
         security_enabled=data.security_enabled
     )
 
+    # If user token failed, retry with a fresh system token
     if not success:
+        logging.warning(f"set_trustees failed with user token for doc {doc_id}: {message}. Retrying with system token.")
+        sys_token = wsdl_client.dms_system_login(force_refresh=True)
+        if sys_token and sys_token != token:
+            success, message = await run_in_threadpool(
+                wsdl_client.set_trustees,
+                dst=sys_token,
+                doc_id=doc_id,
+                library=data.library,
+                trustees=data.trustees,
+                security_enabled=data.security_enabled
+            )
+
+    if not success:
+        logging.error(f"Failed to set trustees for doc {doc_id}: {message}")
         raise HTTPException(status_code=500, detail=message)
 
     return {"status": "success", "message": "Trustees updated successfully"}
