@@ -35,6 +35,7 @@ class Group(BaseModel):
 # Admin Schemas
 class EdmsUserResponse(BaseModel):
     username: str
+    full_name: str
     people_system_id: int
     edms_user_id: int
     user_ref_id: int

@@ -19,6 +19,7 @@ async def get_all_edms_users(search: str = "", page: int = 1, limit: int = 20):
                 search_condition = """
                     AND (
                         UPPER(p.USER_ID) LIKE UPPER(:search)
+                        OR UPPER(p.FULL_NAME) LIKE UPPER(:search)
                         OR UPPER(sl.NAME) LIKE UPPER(:search)
                     )
                 """
@@ -47,6 +48,7 @@ async def get_all_edms_users(search: str = "", page: int = 1, limit: int = 20):
                 SELECT * FROM (
                     SELECT 
                         p.USER_ID as username,
+                        p.FULL_NAME as full_name,
                         p.SYSTEM_ID as people_system_id,
                         us.SYSTEM_ID as edms_user_id,
                         us.USER_ID as user_ref_id,
@@ -75,15 +77,16 @@ async def get_all_edms_users(search: str = "", page: int = 1, limit: int = 20):
             for row in rows:
                 users.append({
                     'username': row[0],
-                    'people_system_id': row[1],
-                    'edms_user_id': row[2],
-                    'user_ref_id': row[3],
-                    'security_level': row[4],
-                    'security_level_id': row[5],
-                    'lang': row[6] or 'en',
-                    'theme': row[7] or 'light',
-                    'remaining_quota': row[8],
-                    'quota': row[9],
+                    'full_name': row[1] or row[0],
+                    'people_system_id': row[2],
+                    'edms_user_id': row[3],
+                    'user_ref_id': row[4],
+                    'security_level': row[5],
+                    'security_level_id': row[6],
+                    'lang': row[7] or 'en',
+                    'theme': row[8] or 'light',
+                    'remaining_quota': row[9],
+                    'quota': row[10],
                 })
     except oracledb.Error as e:
         logging.error(f"Oracle Database error in get_all_edms_users: {e}", exc_info=True)
