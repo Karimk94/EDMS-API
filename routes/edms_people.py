@@ -159,3 +159,16 @@ async def update_edms_person(request: Request, system_id: int, data: EdmsUserUpd
         raise HTTPException(status_code=400, detail=message)
         
     return {"message": message}
+
+
+@router.get("/api/edms-people/export")
+async def export_edms_people(
+    request: Request,
+    search: str = Query("")
+):
+    """Export all EDMS users (or filtered by search) for Excel download. Requires EMS Admin."""
+    if not await check_admin_access(request):
+        raise HTTPException(status_code=403, detail="Access denied. EMS Admin privileges required.")
+    
+    export_data = await edms_people.get_edms_people_export(search=search)
+    return export_data

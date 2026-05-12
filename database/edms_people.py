@@ -4,7 +4,41 @@ import db_connector
 import hashlib
 import base64
 
+DOCS_USERS_GROUP_ID = "DOCS_USERS"
+
 # --- Helper functions ---
+async def _ensure_docs_users_group(cursor, people_system_id: int) -> None:
+    """Ensure the DOCS_USERS group is assigned to the user.
+    
+    Queries the GROUPS table to find the SYSTEM_ID for the DOCS_USERS group
+    and inserts a PEOPLEGROUPS record if one does not already exist.
+    """
+    try:
+        # Find the SYSTEM_ID of the DOCS_USERS group
+        await cursor.execute(
+            "SELECT SYSTEM_ID FROM GROUPS WHERE UPPER(GROUP_ID) = UPPER(:1)",
+            [DOCS_USERS_GROUP_ID]
+        )
+        row = await cursor.fetchone()
+        if row:
+            docs_users_sys_id = row[0]
+            # Check if already assigned to avoid duplicate PK error
+            await cursor.execute(
+                "SELECT COUNT(*) FROM PEOPLEGROUPS WHERE PEOPLE_SYSTEM_ID = :1 AND GROUPS_SYSTEM_ID = :2",
+                [people_system_id, docs_users_sys_id]
+            )
+            count_row = await cursor.fetchone()
+            if count_row and count_row[0] == 0:
+                await cursor.execute(
+                    "INSERT INTO PEOPLEGROUPS (PEOPLE_SYSTEM_ID, GROUPS_SYSTEM_ID, LAST_UPDATE) VALUES (:1, :2, SYSDATE)",
+                    [people_system_id, docs_users_sys_id]
+                )
+        else:
+            logging.warning(f"Group '{DOCS_USERS_GROUP_ID}' not found in GROUPS table; cannot auto-assign.")
+    except Exception as e:
+        logging.error(f"Error ensuring DOCS_USERS group: {e}", exc_info=True)
+
+
 def hash_password(password: str) -> str:
     """Hash password according to EDMS format. Defaulting to MD5 Base64."""
     if not password:
@@ -336,6 +370,9 @@ async def add_edms_person(
                     INSERT INTO PEOPLEGROUPS (PEOPLE_SYSTEM_ID, GROUPS_SYSTEM_ID, LAST_UPDATE)
                     VALUES (:1, :2, SYSDATE)
                 """, [new_sys_id, gid])
+
+            # Ensure DOCS_USERS group is always assigned
+            await _ensure_docs_users_group(cursor, new_sys_id)
                 
             # Add Network Aliases
             logging.info(f"[add_edms_person] Inserting network aliases: {network_aliases}")
@@ -418,6 +455,9 @@ async def update_edms_person(
                     INSERT INTO PEOPLEGROUPS (PEOPLE_SYSTEM_ID, GROUPS_SYSTEM_ID, LAST_UPDATE)
                     VALUES (:1, :2, SYSDATE)
                 """, [system_id, gid])
+
+            # Ensure DOCS_USERS group is always assigned (even if not in the submitted groups)
+            await _ensure_docs_users_group(cursor, system_id)
                 
             # Rebuild Aliases
             await cursor.execute("DELETE FROM NETWORK_ALIASES WHERE PERSONORGROUP = :1", [system_id])
@@ -438,6 +478,83 @@ async def update_edms_person(
             await connection.rollback()
         logging.error(f"Error updating EDMS user: {e}")
         return False, f"Database error: {str(e)}"
+    finally:
+        if connection:
+            await connection.close()
+
+
+async def get_edms_people_export(search: str = "") -> List[Dict[str, Any]]:
+    """Get all EDMS users with complete details for export. Optimized single-query approach."""
+    connection = None
+    try:
+        connection = await db_connector.get_async_connection()
+        
+        # Optimized query that fetches all data in one go using LISTAGG for groups
+        query = """
+            SELECT 
+                p.USER_ID,
+                p.FULL_NAME,
+                p.EMAIL_ADDRESS,
+                p.ALLOW_LOGIN,
+                p.DISABLED,
+                LISTAGG(g.GROUP_NAME, ', ') WITHIN GROUP (ORDER BY g.GROUP_NAME) as GROUPS,
+                COALESCE(
+                    NULLIF(
+                        CASE 
+                            WHEN hr.AGENCY IS NOT NULL OR hr.DEPARTEMENT IS NOT NULL OR hr.SECTION_ORG IS NOT NULL THEN
+                                RTRIM(
+                                    CASE WHEN hr.AGENCY IS NOT NULL THEN hr.AGENCY || ' - ' ELSE '' END ||
+                                    CASE WHEN hr.DEPARTEMENT IS NOT NULL THEN hr.DEPARTEMENT || ' - ' ELSE '' END ||
+                                    CASE WHEN hr.SECTION_ORG IS NOT NULL THEN hr.SECTION_ORG ELSE '' END,
+                                    ' - '
+                                )
+                            ELSE NULL
+                        END, 
+                        ''
+                    ), 
+                    'N/A'
+                ) as HR_HIERARCHY
+            FROM PEOPLE p
+            LEFT JOIN PEOPLEGROUPS pg ON p.SYSTEM_ID = pg.PEOPLE_SYSTEM_ID
+            LEFT JOIN GROUPS g ON pg.GROUPS_SYSTEM_ID = g.SYSTEM_ID
+            LEFT JOIN (
+                SELECT LOGIN, MAX(AGENCY) as AGENCY, MAX(DEPARTEMENT) as DEPARTEMENT, MAX(SECTION_ORG) as SECTION_ORG
+                FROM LKP_HR_EMPLOYEES
+                GROUP BY LOGIN
+            ) hr ON UPPER(p.USER_ID) = UPPER(hr.LOGIN)
+            WHERE (:search IS NULL OR UPPER(p.USER_ID) LIKE UPPER('%' || :search || '%')
+                   OR UPPER(p.FULL_NAME) LIKE UPPER('%' || :search || '%')
+                   OR UPPER(p.EMAIL_ADDRESS) LIKE UPPER('%' || :search || '%'))
+            GROUP BY p.USER_ID, p.FULL_NAME, p.EMAIL_ADDRESS, p.ALLOW_LOGIN, p.DISABLED,
+                     hr.AGENCY, hr.DEPARTEMENT, hr.SECTION_ORG
+            ORDER BY p.SYSTEM_ID DESC
+        """
+        
+        params = {"search": search if search else None}
+        
+        with connection.cursor() as cursor:
+            await cursor.execute(query, params)
+            columns = [col[0].lower() for col in cursor.description]
+            rows = await cursor.fetchall()
+            
+            export_data = []
+            for row in rows:
+                row_dict = dict(zip(columns, row))
+                export_data.append({
+                    "Username": row_dict.get("user_id", ""),
+                    "Full Name": row_dict.get("full_name", ""),
+                    "Email": row_dict.get("email_address", ""),
+                    "Groups": row_dict.get("groups", ""),
+                    "Allow Login": "Yes" if row_dict.get("allow_login") == "Y" else "No",
+                    "Disabled": "Yes" if row_dict.get("disabled") == "Y" else "No",
+                    "Agency - Department - Section": row_dict.get("hr_hierarchy", "N/A")
+                })
+            
+            return export_data
+            
+    except Exception as e:
+        logging.error(f"Error fetching EDMS people for export: {str(e)}")
+        return []
     finally:
         if connection:
             await connection.close()

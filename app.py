@@ -188,7 +188,7 @@ def health_check():
 
 if __name__ == '__main__':
     import uvicorn
-    port = int(os.environ.get('PORT', 5000))
+    port = int(os.environ.get('HTTP_PLATFORM_PORT') or os.environ.get('PORT', 5000))
     uvicorn.run(
         "app:app",
         host='0.0.0.0',

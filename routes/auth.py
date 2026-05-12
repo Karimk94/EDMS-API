@@ -1,6 +1,8 @@
 from fastapi import APIRouter, HTTPException, Request, Query, Depends
 from fastapi.responses import JSONResponse
 from starlette.concurrency import run_in_threadpool
+import asyncio
+import os
 import db_connector
 import wsdl_client
 from wsdl_client import users as wsdl_users
@@ -19,6 +21,8 @@ router = APIRouter()
 limiter = Limiter(key_func=get_remote_address)
 EMS_ADMIN_GROUP_ID = 'EMS_ADMIN'
 DOCS_SUPERVISORS_GROUP_ID = 'DOCS_SUPERVISORS'
+DMS_GROUP_REFRESH_TIMEOUT_SECONDS = float(os.getenv('DMS_GROUP_REFRESH_TIMEOUT_SECONDS', '5'))
+AUTH_DB_TIMEOUT_SECONDS = float(os.getenv('AUTH_DB_TIMEOUT_SECONDS', '5'))
 
 
 def _extract_group_membership_flags(user_groups: list) -> dict:
@@ -87,6 +91,92 @@ async def _get_user_group_access_context(token: str, username: str) -> tuple[lis
     return user_groups, is_docs_supervisor, allowed_group_ids
 
 
+async def _refresh_group_flags_for_session(token: str, username: str, session_user: dict) -> dict:
+    """
+    Best-effort group refresh for page/session restore.
+    Never let DMS/WSDL slowness block /api/auth/user indefinitely.
+    """
+    try:
+        user_groups = await asyncio.wait_for(
+            run_in_threadpool(wsdl_client.get_groups_for_user, token, username),
+            timeout=DMS_GROUP_REFRESH_TIMEOUT_SECONDS,
+        )
+        return _extract_group_membership_flags(user_groups)
+    except asyncio.TimeoutError:
+        logging.warning(
+            "Timed out refreshing DMS group flags for %s after %.1fs; using cached session flags",
+            username,
+            DMS_GROUP_REFRESH_TIMEOUT_SECONDS,
+        )
+    except Exception as exc:
+        logging.warning(
+            "Could not refresh DMS group flags for %s: %s; using cached session flags",
+            username,
+            exc,
+        )
+
+    return {
+        'is_ems_admin_group_member': session_user.get('is_ems_admin_group_member', False),
+        'is_docs_supervisor': session_user.get('is_docs_supervisor', False),
+    }
+
+
+async def _get_user_details_for_session(username: str, session_user: dict) -> dict | None:
+    """Fetch current DB user details, falling back to signed session data on DB stalls."""
+    try:
+        return await asyncio.wait_for(
+            db_connector.get_user_details(username),
+            timeout=AUTH_DB_TIMEOUT_SECONDS,
+        )
+    except asyncio.TimeoutError:
+        logging.warning(
+            "Timed out fetching DB user details for %s after %.1fs; using cached session user",
+            username,
+            AUTH_DB_TIMEOUT_SECONDS,
+        )
+    except Exception as exc:
+        logging.warning(
+            "Failed fetching DB user details for %s: %s; using cached session user",
+            username,
+            exc,
+        )
+
+    if session_user:
+        return dict(session_user)
+    return None
+
+
+async def _get_tab_permissions_for_session(user_details: dict, session_user: dict) -> list:
+    """Fetch tab permissions without allowing a slow DB lookup to block session restore."""
+    security_level = user_details.get('security_level', 'Viewer')
+    if str(security_level).lower() == 'admin':
+        return db_connector.get_admin_full_permissions()
+
+    people_system_id = user_details.get('people_system_id')
+    if not people_system_id:
+        return session_user.get('tab_permissions', [])
+
+    try:
+        return await asyncio.wait_for(
+            db_connector.get_tab_permissions_for_user(people_system_id),
+            timeout=AUTH_DB_TIMEOUT_SECONDS,
+        )
+    except asyncio.TimeoutError:
+        logging.warning(
+            "Timed out fetching tab permissions for user_id %s after %.1fs; using cached session permissions",
+            people_system_id,
+            AUTH_DB_TIMEOUT_SECONDS,
+        )
+    except Exception as exc:
+        logging.warning(
+            "Failed fetching tab permissions for user_id %s: %s; using cached session permissions",
+            people_system_id,
+            exc,
+        )
+
+    return session_user.get('tab_permissions', [])
+
+
 def _ensure_ems_admin_tab_permission(tab_permissions: list, is_ems_admin_group_member: bool) -> list:
     """Ensure EMS admin group members can always see/access EMS admin tab."""
     permissions = list(tab_permissions or [])
@@ -106,7 +196,7 @@ def _ensure_ems_admin_tab_permission(tab_permissions: list, is_ems_admin_group_m
     return permissions
 
 @router.post('/api/auth/login')
-@limiter.limit("5/minute")
+@limiter.limit("255/minute")
 async def login(request: Request, creds: LoginRequest):
     dst, error_msg = wsdl_client.dms_user_login(creds.username, creds.password)
     if dst:
@@ -181,7 +271,7 @@ async def logout(request: Request):
 async def get_user(request: Request):
     user_session = request.session.get('user')
     if user_session and 'username' in user_session:
-        user_details = await db_connector.get_user_details(user_session['username'])
+        user_details = await _get_user_details_for_session(user_session['username'], user_session)
         if user_details:
             # Preserve token if it exists in session but not in db details
             if 'token' in user_session:
@@ -189,28 +279,21 @@ async def get_user(request: Request):
 
             token = user_session.get('token')
             if token:
-                try:
-                    user_groups = wsdl_client.get_groups_for_user(token, user_session['username'])
-                    group_flags = _extract_group_membership_flags(user_groups)
-                    user_details.update(group_flags)
-                except Exception as _wsdl_err:
-                    logging.warning(f"Could not refresh group membership flags for {user_session.get('username')}: {_wsdl_err}")
-                    user_details['is_ems_admin_group_member'] = user_session.get('is_ems_admin_group_member', False)
-                    user_details['is_docs_supervisor'] = user_session.get('is_docs_supervisor', False)
+                group_flags = await _refresh_group_flags_for_session(
+                    token,
+                    user_session['username'],
+                    user_session,
+                )
+                user_details.update(group_flags)
             else:
                 user_details['is_ems_admin_group_member'] = user_session.get('is_ems_admin_group_member', False)
                 user_details['is_docs_supervisor'] = user_session.get('is_docs_supervisor', False)
 
             # Fetch tab permissions — per-user
-            security_level = user_details.get('security_level', 'Viewer')
-            if str(security_level).lower() == 'admin':
-                user_details['tab_permissions'] = db_connector.get_admin_full_permissions()
-            else:
-                people_system_id = user_details.get('people_system_id')
-                if people_system_id:
-                    user_details['tab_permissions'] = await db_connector.get_tab_permissions_for_user(people_system_id)
-                else:
-                    user_details['tab_permissions'] = []
+            user_details['tab_permissions'] = await _get_tab_permissions_for_session(
+                user_details,
+                user_session,
+            )
 
             user_details['tab_permissions'] = _ensure_ems_admin_tab_permission(
                 user_details.get('tab_permissions', []),
