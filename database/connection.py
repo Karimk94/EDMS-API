@@ -50,7 +50,7 @@ def _get_sync_pool():
         try:
             _sync_pool = oracledb.create_pool(
                 user=user, password=password, dsn=dsn,
-                min=2, max=10, increment=1,
+                min=0, max=10, increment=1,
                 timeout=30, getmode=oracledb.POOL_GETMODE_TIMEDWAIT, wait_timeout=10000
             )
         except oracledb.Error as ex:
@@ -70,7 +70,7 @@ async def _get_async_pool():
         try:
             _async_pool = oracledb.create_pool_async(
                 user=user, password=password, dsn=dsn,
-                min=2, max=10, increment=1,
+                min=0, max=10, increment=1,
                 timeout=30, getmode=oracledb.POOL_GETMODE_TIMEDWAIT, wait_timeout=10000
             )
         except oracledb.Error as ex:

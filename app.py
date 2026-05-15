@@ -45,9 +45,18 @@ async def periodic_cache_cleanup():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Modern lifespan handler replacing deprecated @app.on_event."""
-    index_result = ensure_performance_indexes()
-    if index_result.get('created'):
-        logging.info(f"Performance indexes created: {index_result['created']}")
+    # --- Best-effort DB index creation (non-blocking, with timeout) ---
+    try:
+        index_result = await asyncio.wait_for(
+            asyncio.get_event_loop().run_in_executor(None, ensure_performance_indexes),
+            timeout=30
+        )
+        if index_result.get('created'):
+            logging.info(f"Performance indexes created: {index_result['created']}")
+    except asyncio.TimeoutError:
+        logging.warning("Startup: ensure_performance_indexes timed out after 30s — skipping.")
+    except Exception as e:
+        logging.warning(f"Startup: ensure_performance_indexes failed — skipping: {e}")
 
     cache_cleanup_task = asyncio.create_task(periodic_cache_cleanup())
     queue_stop_event = asyncio.Event()

@@ -484,20 +484,21 @@ async def update_edms_person(
 
 
 async def get_edms_people_export(search: str = "") -> List[Dict[str, Any]]:
-    """Get all EDMS users with complete details for export. Optimized single-query approach."""
+    """Get all EDMS users with complete details for export. Uses two queries to avoid string concatenation limits."""
     connection = None
     try:
         connection = await db_connector.get_async_connection()
         
-        # Optimized query that fetches all data in one go using LISTAGG for groups
-        query = """
+        # First query: Get basic user info with HR hierarchy (no LISTAGG to avoid ORA-01489)
+        base_query = """
             SELECT 
+                p.SYSTEM_ID,
                 p.USER_ID,
                 p.FULL_NAME,
                 p.EMAIL_ADDRESS,
                 p.ALLOW_LOGIN,
                 p.DISABLED,
-                LISTAGG(g.GROUP_NAME, ', ') WITHIN GROUP (ORDER BY g.GROUP_NAME) as GROUPS,
+                p.LAST_LOGIN_DATE,
                 COALESCE(
                     NULLIF(
                         CASE 
@@ -515,45 +516,90 @@ async def get_edms_people_export(search: str = "") -> List[Dict[str, Any]]:
                     'N/A'
                 ) as HR_HIERARCHY
             FROM PEOPLE p
-            LEFT JOIN PEOPLEGROUPS pg ON p.SYSTEM_ID = pg.PEOPLE_SYSTEM_ID
-            LEFT JOIN GROUPS g ON pg.GROUPS_SYSTEM_ID = g.SYSTEM_ID
             LEFT JOIN (
                 SELECT LOGIN, MAX(AGENCY) as AGENCY, MAX(DEPARTEMENT) as DEPARTEMENT, MAX(SECTION_ORG) as SECTION_ORG
                 FROM LKP_HR_EMPLOYEES
                 GROUP BY LOGIN
             ) hr ON UPPER(p.USER_ID) = UPPER(hr.LOGIN)
-            WHERE (:search IS NULL OR UPPER(p.USER_ID) LIKE UPPER('%' || :search || '%')
+            WHERE (:search IS NULL OR :search = '' OR UPPER(p.USER_ID) LIKE UPPER('%' || :search || '%')
                    OR UPPER(p.FULL_NAME) LIKE UPPER('%' || :search || '%')
                    OR UPPER(p.EMAIL_ADDRESS) LIKE UPPER('%' || :search || '%'))
-            GROUP BY p.USER_ID, p.FULL_NAME, p.EMAIL_ADDRESS, p.ALLOW_LOGIN, p.DISABLED,
-                     hr.AGENCY, hr.DEPARTEMENT, hr.SECTION_ORG
+                   AND p.DISABLED = 'N' AND p.ALLOW_LOGIN = 'Y'
             ORDER BY p.SYSTEM_ID DESC
         """
         
-        params = {"search": search if search else None}
+        params = {"search": search if search else ''}
+        
+        logging.info(f"Executing export query with params: {params}")
         
         with connection.cursor() as cursor:
-            await cursor.execute(query, params)
+            # Fetch basic user data
+            await cursor.execute(base_query, params)
             columns = [col[0].lower() for col in cursor.description]
             rows = await cursor.fetchall()
             
-            export_data = []
+            logging.info(f"Export query returned {len(rows)} rows")
+            
+            if not rows:
+                return []
+            
+            # Build a dict of system_id -> user data
+            users_dict = {}
+            system_ids = []
             for row in rows:
                 row_dict = dict(zip(columns, row))
-                export_data.append({
+                sys_id = row_dict['system_id']
+                users_dict[sys_id] = {
                     "Username": row_dict.get("user_id", ""),
                     "Full Name": row_dict.get("full_name", ""),
                     "Email": row_dict.get("email_address", ""),
-                    "Groups": row_dict.get("groups", ""),
                     "Allow Login": "Yes" if row_dict.get("allow_login") == "Y" else "No",
                     "Disabled": "Yes" if row_dict.get("disabled") == "Y" else "No",
-                    "Agency - Department - Section": row_dict.get("hr_hierarchy", "N/A")
-                })
+                    "Agency - Department - Section": row_dict.get("hr_hierarchy", "N/A"),
+                    "Groups": "",  # Will be populated next
+                    "Last Login Date": row_dict.get("last_login_date", "")
+                }
+                system_ids.append(sys_id)
+            
+            # Second query: Fetch groups for these users using a JOIN to avoid ORA-01795 (max 1000 in IN clause)
+            if system_ids:
+                # Create a global temporary table approach or use a JOIN with a subquery
+                # Using a JOIN with a subquery that selects the system IDs
+                # We'll create a query that joins back to PEOPLE to get the system IDs
+                groups_query = """
+                    SELECT pg.PEOPLE_SYSTEM_ID, g.GROUP_NAME
+                    FROM PEOPLEGROUPS pg
+                    JOIN GROUPS g ON pg.GROUPS_SYSTEM_ID = g.SYSTEM_ID
+                    JOIN PEOPLE p ON pg.PEOPLE_SYSTEM_ID = p.SYSTEM_ID
+                    WHERE (:search IS NULL OR :search = '' OR UPPER(p.USER_ID) LIKE UPPER('%' || :search || '%')
+                           OR UPPER(p.FULL_NAME) LIKE UPPER('%' || :search || '%')
+                           OR UPPER(p.EMAIL_ADDRESS) LIKE UPPER('%' || :search || '%'))
+                    ORDER BY pg.PEOPLE_SYSTEM_ID, g.GROUP_NAME
+                """
+                await cursor.execute(groups_query, params)
+                
+                if cursor.description:
+                    g_cols = [col[0].lower() for col in cursor.description]
+                    groups_rows = await cursor.fetchall()
+                    
+                    # Aggregate groups per user
+                    for groups_row in groups_rows:
+                        groups_dict = dict(zip(g_cols, groups_row))
+                        sys_id = groups_dict['people_system_id']
+                        group_name = groups_dict.get('group_name', '')
+                        if sys_id in users_dict:
+                            if users_dict[sys_id]["Groups"]:
+                                users_dict[sys_id]["Groups"] += ', ' + group_name
+                            else:
+                                users_dict[sys_id]["Groups"] = group_name
+            
+            # Convert dict to list maintaining order
+            export_data = [users_dict[sid] for sid in system_ids]
             
             return export_data
             
     except Exception as e:
-        logging.error(f"Error fetching EDMS people for export: {str(e)}")
+        logging.error(f"Error fetching EDMS people for export: {str(e)}", exc_info=True)
         return []
     finally:
         if connection:
