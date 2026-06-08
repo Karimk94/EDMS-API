@@ -198,7 +198,7 @@ def _ensure_ems_admin_tab_permission(tab_permissions: list, is_ems_admin_group_m
 @router.post('/api/auth/login')
 @limiter.limit("255/minute")
 async def login(request: Request, creds: LoginRequest):
-    dst, error_msg = wsdl_client.dms_user_login(creds.username, creds.password)
+    dst, error_msg = await run_in_threadpool(wsdl_client.dms_user_login, creds.username, creds.password)
     if dst:
         # Mandatory: Check if user exists in Smart EDMS local DB
         db_user = await db_connector.get_user_details(creds.username)
@@ -208,7 +208,7 @@ async def login(request: Request, creds: LoginRequest):
         # Get user's groups from DMS (proven working query)
         group_flags = {'is_ems_admin_group_member': False}
         try:
-            user_groups = wsdl_client.get_groups_for_user(dst, creds.username)
+            user_groups = await run_in_threadpool(wsdl_client.get_groups_for_user, dst, creds.username)
             # logging.info(f"User {creds.username} belongs to groups: {[g.get('group_id') for g in user_groups]}")
 
             group_flags = _extract_group_membership_flags(user_groups)

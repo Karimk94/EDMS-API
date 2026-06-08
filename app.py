@@ -28,7 +28,6 @@ logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
 
 # --- Background Cache Eviction ---
 from utils.cache_eviction import cleanup_video_cache
-from services.processing_queue import processing_worker_loop
 
 async def periodic_cache_cleanup():
     """Runs video cache cleanup every 6 hours."""
@@ -59,16 +58,14 @@ async def lifespan(app: FastAPI):
         logging.warning(f"Startup: ensure_performance_indexes failed — skipping: {e}")
 
     cache_cleanup_task = asyncio.create_task(periodic_cache_cleanup())
-    queue_stop_event = asyncio.Event()
-    queue_worker_task = asyncio.create_task(processing_worker_loop(queue_stop_event))
+    # Background processing is moved to a dedicated worker process.
+    # This keeps FastAPI request handling isolated from heavy queue work.
 
     try:
         yield
     finally:
-        queue_stop_event.set()
         cache_cleanup_task.cancel()
-        queue_worker_task.cancel()
-        await asyncio.gather(cache_cleanup_task, queue_worker_task, return_exceptions=True)
+        await asyncio.gather(cache_cleanup_task, return_exceptions=True)
 
 app = FastAPI(title="EDMS Middleware API", lifespan=lifespan)
 

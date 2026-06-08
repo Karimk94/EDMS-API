@@ -150,7 +150,7 @@ async def api_upload_document(request: Request, file: UploadFile = File(...), do
     if parent_id and str(parent_id).strip().lower() in ['null', 'undefined', '']:
         parent_id = None
 
-    dst = wsdl_client.dms_system_login()
+    dst = await run_in_threadpool(wsdl_client.dms_system_login)
     if not dst:
         raise HTTPException(status_code=500, detail="Failed to authenticate with DMS.")
 
@@ -178,7 +178,7 @@ async def api_upload_document(request: Request, file: UploadFile = File(...), do
             trustees = []
             if parent_id:
                 try:
-                    parent_trustees = wsdl_client.get_object_trustees(dst, str(parent_id))
+                    parent_trustees = await run_in_threadpool(wsdl_client.get_object_trustees, dst, str(parent_id))
                     if parent_trustees:
                         trustees = list(parent_trustees)
                 except Exception as te:
@@ -192,12 +192,13 @@ async def api_upload_document(request: Request, file: UploadFile = File(...), do
             if not uploader_in_list:
                 trustees.append({'username': username, 'rights': 255, 'flag': 2})
 
-            success, message = wsdl_client.set_trustees(
-                dst=dst,
-                doc_id=str(new_doc_number),
-                library='RTA_MAIN',
-                trustees=trustees,
-                security_enabled='1'
+            success, message = await run_in_threadpool(
+                wsdl_client.set_trustees,
+                dst,
+                str(new_doc_number),
+                'RTA_MAIN',
+                trustees,
+                '1'
             )
             if not success:
                 logging.warning(f"Failed to set security on uploaded document {new_doc_number}: {message}")
@@ -230,7 +231,7 @@ async def api_process_uploaded_documents(data: ProcessUploadRequest, user=Depend
 @router.get('/api/document/{docnumber}')
 async def get_document_file(docnumber: int, request: Request, user=Depends(get_current_user)):
 
-    dst = wsdl_client.dms_system_login()
+    dst = await run_in_threadpool(wsdl_client.dms_system_login)
     if not dst:
         raise HTTPException(status_code=500, detail="Failed to get token")
 
@@ -247,9 +248,9 @@ async def get_document_file(docnumber: int, request: Request, user=Depends(get_c
         if disposition == 'attachment':
             cache_path = db_connector.get_download_cache_path(docnumber, file_ext)
             if not os.path.exists(cache_path):
-                did_cache = db_connector.cache_document_stream_to_file(dst, docnumber, cache_path)
+                did_cache = await db_connector.cache_document_stream_to_file_async(dst, docnumber, cache_path)
                 if not did_cache:
-                    file_bytes = db_connector.get_media_content_from_dms(dst, docnumber)
+                    file_bytes = await db_connector.get_media_content_from_dms_async(dst, docnumber)
                     if not file_bytes:
                         raise HTTPException(status_code=404, detail="Document not found")
                     _write_cached_download_fallback(cache_path, file_bytes)
@@ -264,7 +265,7 @@ async def get_document_file(docnumber: int, request: Request, user=Depends(get_c
                 }
             )
 
-        file_bytes = db_connector.get_media_content_from_dms(dst, docnumber)
+        file_bytes = await db_connector.get_media_content_from_dms_async(dst, docnumber)
         if not file_bytes:
             raise HTTPException(status_code=404, detail="Document not found")
 
@@ -321,7 +322,7 @@ async def api_download_watermarked(doc_id: int, request: Request, user=Depends(g
     username = request.session['user'].get('username', 'Unknown')
     system_id = await db_connector.get_user_system_id(username) or "UNKNOWN"
 
-    dst = wsdl_client.dms_system_login()
+    dst = await run_in_threadpool(wsdl_client.dms_system_login)
     if not dst:
         raise HTTPException(status_code=500, detail="Failed to get token")
 
@@ -341,9 +342,9 @@ async def api_download_watermarked(doc_id: int, request: Request, user=Depends(g
         mimetype, _ = get_mimetype_for_media(media_type, file_ext)
         cache_path = db_connector.get_download_cache_path(doc_id, file_ext)
         if not os.path.exists(cache_path):
-            did_cache = db_connector.cache_document_stream_to_file(dst, doc_id, cache_path)
+            did_cache = await db_connector.cache_document_stream_to_file_async(dst, doc_id, cache_path)
             if not did_cache:
-                file_bytes = db_connector.get_media_content_from_dms(dst, doc_id)
+                file_bytes = await db_connector.get_media_content_from_dms_async(dst, doc_id)
                 if not file_bytes:
                     raise HTTPException(status_code=500, detail="Failed to retrieve content")
                 _write_cached_download_fallback(cache_path, file_bytes)
@@ -359,7 +360,7 @@ async def api_download_watermarked(doc_id: int, request: Request, user=Depends(g
         )
     
     # --- PROCESSING PATH (Watermark Required or Fallback) ---
-    file_bytes = db_connector.get_media_content_from_dms(dst, doc_id)
+    file_bytes = await db_connector.get_media_content_from_dms_async(dst, doc_id)
     if not file_bytes:
         raise HTTPException(status_code=500, detail="Failed to retrieve content")
 
@@ -430,7 +431,7 @@ async def set_document_security(doc_id: str, data: SetTrusteesRequest, request: 
         pass
 
     if not token:
-        token = wsdl_client.dms_system_login()
+        token = await run_in_threadpool(wsdl_client.dms_system_login)
         if not token:
             raise HTTPException(status_code=500, detail="Failed to authenticate with DMS.")
 
@@ -446,7 +447,7 @@ async def set_document_security(doc_id: str, data: SetTrusteesRequest, request: 
     # If user token failed, retry with a fresh system token
     if not success:
         logging.warning(f"set_trustees failed with user token for doc {doc_id}: {message}. Retrying with system token.")
-        sys_token = wsdl_client.dms_system_login(force_refresh=True)
+        sys_token = await run_in_threadpool(wsdl_client.dms_system_login, True)
         if sys_token and sys_token != token:
             success, message = await run_in_threadpool(
                 wsdl_client.set_trustees,

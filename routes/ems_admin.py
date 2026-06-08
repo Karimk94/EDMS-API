@@ -1,4 +1,5 @@
 from fastapi import APIRouter, HTTPException, Request
+from fastapi.concurrency import run_in_threadpool
 import logging
 import wsdl_client
 from database.ems_admin import (
@@ -53,7 +54,7 @@ async def check_admin_access(request: Request) -> bool:
     original_username = user.get("username")
     if token and original_username:
         try:
-            user_groups = wsdl_client.get_groups_for_user(token, original_username)
+            user_groups = await run_in_threadpool(wsdl_client.get_groups_for_user, token, original_username)
             target_group = EMS_ADMIN_GROUP_ID.upper()
             for group in user_groups or []:
                 group_id = str(group.get("group_id", "")).strip().upper()

@@ -12,6 +12,27 @@ import random
 import asyncio
 import shutil
 
+
+def _configure_moviepy_ffmpeg():
+    """Configure MoviePy to use an ffmpeg binary path if available."""
+    try:
+        ffmpeg_binary = os.getenv('FFMPEG_BINARY') or os.getenv('FFMPEG_PATH')
+        if not ffmpeg_binary:
+            ffmpeg_binary = shutil.which('ffmpeg')
+
+        if ffmpeg_binary:
+            try:
+                from moviepy.config import change_settings
+                change_settings({'FFMPEG_BINARY': ffmpeg_binary})
+            except ImportError:
+                os.environ['IMAGEIO_FFMPEG_EXE'] = ffmpeg_binary
+            logging.debug(f"Configured MoviePy FFMPEG_BINARY={ffmpeg_binary}")
+        else:
+            logging.warning('MoviePy ffmpeg binary not found in environment or PATH')
+    except Exception as e:
+        logging.warning(f'Failed to configure MoviePy ffmpeg binary: {e}')
+
+
 def _get_video_duration(input_path):
     """
     Get video duration in seconds using ffprobe.
@@ -228,6 +249,7 @@ def _apply_watermark_moviepy(input_path, output_path, watermark_text, temp_dir):
     Fallback: Apply watermark using MoviePy (segmented clips).
     """
     # logging.info("Starting MoviePy watermark fallback")
+    _configure_moviepy_ffmpeg()
     video_clip = None
     watermark_clips = []
     final_clip = None
@@ -305,9 +327,8 @@ def _apply_watermark_moviepy(input_path, output_path, watermark_text, temp_dir):
             audio_codec='aac',
             temp_audiofile=os.path.join(temp_dir, 'temp-audio.m4a'),
             remove_temp=True,
-            verbose=False,
-            logger=None,
-            preset='ultrafast'
+            progress_bar=False,
+            logger=None
         )
         return True
     except Exception as e:

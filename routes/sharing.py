@@ -462,7 +462,7 @@ async def stream_shared_document(
             document_id = share_info['document_id']
 
         # 5. Login with system credentials
-        dst = wsdl_client.dms_system_login()
+        dst = await run_in_threadpool(wsdl_client.dms_system_login)
         if not dst:
             raise HTTPException(status_code=500, detail="Failed to authenticate with DMS")
 
@@ -481,7 +481,7 @@ async def stream_shared_document(
             cache_filepath = os.path.join(video_cache_dir, cache_filename)
 
             if not os.path.exists(cache_filepath):
-                file_bytes = db_connector.get_media_content_from_dms(dst, document_id)
+                file_bytes = await db_connector.get_media_content_from_dms_async(dst, document_id)
                 if not file_bytes:
                     raise HTTPException(status_code=500, detail="Failed to retrieve content")
                 
@@ -504,7 +504,7 @@ async def stream_shared_document(
             )
 
         # 8. For other files, just stream inline (no watermark)
-        file_bytes = db_connector.get_media_content_from_dms(dst, document_id)
+        file_bytes = await db_connector.get_media_content_from_dms_async(dst, document_id)
         if not file_bytes:
             raise HTTPException(status_code=500, detail="Failed to retrieve content")
 
@@ -575,7 +575,7 @@ async def download_shared_document(
             document_id = share_info['document_id']
 
         # 5. Login with system credentials
-        dst = wsdl_client.dms_system_login()
+        dst = await run_in_threadpool(wsdl_client.dms_system_login)
         if not dst:
             raise HTTPException(status_code=500, detail="Failed to authenticate with DMS")
 
@@ -594,9 +594,9 @@ async def download_shared_document(
             mimetype, _ = get_mimetype_for_media(media_type, file_ext)
             cache_path = db_connector.get_download_cache_path(document_id, file_ext)
             if not os.path.exists(cache_path):
-                did_cache = db_connector.cache_document_stream_to_file(dst, document_id, cache_path)
+                did_cache = await db_connector.cache_document_stream_to_file_async(dst, document_id, cache_path)
                 if not did_cache:
-                    file_bytes = db_connector.get_media_content_from_dms(dst, document_id)
+                    file_bytes = await db_connector.get_media_content_from_dms_async(dst, document_id)
                     if not file_bytes:
                         raise HTTPException(status_code=500, detail="Failed to retrieve document content")
                     temp_path = f"{cache_path}.tmp"
@@ -625,21 +625,25 @@ async def download_shared_document(
             if os.path.exists(raw_cache_path):
                 # logging.info(f"Using existing global raw cache for shared download: {document_id}{file_ext}")
                 try:
-                    with open(raw_cache_path, 'rb') as f:
-                        file_bytes = f.read()
+                    def read_raw_cache():
+                        with open(raw_cache_path, 'rb') as f:
+                            return f.read()
+                    file_bytes = await run_in_threadpool(read_raw_cache)
                 except Exception as e:
                     logging.warning(f"Failed to read cache {raw_cache_path}: {e}")
 
         if not file_bytes:
-            file_bytes = db_connector.get_media_content_from_dms(dst, document_id)
+            file_bytes = await db_connector.get_media_content_from_dms_async(dst, document_id)
             if not file_bytes:
                 raise HTTPException(status_code=500, detail="Failed to retrieve document content")
             
             # Populate cache if it's a video and we just downloaded it
             if media_type == 'video' and raw_cache_path:
                 try:
-                    with open(raw_cache_path, 'wb') as f:
-                        f.write(file_bytes)
+                    def write_raw_cache():
+                        with open(raw_cache_path, 'wb') as f:
+                            f.write(file_bytes)
+                    await run_in_threadpool(write_raw_cache)
                     # logging.info(f"Populated global raw cache for: {document_id}{file_ext}")
                 except Exception as e:
                     logging.warning(f"Failed to populate global cache: {e}")

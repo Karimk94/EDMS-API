@@ -13,29 +13,29 @@ router = APIRouter()
 
 @router.get('/api/image/{doc_id}')
 async def api_get_image(doc_id: int, user=Depends(get_current_user)):
-    dst = db_connector.dms_system_login()
+    dst = await db_connector.dms_system_login_async()
     if not dst:
         raise HTTPException(status_code=500, detail='DMS login failed.')
 
-    image_data, _ = wsdl_client.get_image_by_docnumber(dst, doc_id)
+    image_data, _ = await db_connector.get_media_content_from_dms_async(dst, doc_id)
     if image_data:
         return Response(content=bytes(image_data), media_type='image/jpeg')
     raise HTTPException(status_code=404, detail='Image not found in EDMS.')
 
 @router.get('/api/pdf/{doc_id}')
 async def api_get_pdf(doc_id: int, user=Depends(get_current_user)):
-    dst = db_connector.dms_system_login()
+    dst = await db_connector.dms_system_login_async()
     if not dst:
         raise HTTPException(status_code=500, detail='DMS login failed.')
 
-    pdf_data, _ = wsdl_client.get_image_by_docnumber(dst, doc_id)
+    pdf_data, _ = await db_connector.get_media_content_from_dms_async(dst, doc_id)
     if pdf_data:
         return Response(content=bytes(pdf_data), media_type='application/pdf')
     raise HTTPException(status_code=404, detail='PDF not found in EDMS.')
 
 @router.get('/api/video/{doc_id}')
 async def api_get_video(doc_id: int, user=Depends(get_current_user)):
-    dst = db_connector.dms_system_login()
+    dst = await db_connector.dms_system_login_async()
     if not dst:
         raise HTTPException(status_code=500, detail='DMS login failed.')
 
@@ -52,7 +52,7 @@ async def api_get_video(doc_id: int, user=Depends(get_current_user)):
     if os.path.exists(cached_video_path):
         return FileResponse(cached_video_path)
 
-    stream_details = db_connector.get_dms_stream_details(dst, doc_id)
+    stream_details = await db_connector.get_dms_stream_details_async(dst, doc_id)
     if not stream_details:
         raise HTTPException(status_code=500, detail='Could not open stream.')
 
@@ -87,7 +87,7 @@ async def serve_temp_thumbnail(doc_id: int, user=Depends(get_current_user)):
         else:
             return FileResponse(file_path)
             
-    dst = db_connector.dms_system_login()
+    dst = await db_connector.dms_system_login_async()
     if not dst:
         raise HTTPException(status_code=500, detail='DMS login failed.')
         
@@ -95,7 +95,7 @@ async def serve_temp_thumbnail(doc_id: int, user=Depends(get_current_user)):
     if not media_type or media_type in ['excel', 'powerpoint', 'text', 'file', 'zip']:
         raise HTTPException(status_code=404, detail='Thumbnail not applicable for this media type.')
         
-    media_bytes = db_connector.get_media_content_from_dms(dst, doc_id)
+    media_bytes = await db_connector.get_media_content_from_dms_async(dst, doc_id)
     if media_bytes:
         thumbnail_path = db_connector.create_thumbnail(doc_id, media_type, file_ext, media_bytes, is_temp=True)
         if thumbnail_path and os.path.exists(file_path):

@@ -855,7 +855,7 @@ async def delete_folder_contents(dst, folder_id, delete_root=True):
                 else:
                     # Get file size before deleting
                     try:
-                        content = db_connector.get_media_content_from_dms(dst, d_id)
+                        content = await db_connector.get_media_content_from_dms_async(dst, d_id)
                         if content:
                             total_bytes_deleted += len(content)
                     except Exception:

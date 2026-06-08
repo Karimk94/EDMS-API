@@ -1,3 +1,4 @@
+import asyncio
 import os
 import io
 import shutil
@@ -98,12 +99,24 @@ def dms_system_login():
     """Logs into the DMS SOAP service using system credentials."""
     return wsdl_client.dms_system_login()
 
+async def dms_system_login_async():
+    return await asyncio.to_thread(dms_system_login)
+
 def stream_document_from_dms(dst, doc_number):
     """
     Returns a generator that yields file content chunks and the filename.
     Returns: (generator, filename)
     """
     return wsdl_client.stream_document_content(dst, doc_number)
+
+async def stream_document_from_dms_async(dst, doc_number):
+    return await asyncio.to_thread(stream_document_from_dms, dst, doc_number)
+
+async def get_media_content_from_dms_async(dst, doc_number):
+    return await asyncio.to_thread(get_media_content_from_dms, dst, doc_number)
+
+async def get_dms_stream_details_async(dst, doc_number):
+    return await asyncio.to_thread(get_dms_stream_details, dst, doc_number)
 
 def get_exif_date(image_stream):
     """Extracts the 'Date Taken' from image EXIF data."""
@@ -272,6 +285,12 @@ def get_media_content_from_dms(dst, doc_number):
 
 def get_dms_stream_details(dst, doc_number):
     return wsdl_client.get_dms_stream_details(dst, doc_number)
+
+async def get_dms_stream_details_async(dst, doc_number):
+    return await asyncio.to_thread(get_dms_stream_details, dst, doc_number)
+
+async def cache_document_stream_to_file_async(dst, doc_number, final_cache_path):
+    return await asyncio.to_thread(cache_document_stream_to_file, dst, doc_number, final_cache_path)
 
 def get_download_cache_path(doc_number, file_ext):
     normalized_ext = file_ext or ''
