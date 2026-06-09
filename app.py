@@ -28,6 +28,7 @@ logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
 
 # --- Background Cache Eviction ---
 from utils.cache_eviction import cleanup_video_cache
+from utils.log_cleanup import cleanup_old_logs
 
 async def periodic_cache_cleanup():
     """Runs video cache cleanup every 6 hours."""
@@ -40,6 +41,18 @@ async def periodic_cache_cleanup():
         except Exception as e:
             logging.error(f"Cache cleanup error: {e}")
         await asyncio.sleep(6 * 3600)  # Every 6 hours
+
+async def periodic_log_cleanup():
+    """Runs log cleanup daily to delete IIS/app logs older than 14 days."""
+    logs_path = os.path.join(os.getcwd(), 'logs')
+    while True:
+        try:
+            result = cleanup_old_logs(logs_path, max_age_days=14)
+            if result.get('deleted_count', 0) > 0:
+                logging.info(f"Log cleanup: {result}")
+        except Exception as e:
+            logging.error(f"Log cleanup error: {e}")
+        await asyncio.sleep(24 * 3600)  # Every 24 hours
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -58,6 +71,7 @@ async def lifespan(app: FastAPI):
         logging.warning(f"Startup: ensure_performance_indexes failed — skipping: {e}")
 
     cache_cleanup_task = asyncio.create_task(periodic_cache_cleanup())
+    log_cleanup_task = asyncio.create_task(periodic_log_cleanup())
     # Background processing is moved to a dedicated worker process.
     # This keeps FastAPI request handling isolated from heavy queue work.
 
@@ -65,7 +79,8 @@ async def lifespan(app: FastAPI):
         yield
     finally:
         cache_cleanup_task.cancel()
-        await asyncio.gather(cache_cleanup_task, return_exceptions=True)
+        log_cleanup_task.cancel()
+        await asyncio.gather(cache_cleanup_task, log_cleanup_task, return_exceptions=True)
 
 app = FastAPI(title="EDMS Middleware API", lifespan=lifespan)
 
