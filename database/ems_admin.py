@@ -336,6 +336,15 @@ async def add_section(name: str, translation: str):
             return False, "Failed to generate SYSTEM_ID"
         
         async with conn.cursor() as cursor:
+            # Final existence check within the same connection to prevent race conditions
+            await cursor.execute(
+                "SELECT COUNT(*) FROM LKP_SECTION WHERE SECID = :secid",
+                secid=new_secid
+            )
+            count_result = await cursor.fetchone()
+            if count_result[0] > 0:
+                return False, f'SECID "{new_secid}" already exists in LKP_SECTION. Please try again.'
+            
             query = """
                 INSERT INTO LKP_SECTION (SECID, SYSTEM_ID, NAME, TRANSLATION, DISABLED, DEPTID, LAST_UPDATE)
                 VALUES (:secid, :system_id, :name, :translation, 'N', :deptid, SYSDATE)
@@ -359,7 +368,7 @@ async def add_section(name: str, translation: str):
             await conn.close()
 
 
-async def update_section(secid: str, name: str, translation: str, disabled: str):
+async def update_section(system_id: str, name: str, translation: str, disabled: str):
     """Update an existing section in LKP_SECTION."""
     conn = await get_async_connection()
     if not conn:
@@ -370,9 +379,9 @@ async def update_section(secid: str, name: str, translation: str, disabled: str)
             query = """
                 UPDATE LKP_SECTION
                 SET NAME = :name, TRANSLATION = :translation, DISABLED = :disabled, LAST_UPDATE = SYSDATE
-                WHERE SECID = :secid
+                WHERE SYSTEM_ID = :system_id
             """
-            await cursor.execute(query, secid=secid, name=name, translation=translation, disabled=disabled)
+            await cursor.execute(query, system_id=system_id, name=name, translation=translation, disabled=disabled)
             await conn.commit()
             return True, "Section updated successfully"
     except oracledb.Error as ex:
@@ -429,6 +438,7 @@ async def get_departments(name: str = "", agency_id: int = None, page: int = 1, 
                         DISABLED,
                         LAST_UPDATE,
                         AGENCYID,
+                        SYSTEM_ID,
                         ROW_NUMBER() OVER (ORDER BY NAME) as rn
                     FROM LKP_DEPT
                     WHERE DISABLED = 'N' {search_condition}
@@ -448,7 +458,8 @@ async def get_departments(name: str = "", agency_id: int = None, page: int = 1, 
                     'SHORT': row[2],
                     'DISABLED': row[3],
                     'LAST_UPDATE': row[4],
-                    'SYSTEM_ID': row[5] # Keep dictionary key as SYSTEM_ID for frontend compatibility, but it holds AGENCYID
+                    'AGENCYID': row[5],
+                    'SYSTEM_ID': row[6]
                 })
     except oracledb.Error as ex:
         error, = ex.args
@@ -537,6 +548,15 @@ async def add_department(name: str, translation: str, short: str, agency_system_
         # The SHORT column has a max of 5 characters (validated in frontend)
         
         async with conn.cursor() as cursor:
+            # Final existence check within the same connection to prevent race conditions
+            await cursor.execute(
+                "SELECT COUNT(*) FROM LKP_DEPT WHERE DEPTID = :deptid",
+                deptid=new_deptid
+            )
+            count_result = await cursor.fetchone()
+            if count_result[0] > 0:
+                return False, f'DEPTID "{new_deptid}" already exists in LKP_DEPT. Please try again.'
+            
             query = """
                 INSERT INTO LKP_DEPT (DEPTID, NAME, TRANSLATION, SHORT, DISABLED, AGENCYID, LAST_UPDATE)
                 VALUES (:deptid, :name, :translation, :short, 'N', :agency_system_id, SYSDATE)
@@ -560,8 +580,8 @@ async def add_department(name: str, translation: str, short: str, agency_system_
             await conn.close()
 
 
-async def update_department(deptid: str, name: str, translation: str):
-    """Update an existing department in LKP_DEPT."""
+async def update_department(system_id: int, name: str, translation: str):
+    """Update an existing department in LKP_DEPT by SYSTEM_ID."""
     conn = await get_async_connection()
     if not conn:
         return False, "Failed to connect to database"
@@ -571,9 +591,9 @@ async def update_department(deptid: str, name: str, translation: str):
             query = """
                 UPDATE LKP_DEPT
                 SET NAME = :name, TRANSLATION = :translation, LAST_UPDATE = SYSDATE
-                WHERE DEPTID = :deptid
+                WHERE SYSTEM_ID = :system_id
             """
-            await cursor.execute(query, deptid=deptid, name=name, translation=translation)
+            await cursor.execute(query, system_id=system_id, name=name, translation=translation)
             await conn.commit()
             return True, "Department updated successfully"
     except oracledb.Error as ex:
@@ -751,6 +771,15 @@ async def add_ems_section(name: str, translation: str, dept_system_id: int):
             return False, "Failed to generate SYSTEM_ID"
         
         async with conn.cursor() as cursor:
+            # Final existence check within the same connection to prevent race conditions
+            await cursor.execute(
+                "SELECT COUNT(*) FROM LKP_SECTION WHERE SECID = :secid",
+                secid=new_secid
+            )
+            count_result = await cursor.fetchone()
+            if count_result[0] > 0:
+                return False, f'SECID "{new_secid}" already exists in LKP_SECTION. Please try again.'
+            
             query = """
                 INSERT INTO LKP_SECTION (SECID, SYSTEM_ID, NAME, TRANSLATION, DISABLED, DEPTID, LAST_UPDATE)
                 VALUES (:secid, :system_id, :name, :translation, 'N', :parent_dept_system_id, SYSDATE)
@@ -774,8 +803,8 @@ async def add_ems_section(name: str, translation: str, dept_system_id: int):
             await conn.close()
 
 
-async def update_ems_section(secid: str, name: str, translation: str, disabled: str, parent_dept_system_id: int):
-    """Update an existing EMS section."""
+async def update_ems_section(system_id: int, name: str, translation: str, disabled: str, parent_dept_system_id: int):
+    """Update an existing EMS section by SYSTEM_ID."""
     conn = await get_async_connection()
     if not conn:
         return False, "Failed to connect to database"
@@ -785,9 +814,9 @@ async def update_ems_section(secid: str, name: str, translation: str, disabled: 
             query = """
                 UPDATE LKP_SECTION
                 SET NAME = :name, TRANSLATION = :translation, DISABLED = :disabled, LAST_UPDATE = SYSDATE, DEPTID = :parent_dept_system_id
-                WHERE SECID = :secid
+                WHERE SYSTEM_ID = :system_id
             """
-            await cursor.execute(query, secid=secid, name=name, translation=translation, disabled=disabled, parent_dept_system_id=parent_dept_system_id)
+            await cursor.execute(query, system_id=system_id, name=name, translation=translation, disabled=disabled, parent_dept_system_id=parent_dept_system_id)
             await conn.commit()
             return True, "EMS Section updated successfully"
     except oracledb.Error as ex:

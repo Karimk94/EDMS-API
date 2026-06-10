@@ -167,15 +167,15 @@ async def update_section_endpoint(request: Request, data: dict):
         raise HTTPException(status_code=403, detail="Access denied")
     
     try:
-        secid = data.get("secid")
+        system_id = data.get("system_id")
         name = data.get("name")
         translation = data.get("translation", "")
         disabled = data.get("disabled", "N")
         
-        if not secid or not name:
-            raise HTTPException(status_code=400, detail="Section ID and name are required")
+        if not system_id or not name:
+            raise HTTPException(status_code=400, detail="System ID and name are required")
         
-        success, message = await update_section(secid, name, translation, disabled)
+        success, message = await update_section(system_id, name, translation, disabled)
         
         if not success:
             raise HTTPException(status_code=400, detail=message)
@@ -254,14 +254,14 @@ async def update_department_endpoint(request: Request, data: dict):
         raise HTTPException(status_code=403, detail="Access denied")
     
     try:
-        deptid = data.get("deptid")
+        system_id = data.get("system_id")
         name = data.get("name")
         translation = data.get("translation", "")
         
-        if not deptid or not name:
-            raise HTTPException(status_code=400, detail="Department ID and name are required")
+        if not system_id or not name:
+            raise HTTPException(status_code=400, detail="System ID and name are required")
         
-        success, message = await update_department(deptid, name, translation)
+        success, message = await update_department(system_id, name, translation)
         
         if not success:
             raise HTTPException(status_code=400, detail=message)
@@ -359,16 +359,16 @@ async def update_ems_section_endpoint(request: Request, data: dict):
         raise HTTPException(status_code=403, detail="Access denied")
     
     try:
-        secid = data.get("secid")
+        system_id = data.get("system_id")
         name = data.get("name")
         translation = data.get("translation", "")
         disabled = data.get("disabled", "N")
         parent_dept_system_id = data.get("parent_dept_system_id")
         
-        if not secid or not name or not parent_dept_system_id:
-            raise HTTPException(status_code=400, detail="EMS Section ID, name, and department are required")
+        if not system_id or not name or not parent_dept_system_id:
+            raise HTTPException(status_code=400, detail="System ID, name, and department are required")
         
-        success, message = await update_ems_section(secid, name, translation, disabled, parent_dept_system_id)
+        success, message = await update_ems_section(system_id, name, translation, disabled, parent_dept_system_id)
         
         if not success:
             raise HTTPException(status_code=400, detail=message)
