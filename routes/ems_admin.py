@@ -147,7 +147,7 @@ async def add_section_endpoint(request: Request, data: dict):
         success, message = await add_section(name, translation)
         
         if not success:
-            raise HTTPException(status_code=400, detail=message)
+            return {"success": False, "error": message}
         
         return {
             "success": True,
@@ -178,7 +178,7 @@ async def update_section_endpoint(request: Request, data: dict):
         success, message = await update_section(system_id, name, translation, disabled)
         
         if not success:
-            raise HTTPException(status_code=400, detail=message)
+            return {"success": False, "error": message}
         
         return {
             "success": True,
@@ -234,7 +234,7 @@ async def add_department_endpoint(request: Request, data: dict):
         success, message = await add_department(name, translation, short, agency_system_id)
         
         if not success:
-            raise HTTPException(status_code=400, detail=message)
+            return {"success": False, "error": message}
         
         return {
             "success": True,
@@ -264,7 +264,7 @@ async def update_department_endpoint(request: Request, data: dict):
         success, message = await update_department(system_id, name, translation)
         
         if not success:
-            raise HTTPException(status_code=400, detail=message)
+            return {"success": False, "error": message}
         
         return {
             "success": True,
@@ -339,7 +339,7 @@ async def add_ems_section_endpoint(request: Request, data: dict):
         success, message = await add_ems_section(name, translation, dept_system_id)
         
         if not success:
-            raise HTTPException(status_code=400, detail=message)
+            return {"success": False, "error": message}
         
         return {
             "success": True,
@@ -371,7 +371,7 @@ async def update_ems_section_endpoint(request: Request, data: dict):
         success, message = await update_ems_section(system_id, name, translation, disabled, parent_dept_system_id)
         
         if not success:
-            raise HTTPException(status_code=400, detail=message)
+            return {"success": False, "error": message}
         
         return {
             "success": True,

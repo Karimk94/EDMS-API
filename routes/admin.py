@@ -128,6 +128,16 @@ async def check_access(request: Request):
     return {"has_access": has_access, "username": user.get('username')}
 
 
+@router.get("/api/admin/history/{docnumber}")
+async def get_document_history(request: Request, docnumber: int):
+    """Get activity history for a specific document/folder. Requires admin access."""
+    if not check_admin_access(request):
+        raise HTTPException(status_code=403, detail="Access denied. Admin privileges required.")
+    
+    history = await admin_db.get_document_history(docnumber)
+    return {"history": history}
+
+
 @router.get("/api/admin/processing-queue/status")
 async def get_processing_queue_status(request: Request):
     """Returns local processing queue status for admin monitoring."""

@@ -307,3 +307,47 @@ async def search_people(search_term: str = "", limit: int = 50):
             await conn.close()
     
     return users
+
+
+async def get_document_history(docnumber: int):
+    """Fetches activity history for a specific document/folder from SIEM_EDMS_VIEW."""
+    conn = await get_async_connection()
+    if not conn:
+        return []
+
+    history = []
+    try:
+        async with conn.cursor() as cursor:
+            query = """
+                SELECT 
+                    ACTIVITY_DESCRIPTION,
+                    DOCNUMBER,
+                    TYPIST,
+                    DOCNAME,
+                    AUTHOR,
+                    START_DATE,
+                    FORM_NAME
+                FROM SIEM_EDMS_VIEW
+                WHERE DOCNUMBER = :docnumber
+                ORDER BY START_DATE DESC
+            """
+            await cursor.execute(query, docnumber=docnumber)
+            rows = await cursor.fetchall()
+            
+            for row in rows:
+                history.append({
+                    'activity_description': row[0],
+                    'docnumber': row[1],
+                    'typist': row[2],
+                    'docname': row[3],
+                    'author': row[4],
+                    'start_date': row[5].isoformat() if row[5] else None,
+                    'form_name': row[6]
+                })
+    except oracledb.Error as e:
+        logging.error(f"Oracle Database error in get_document_history: {e}", exc_info=True)
+    finally:
+        if conn:
+            await conn.close()
+            
+    return history

@@ -54,7 +54,7 @@ async def _get_folder_direct_file_size_sum(dst, folder_id):
         for file_item in folder_files:
             file_id = file_item.get('id')
             if file_id:
-                total_size += _get_file_size_from_dms(dst, file_id)
+                total_size += await _get_file_size_from_dms(dst, file_id)
     except Exception as e:
         logging.warning(f"Could not calculate direct file size sum for folder {folder_id}: {e}")
 
@@ -198,13 +198,18 @@ async def api_delete_folder(folder_id: str, request: Request, force: bool = Fals
     else:
         bytes_freed = await _get_file_size_from_dms(dst, folder_id)
 
+    logging.info(f"Delete {folder_id}: is_folder={is_folder}, edms_user_id={edms_user_id}, bytes_freed={bytes_freed}")
+
     try:
         # Try standard delete first
         success, message = await run_in_threadpool(wsdl_client.delete_document, dst, folder_id)
 
         if success:
             if edms_user_id and bytes_freed > 0:
-                await user_data.restore_user_quota(edms_user_id, bytes_freed)
+                restore_ok, restore_msg = await user_data.restore_user_quota(edms_user_id, bytes_freed)
+                logging.info(f"Quota restore for user {edms_user_id} after deleting {folder_id}: {restore_ok}, {restore_msg}")
+            else:
+                logging.warning(f"Skipped quota restore for {folder_id}: edms_user_id={edms_user_id}, bytes_freed={bytes_freed}")
             return {"message": "Folder deleted", "id": folder_id}
 
         # Check for specific "Referenced by" error to prompt user
