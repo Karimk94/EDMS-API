@@ -222,9 +222,8 @@ async def api_delete_folder(folder_id: str, request: Request, force: bool = Fals
                     detail="Failed to clear folder contents. Some items may still be referenced elsewhere. Check logs for details."
                 )
 
-            bytes_freed = total_bytes_deleted if isinstance(total_bytes_deleted, int) else 0
-            if not is_folder:
-                bytes_freed += await _get_file_size_from_dms(dst, folder_id)
+            if is_folder:
+                bytes_freed = total_bytes_deleted if isinstance(total_bytes_deleted, int) else 0
 
             if edms_user_id and bytes_freed > 0:
                 await user_data.restore_user_quota(edms_user_id, bytes_freed)
