@@ -341,6 +341,201 @@ async def get_document_history(docnumber: int):
                     'typist': row[2],
                     'docname': row[3],
                     'author': row[4],
+            insert_query = """
+                INSERT INTO LKP_EDMS_USR_SECUR (SYSTEM_ID, USER_ID, SECURITY_LEVEL_ID, LANG, THEME, DISABLED)
+                VALUES ((SELECT NVL(MAX(SYSTEM_ID), 0) + 1 FROM LKP_EDMS_USR_SECUR), :user_id, :security_level_id, :lang, :theme, '0')
+            """
+            await cursor.execute(
+                insert_query,
+                user_id=user_system_id,
+                security_level_id=security_level_id,
+                lang=lang,
+                theme=theme
+            )
+            
+            # Get the newly created EDMS User ID
+            await cursor.execute("SELECT SYSTEM_ID FROM LKP_EDMS_USR_SECUR WHERE USER_ID = :1", [user_system_id])
+            edms_user_id = (await cursor.fetchone())[0]
+
+            # Initialize Quota
+            await cursor.execute(
+                "INSERT INTO LKP_EDMS_USR_DATA (SYSTEM_ID, USER_ID, REMAINING_QUOTA, QUOTA, DISABLED) VALUES ((SELECT NVL(MAX(SYSTEM_ID), 0) + 1 FROM LKP_EDMS_USR_DATA), :1, :2, :3, '0')",
+                [edms_user_id, quota, quota]
+            )
+
+            await conn.commit()
+            return True, "User added successfully"
+            
+    except oracledb.Error as e:
+        logging.error(f"Oracle Database error in add_edms_user: {e}", exc_info=True)
+        await conn.rollback()
+        return False, str(e)
+    finally:
+        if conn:
+            await conn.close()
+
+
+async def delete_edms_user(edms_user_id: int):
+    """Deletes a user from LKP_EDMS_USR_SECUR table by their EDMS user record ID."""
+    conn = await get_async_connection()
+    if not conn:
+        return False, "Database connection failed"
+
+    try:
+        async with conn.cursor() as cursor:
+            # Delete quota data first (FK)
+            await cursor.execute("DELETE FROM LKP_EDMS_USR_DATA WHERE USER_ID = :edms_user_id", edms_user_id=edms_user_id)
+
+            delete_query = "DELETE FROM LKP_EDMS_USR_SECUR WHERE SYSTEM_ID = :edms_user_id"
+            await cursor.execute(delete_query, edms_user_id=edms_user_id)
+            
+            if cursor.rowcount == 0:
+                return False, "User not found"
+            
+            await conn.commit()
+            return True, "User deleted successfully"
+            
+    except oracledb.Error as e:
+        logging.error(f"Oracle Database error in delete_edms_user: {e}", exc_info=True)
+        await conn.rollback()
+        return False, str(e)
+    finally:
+        if conn:
+            await conn.close()
+
+
+async def update_edms_user(edms_user_id: int, security_level_id: int, lang: str = 'en', theme: str = 'light', remaining_quota: int = None, quota: int = None):
+    """Updates an existing user in LKP_EDMS_USR_SECUR table."""
+    conn = await get_async_connection()
+    if not conn:
+        return False, "Database connection failed"
+
+    try:
+        async with conn.cursor() as cursor:
+            update_query = """
+                UPDATE LKP_EDMS_USR_SECUR 
+                SET SECURITY_LEVEL_ID = :security_level_id,
+                    LANG = :lang,
+                    THEME = :theme
+                WHERE SYSTEM_ID = :edms_user_id
+            """
+            await cursor.execute(
+                update_query,
+                security_level_id=security_level_id,
+                lang=lang,
+                theme=theme,
+                edms_user_id=edms_user_id
+            )
+            
+            if cursor.rowcount == 0:
+                return False, "User not found"
+
+            # Update User Data if quota or remaining_quota is provided
+            if remaining_quota is not None or quota is not None:
+                # Check if record exists
+                await cursor.execute("SELECT COUNT(*) FROM LKP_EDMS_USR_DATA WHERE USER_ID = :1", [edms_user_id])
+                exists = (await cursor.fetchone())[0] > 0
+                
+                if exists:
+                    if remaining_quota is not None:
+                         await cursor.execute("UPDATE LKP_EDMS_USR_DATA SET REMAINING_QUOTA = :1 WHERE USER_ID = :2", [remaining_quota, edms_user_id])
+                    if quota is not None:
+                         await cursor.execute("UPDATE LKP_EDMS_USR_DATA SET QUOTA = :1 WHERE USER_ID = :2", [quota, edms_user_id])
+                else:
+                    # Insert new record if not exists
+                     current_quota = quota if quota is not None else 1073741824
+                     current_remaining = remaining_quota if remaining_quota is not None else current_quota
+                     await cursor.execute(
+                        "INSERT INTO LKP_EDMS_USR_DATA (SYSTEM_ID, USER_ID, REMAINING_QUOTA, QUOTA, DISABLED) VALUES ((SELECT NVL(MAX(SYSTEM_ID), 0) + 1 FROM LKP_EDMS_USR_DATA), :1, :2, :3, '0')", 
+                        [edms_user_id, current_remaining, current_quota]
+                    )
+
+            
+            await conn.commit()
+            return True, "User updated successfully"
+            
+    except oracledb.Error as e:
+        logging.error(f"Oracle Database error in update_edms_user: {e}", exc_info=True)
+        await conn.rollback()
+        return False, str(e)
+    finally:
+        if conn:
+            await conn.close()
+
+
+async def search_people(search_term: str = "", limit: int = 50):
+    """Search for users in PEOPLE table who are not yet in LKP_EDMS_USR_SECUR."""
+    conn = await get_async_connection()
+    if not conn:
+        return []
+
+    users = []
+    try:
+        async with conn.cursor() as cursor:
+            query = """
+                SELECT p.SYSTEM_ID, p.USER_ID, p.FULL_NAME
+                FROM PEOPLE p
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM LKP_EDMS_USR_SECUR us WHERE us.USER_ID = p.SYSTEM_ID
+                )
+                AND (
+                    UPPER(p.USER_ID) LIKE UPPER(:search) 
+                    OR UPPER(p.FULL_NAME) LIKE UPPER(:search)
+                )
+                AND ROWNUM <= :limit
+                ORDER BY p.USER_ID
+            """
+            search_pattern = f"%{search_term}%"
+            await cursor.execute(query, search=search_pattern, limit=limit)
+            rows = await cursor.fetchall()
+            
+            for row in rows:
+                users.append({
+                    'system_id': row[0],
+                    'user_id': row[1],
+                    'name': row[2] or row[1]
+                })
+    except oracledb.Error as e:
+        logging.error(f"Oracle Database error in search_people: {e}", exc_info=True)
+    finally:
+        if conn:
+            await conn.close()
+    
+    return users
+
+
+async def get_document_history(docnumber: int):
+    """Fetches activity history for a specific document/folder from SIEM_EDMS_VIEW."""
+    conn = await get_async_connection()
+    if not conn:
+        return []
+
+    history = []
+    try:
+        async with conn.cursor() as cursor:
+            query = """
+                SELECT 
+                    ACTIVITY_DESCRIPTION,
+                    DOCNUMBER,
+                    TYPIST,
+                    DOCNAME,
+                    AUTHOR,
+                    START_DATE,
+                    FORM_NAME
+                FROM SIEM_EDMS_VIEW
+                WHERE DOCNUMBER = :docnumber
+                ORDER BY START_DATE DESC
+            """
+            await cursor.execute(query, docnumber=docnumber)
+            rows = await cursor.fetchall()
+            
+            for row in rows:
+                history.append({
+                    'activity_description': row[0],
+                    'docnumber': row[1],
+                    'typist': row[2],
+                    'docname': row[3],
+                    'author': row[4],
                     'start_date': row[5].isoformat() if row[5] else None,
                     'form_name': row[6]
                 })
@@ -351,3 +546,106 @@ async def get_document_history(docnumber: int):
             await conn.close()
             
     return history
+
+
+async def get_admin_profiles():
+    """Fetches profiles from the FORMS table (form_type = 'P' and name not containing search)."""
+    conn = await get_async_connection()
+    if not conn:
+        return []
+
+    profiles = []
+    try:
+        async with conn.cursor() as cursor:
+            query = """
+                SELECT SYSTEM_ID, FORM_NAME, FORM_TITLE 
+                FROM FORMS 
+                WHERE FORM_TYPE = 'P' 
+                AND UPPER(FORM_NAME) NOT LIKE UPPER('%SEARCH%')
+                ORDER BY FORM_NAME
+            """
+            await cursor.execute(query)
+            rows = await cursor.fetchall()
+            
+            for row in rows:
+                profiles.append({
+                    'system_id': row[0],
+                    'form_name': row[1],
+                    'form_title': row[2]
+                })
+    except oracledb.Error as e:
+        logging.error(f"Oracle Database error in get_admin_profiles: {e}", exc_info=True)
+    finally:
+        if conn:
+            await conn.close()
+            
+    return profiles
+
+
+async def get_profile_groups(profile_system_id: int):
+    """Fetches groups mapped to a specific profile from FORM_USER and GROUPS."""
+    conn = await get_async_connection()
+    if not conn:
+        return []
+
+    groups = []
+    try:
+        async with conn.cursor() as cursor:
+            query = """
+                SELECT g.GROUP_ID, g.GROUP_NAME, g.SYSTEM_ID
+                FROM FORM_USER fu
+                JOIN GROUPS g ON fu.PERSONORGROUP = g.SYSTEM_ID
+                WHERE fu.FORM = :profile_system_id
+                ORDER BY g.GROUP_NAME
+            """
+            await cursor.execute(query, profile_system_id=profile_system_id)
+            rows = await cursor.fetchall()
+            
+            for row in rows:
+                groups.append({
+                    'group_id': row[0],
+                    'group_name': row[1],
+                    'system_id': row[2]
+                })
+    except oracledb.Error as e:
+        logging.error(f"Oracle Database error in get_profile_groups: {e}", exc_info=True)
+    finally:
+        if conn:
+            await conn.close()
+            
+    return groups
+
+
+async def get_group_users(group_system_id: int):
+    """Fetches active users mapped to a specific group from PEOPLEGROUPS and PEOPLE."""
+    conn = await get_async_connection()
+    if not conn:
+        return []
+
+    users = []
+    try:
+        async with conn.cursor() as cursor:
+            query = """
+                SELECT p.USER_ID, p.FULL_NAME, p.SYSTEM_ID
+                FROM PEOPLEGROUPS pg
+                JOIN PEOPLE p ON pg.PEOPLE_SYSTEM_ID = p.SYSTEM_ID
+                WHERE pg.GROUPS_SYSTEM_ID = :group_system_id
+                  AND p.DISABLED = 'N'
+                ORDER BY p.USER_ID
+            """
+            await cursor.execute(query, group_system_id=group_system_id)
+            rows = await cursor.fetchall()
+            
+            for row in rows:
+                users.append({
+                    'user_id': row[0],
+                    'full_name': row[1] or row[0],
+                    'system_id': row[2]
+                })
+    except oracledb.Error as e:
+        logging.error(f"Oracle Database error in get_group_users: {e}", exc_info=True)
+    finally:
+        if conn:
+            await conn.close()
+            
+    return users
