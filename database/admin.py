@@ -341,6 +341,26 @@ async def get_document_history(docnumber: int):
                     'typist': row[2],
                     'docname': row[3],
                     'author': row[4],
+                    'start_date': row[5].isoformat() if row[5] else None,
+                    'form_name': row[6]
+                })
+    except oracledb.Error as e:
+        logging.error(f"Oracle Database error in get_document_history: {e}", exc_info=True)
+    finally:
+        if conn:
+            await conn.close()
+            
+    return history
+
+
+async def add_edms_user(user_system_id: int, security_level_id: int, lang: str = 'en', theme: str = 'light', quota: int = 1073741824):
+    """Adds a new user to LKP_EDMS_USR_SECUR table."""
+    conn = await get_async_connection()
+    if not conn:
+        return False, "Database connection failed"
+
+    try:
+        async with conn.cursor() as cursor:
             insert_query = """
                 INSERT INTO LKP_EDMS_USR_SECUR (SYSTEM_ID, USER_ID, SECURITY_LEVEL_ID, LANG, THEME, DISABLED)
                 VALUES ((SELECT NVL(MAX(SYSTEM_ID), 0) + 1 FROM LKP_EDMS_USR_SECUR), :user_id, :security_level_id, :lang, :theme, '0')
@@ -373,6 +393,7 @@ async def get_document_history(docnumber: int):
     finally:
         if conn:
             await conn.close()
+
 
 
 async def delete_edms_user(edms_user_id: int):
