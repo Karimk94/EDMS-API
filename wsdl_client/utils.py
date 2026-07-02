@@ -652,11 +652,17 @@ def parse_binary_result_buffer(buffer):
                                     if ext in EXT_MAP:
                                         media_type = EXT_MAP[ext]
                                         break
+                        # Build display name from tokens BEFORE the first structural
+                        # flag (N/F/D).  Tokens after the flag are DMS metadata fields
+                        # (APPLICATION, APP_ID, etc.) and should be excluded.
+                        # This prevents legitimate name words like "folder" from being
+                        # stripped when they happen to match FOLDER_APPS identifiers.
                         name_parts = []
                         for t in chunk_tokens:
-                            # 'D' might also appear as a structural token similar to N/F
-                            if t not in ['N', 'D', 'F'] and t.upper() not in FOLDER_APPS:
-                                name_parts.append(t)
+                            # Stop collecting name parts once we hit a structural flag
+                            if t in ('N', 'D', 'F'):
+                                break
+                            name_parts.append(t)
                         full_name = " ".join(name_parts).strip()
                         if len(full_name) > 0:
                             items.append({

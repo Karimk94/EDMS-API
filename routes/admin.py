@@ -362,30 +362,31 @@ async def delete_tab_permission(request: Request, permission_id: int):
 # --- Profiles Tab Endpoints ---
 
 @router.get("/api/admin/profiles")
-async def get_profiles(request: Request):
+async def get_profiles(request: Request, search: str = ""):
     """Get all EDMS profiles. Requires admin access."""
     if not check_admin_access(request):
         raise HTTPException(status_code=403, detail="Access denied. Admin privileges required.")
     
-    profiles = await admin_db.get_admin_profiles()
+    profiles = await admin_db.get_admin_profiles(search=search)
     return {"profiles": profiles}
 
 
 @router.get("/api/admin/profiles/{profile_system_id}/groups")
-async def get_profile_groups(request: Request, profile_system_id: int):
+async def get_profile_groups(request: Request, profile_system_id: int, search: str = ""):
     """Get groups mapped to a specific profile. Requires admin access."""
     if not check_admin_access(request):
         raise HTTPException(status_code=403, detail="Access denied. Admin privileges required.")
     
-    groups = await admin_db.get_profile_groups(profile_system_id)
+    groups = await admin_db.get_profile_groups(profile_system_id, search=search)
     return {"groups": groups}
 
 
 @router.get("/api/admin/groups/{group_system_id}/users")
-async def get_group_users(request: Request, group_system_id: int):
+async def get_group_users(request: Request, group_system_id: int, search: str = ""):
     """Get users mapped to a specific group. Requires admin access."""
     if not check_admin_access(request):
         raise HTTPException(status_code=403, detail="Access denied. Admin privileges required.")
     
-    users = await admin_db.get_group_users(group_system_id)
+    users = await admin_db.get_group_users(group_system_id, search=search)
     return {"users": users}
+

@@ -147,8 +147,8 @@ async def add_edms_user(user_system_id: int, security_level_id: int, lang: str =
             
             # Insert new user
             insert_query = """
-                INSERT INTO LKP_EDMS_USR_SECUR (SYSTEM_ID, USER_ID, SECURITY_LEVEL_ID, LANG, THEME, DISABLED)
-                VALUES ((SELECT NVL(MAX(SYSTEM_ID), 0) + 1 FROM LKP_EDMS_USR_SECUR), :user_id, :security_level_id, :lang, :theme, '0')
+                INSERT INTO LKP_EDMS_USR_SECUR (SYSTEM_ID, USER_ID, SECURITY_LEVEL_ID, LANG, THEME, DISABLED, SECTION)
+                VALUES ((SELECT NVL(MAX(SYSTEM_ID), 0) + 1 FROM LKP_EDMS_USR_SECUR), :user_id, :security_level_id, :lang, :theme, '0', '0000')
             """
             await cursor.execute(
                 insert_query,
@@ -569,7 +569,7 @@ async def get_document_history(docnumber: int):
     return history
 
 
-async def get_admin_profiles():
+async def get_admin_profiles(search: str = ""):
     """Fetches profiles from the FORMS table (form_type = 'P' and name not containing search)."""
     conn = await get_async_connection()
     if not conn:
@@ -578,14 +578,26 @@ async def get_admin_profiles():
     profiles = []
     try:
         async with conn.cursor() as cursor:
-            query = """
+            search_condition = ""
+            bind_vars = {}
+            if search.strip():
+                search_condition = """
+                    AND (
+                        UPPER(FORM_NAME) LIKE UPPER(:search)
+                        OR UPPER(FORM_TITLE) LIKE UPPER(:search)
+                    )
+                """
+                bind_vars['search'] = f"%{search}%"
+
+            query = f"""
                 SELECT SYSTEM_ID, FORM_NAME, FORM_TITLE 
                 FROM FORMS 
                 WHERE FORM_TYPE = 'P' 
                 AND UPPER(FORM_NAME) NOT LIKE UPPER('%SEARCH%')
+                {search_condition}
                 ORDER BY FORM_NAME
             """
-            await cursor.execute(query)
+            await cursor.execute(query, **bind_vars)
             rows = await cursor.fetchall()
             
             for row in rows:
@@ -603,7 +615,7 @@ async def get_admin_profiles():
     return profiles
 
 
-async def get_profile_groups(profile_system_id: int):
+async def get_profile_groups(profile_system_id: int, search: str = ""):
     """Fetches groups mapped to a specific profile from FORM_USER and GROUPS."""
     conn = await get_async_connection()
     if not conn:
@@ -612,14 +624,26 @@ async def get_profile_groups(profile_system_id: int):
     groups = []
     try:
         async with conn.cursor() as cursor:
-            query = """
-                SELECT g.GROUP_ID, g.GROUP_NAME, g.SYSTEM_ID
+            search_condition = ""
+            bind_vars = {'profile_system_id': profile_system_id}
+            if search.strip():
+                search_condition = """
+                    AND (
+                        UPPER(g.GROUP_NAME) LIKE UPPER(:search)
+                        OR UPPER(g.GROUP_ID) LIKE UPPER(:search)
+                    )
+                """
+                bind_vars['search'] = f"%{search}%"
+
+            query = f"""
+                SELECT DISTINCT g.GROUP_ID, g.GROUP_NAME, g.SYSTEM_ID
                 FROM FORM_USER fu
                 JOIN GROUPS g ON fu.PERSONORGROUP = g.SYSTEM_ID
                 WHERE fu.FORM = :profile_system_id
+                {search_condition}
                 ORDER BY g.GROUP_NAME
             """
-            await cursor.execute(query, profile_system_id=profile_system_id)
+            await cursor.execute(query, **bind_vars)
             rows = await cursor.fetchall()
             
             for row in rows:
@@ -637,7 +661,7 @@ async def get_profile_groups(profile_system_id: int):
     return groups
 
 
-async def get_group_users(group_system_id: int):
+async def get_group_users(group_system_id: int, search: str = ""):
     """Fetches active users mapped to a specific group from PEOPLEGROUPS and PEOPLE."""
     conn = await get_async_connection()
     if not conn:
@@ -646,15 +670,27 @@ async def get_group_users(group_system_id: int):
     users = []
     try:
         async with conn.cursor() as cursor:
-            query = """
+            search_condition = ""
+            bind_vars = {'group_system_id': group_system_id}
+            if search.strip():
+                search_condition = """
+                    AND (
+                        UPPER(p.USER_ID) LIKE UPPER(:search)
+                        OR UPPER(p.FULL_NAME) LIKE UPPER(:search)
+                    )
+                """
+                bind_vars['search'] = f"%{search}%"
+
+            query = f"""
                 SELECT p.USER_ID, p.FULL_NAME, p.SYSTEM_ID
                 FROM PEOPLEGROUPS pg
                 JOIN PEOPLE p ON pg.PEOPLE_SYSTEM_ID = p.SYSTEM_ID
                 WHERE pg.GROUPS_SYSTEM_ID = :group_system_id
                   AND p.DISABLED = 'N'
+                {search_condition}
                 ORDER BY p.USER_ID
             """
-            await cursor.execute(query, group_system_id=group_system_id)
+            await cursor.execute(query, **bind_vars)
             rows = await cursor.fetchall()
             
             for row in rows:
@@ -670,3 +706,4 @@ async def get_group_users(group_system_id: int):
             await conn.close()
             
     return users
+
