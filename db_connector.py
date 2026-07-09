@@ -6,7 +6,8 @@ from database.media import (
     cache_document_stream_to_file, cache_document_stream_to_file_async, get_download_cache_path,
     create_thumbnail, clear_thumbnail_cache, clear_video_cache, get_media_type_counts,
     resolve_media_types_from_db, get_app_id_from_extension, get_exif_date,
-    thumbnail_cache_dir, video_cache_dir, temp_thumbnail_cache_dir, download_cache_dir
+    thumbnail_cache_dir, video_cache_dir, temp_thumbnail_cache_dir, download_cache_dir,
+    get_metadata_for_docs
 )
 from database.documents import (
     fetch_documents_from_oracle, get_documents_to_process,
@@ -23,7 +24,7 @@ from database.tags import (
 )
 from database.users import (
     get_user_security_level, get_user_details, update_user_language,
-    update_user_theme, get_user_system_id
+    update_user_theme, update_user_view_mode, get_user_system_id
 )
 from database.events import (
     get_events, create_event, link_document_to_event,

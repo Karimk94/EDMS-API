@@ -6,7 +6,7 @@ import os
 import db_connector
 import wsdl_client
 from wsdl_client import users as wsdl_users
-from schemas.auth import LoginRequest, LangUpdateRequest, ThemeUpdateRequest, GroupMember, TrusteeResponse, Group
+from schemas.auth import LoginRequest, LangUpdateRequest, ThemeUpdateRequest, ViewModeUpdateRequest, GroupMember, TrusteeResponse, Group
 from typing import List
 from services import processor
 from utils.common import get_current_user, get_session_token
@@ -345,6 +345,24 @@ async def api_update_user_theme(request: Request, data: ThemeUpdateRequest):
         return {"message": "Theme updated"}
     else:
         raise HTTPException(status_code=500, detail="Failed to update theme")
+
+@router.put('/api/user/view-mode')
+async def api_update_user_view_mode(request: Request, data: ViewModeUpdateRequest):
+    user = request.session.get('user')
+    if not user:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    if data.view_mode not in ['grid', 'list']:
+        raise HTTPException(status_code=400, detail="Invalid view mode")
+
+    username = user['username']
+    success = await db_connector.update_user_view_mode(username, data.view_mode)
+    if success:
+        user['view_mode'] = data.view_mode
+        request.session['user'] = user
+        return {"message": "View mode updated"}
+    else:
+        raise HTTPException(status_code=500, detail="Failed to update view mode")
 
 # --- Groups & Security Endpoints (Updated to use Session) ---
 

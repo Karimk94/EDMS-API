@@ -491,7 +491,19 @@ async def list_folder_contents(dst, parent_id=None, app_source=None, scope=None,
                 filtered_items.append(item)
         
         items = filtered_items
-    
+
+    # Fetch and merge metadata (size, date) for documents
+    try:
+        doc_ids = [item['id'] for item in items if item.get('type') == 'file']
+        if doc_ids:
+            metadata_map = await db_connector.get_metadata_for_docs(doc_ids)
+            for item in items:
+                if item.get('type') == 'file' and item['id'] in metadata_map:
+                    item['size'] = metadata_map[item['id']].get('size', 0)
+                    item['date'] = metadata_map[item['id']].get('date')
+    except Exception as e:
+        logging.error(f"Error merging metadata into items: {e}")
+
     return items
 
 async def get_root_folder_counts(dst, username=None):

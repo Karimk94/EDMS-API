@@ -540,3 +540,53 @@ async def resolve_media_types_from_db(doc_ids):
     finally:
         if conn: conn.close()
     return resolved_map
+
+async def get_metadata_for_docs(doc_ids):
+    """Queries the database to fetch metadata (size, date) for documents."""
+    if not doc_ids: return {}
+
+    conn = get_connection()
+    if not conn: return {}
+
+    metadata_map = {}
+    try:
+        with conn.cursor() as cursor:
+            valid_doc_ids = []
+            for did in doc_ids:
+                try:
+                    valid_doc_ids.append(int(did))
+                except Exception:
+                    continue
+
+            if not valid_doc_ids:
+                return {}
+
+            for start in range(0, len(valid_doc_ids), 1000): # Hardcoding limit here for safety
+                chunk = valid_doc_ids[start:start + 1000]
+                bind_names = [f"id{i}" for i in range(len(chunk))]
+                in_clause = ",".join(f":{name}" for name in bind_names)
+                bind_params = {name: value for name, value in zip(bind_names, chunk)}
+
+                sql = f"""
+                    SELECT p.DOCNUMBER, TO_CHAR(p.CREATION_DATE, 'YYYY-MM-DD"T"HH24:MI:SS"Z"')
+                    FROM PROFILE p
+                    WHERE p.DOCNUMBER IN ({in_clause})
+                """
+
+                try:
+                    cursor.execute(sql, bind_params)
+                    rows = cursor.fetchall()
+                    for doc_id, c_date in rows:
+                        metadata_map[str(doc_id)] = {
+                            'date': c_date,
+                            'size': 0
+                        }
+                except Exception as e:
+                    logging.error(f"Error executing metadata query: {e}")
+
+    except Exception as e:
+        logging.error(f"Error fetching document metadata: {e}")
+    finally:
+        if conn: conn.close()
+        
+    return metadata_map
