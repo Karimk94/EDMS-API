@@ -105,9 +105,29 @@ async def api_upload_document(request: Request, file: UploadFile = File(...), do
                               event_id: Optional[str] = Form(None), parent_id: Optional[str] = Form(None),
                               date_taken: Optional[str] = Form(None),
                               x_app_source: str = Header("unknown", alias="X-App-Source"),
+                              idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key"),
                               user=Depends(get_current_user)):
     if not file.filename:
         raise HTTPException(status_code=400, detail="No selected file")
+
+    original_filename = secure_filename(file.filename)
+
+    from services.idempotency_store import idempotency_store
+    if idempotency_key:
+        result = idempotency_store.get_result(idempotency_key)
+        if result:
+            if result["status"] == "SUCCESS":
+                return {
+                    "success": True, 
+                    "docnumber": result["doc_number"], 
+                    "filename": original_filename, 
+                    "message": "Idempotent hit: Returning cached success response"
+                }
+            elif result["status"] == "IN_PROGRESS":
+                raise HTTPException(status_code=409, detail="Upload already in progress. Please wait.")
+        
+        if not idempotency_store.claim_key(idempotency_key):
+            raise HTTPException(status_code=409, detail="Upload already in progress. Please wait.")
 
     file_bytes = file.file.read()
     file.file.seek(0)
@@ -165,9 +185,17 @@ async def api_upload_document(request: Request, file: UploadFile = File(...), do
     }
 
     # Passing file.file (SpooledTemporaryFile) acts like a stream
-    new_doc_number = await wsdl_client.upload_document_to_dms(dst, file.file, metadata, parent_id=parent_id)
+    try:
+        new_doc_number = await wsdl_client.upload_document_to_dms(dst, file.file, metadata, parent_id=parent_id)
+    except Exception as e:
+        if idempotency_key:
+            idempotency_store.mark_failed(idempotency_key)
+        raise e
 
     if new_doc_number:
+        if idempotency_key:
+            idempotency_store.mark_success(idempotency_key, int(new_doc_number))
+            
         # --- Deduct Quota ---
         if user and 'edms_user_id' in locals():
             await user_data.deduct_user_quota(edms_user_id, file_size)
@@ -206,6 +234,8 @@ async def api_upload_document(request: Request, file: UploadFile = File(...), do
 
         return {"success": True, "docnumber": new_doc_number, "filename": original_filename}
     else:
+        if idempotency_key:
+            idempotency_store.mark_failed(idempotency_key)
         raise HTTPException(status_code=500, detail="Failed to upload file to DMS.")
 
 @router.post('/api/process_uploaded_documents')
