@@ -379,6 +379,13 @@ async def api_download_watermarked(doc_id: int, request: Request, user=Depends(g
                     raise HTTPException(status_code=500, detail="Failed to retrieve content")
                 _write_cached_download_fallback(cache_path, file_bytes)
 
+        try:
+            sys_id_int = int(system_id)
+            from database.activity import log_activity
+            await log_activity(doc_id, 'Download', sys_id_int)
+        except (ValueError, TypeError):
+            pass
+
         return FileResponse(
             cache_path,
             media_type=mimetype,
@@ -415,6 +422,13 @@ async def api_download_watermarked(doc_id: int, request: Request, user=Depends(g
         mimetype = "application/vnd.openxmlformats-officedocument.presentationml.presentation"
     elif media_type == 'text':
         mimetype = "text/plain"
+
+    try:
+        sys_id_int = int(system_id)
+        from database.activity import log_activity
+        await log_activity(doc_id, 'Download', sys_id_int)
+    except (ValueError, TypeError):
+        pass
 
     return StreamingResponse(
         io.BytesIO(processed_bytes),

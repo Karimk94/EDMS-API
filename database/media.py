@@ -4,6 +4,7 @@ import io
 import shutil
 import logging
 import time
+import uuid
 import oracledb
 from datetime import datetime
 from PIL import Image
@@ -300,7 +301,7 @@ def get_download_cache_path(doc_number, file_ext):
 
 def stream_and_cache_generator(obj_client, stream_id, content_id, final_cache_path):
     """Generator for streaming data."""
-    temp_cache_path = final_cache_path + ".tmp"
+    temp_cache_path = final_cache_path + f".{uuid.uuid4().hex}.tmp"
     try:
         with open(temp_cache_path, "wb") as f:
             while True:
@@ -310,7 +311,7 @@ def stream_and_cache_generator(obj_client, stream_id, content_id, final_cache_pa
                 if not chunk_data: break
                 f.write(chunk_data)
                 yield chunk_data
-        os.rename(temp_cache_path, final_cache_path)
+        os.replace(temp_cache_path, final_cache_path)
     except Exception as e:
         logging.error(f"Error streaming: {e}")
     finally:
@@ -319,7 +320,11 @@ def stream_and_cache_generator(obj_client, stream_id, content_id, final_cache_pa
             if content_id: obj_client.service.ReleaseObject(call={'objectID': content_id})
         except:
             pass
-        if os.path.exists(temp_cache_path): os.remove(temp_cache_path)
+        if os.path.exists(temp_cache_path): 
+            try:
+                os.remove(temp_cache_path)
+            except OSError:
+                pass
 
 def cache_document_stream_to_file(dst, doc_number, final_cache_path):
     """Streams a document from DMS into a local cache file without buffering it in memory."""

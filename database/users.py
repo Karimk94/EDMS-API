@@ -59,7 +59,7 @@ async def get_user_details(username):
 
                 # Now, get details from the EDMS security and data tables
                 query = """
-                    SELECT sl.NAME, us.LANG, us.THEME, us.VIEW_MODE,
+                    SELECT sl.NAME, us.LANG, us.THEME, us.VIEW_MODE, us.LARGE_DOWNLOADS,
                            COALESCE(ud.QUOTA, 1073741824), 
                            COALESCE(ud.REMAINING_QUOTA, COALESCE(ud.QUOTA, 1073741824))
                     FROM LKP_EDMS_USR_SECUR us
@@ -71,7 +71,7 @@ async def get_user_details(username):
                 details_result = await cursor.fetchone()
 
                 if details_result:
-                    security_level, lang, theme, view_mode, quota, remaining_quota = details_result
+                    security_level, lang, theme, view_mode, LARGE_DOWNLOADS, quota, remaining_quota = details_result
                     # Also fetch the security_level_id for tab permissions lookup
                     await cursor.execute(
                         "SELECT SECURITY_LEVEL_ID FROM LKP_EDMS_USR_SECUR WHERE USER_ID = :user_id",
@@ -89,7 +89,8 @@ async def get_user_details(username):
                         'theme': theme or 'light',
                         'view_mode': view_mode or 'grid',
                         'quota': quota,
-                        'remaining_quota': remaining_quota
+                        'remaining_quota': remaining_quota,
+                        'LARGE_DOWNLOADS': LARGE_DOWNLOADS == '1' if LARGE_DOWNLOADS is not None else False
                     }
                 else:
                     logging.warning(f"No security details found for user_id {user_id} (DMS user: {username})")

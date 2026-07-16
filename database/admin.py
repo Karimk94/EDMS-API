@@ -56,8 +56,8 @@ async def get_all_edms_users(search: str = "", page: int = 1, limit: int = 20):
                         us.SECURITY_LEVEL_ID,
                         us.LANG,
                         us.THEME,
-                        COALESCE(ud.REMAINING_QUOTA, 1073741824) as REMAINING_QUOTA,
                         COALESCE(ud.QUOTA, 1073741824) as QUOTA,
+                        us.LARGE_DOWNLOADS,
                         ROW_NUMBER() OVER (ORDER BY p.USER_ID) as rn
                     FROM LKP_EDMS_USR_SECUR us
                     JOIN PEOPLE p ON us.USER_ID = p.SYSTEM_ID
@@ -87,6 +87,7 @@ async def get_all_edms_users(search: str = "", page: int = 1, limit: int = 20):
                     'theme': row[8] or 'light',
                     'remaining_quota': row[9],
                     'quota': row[10],
+                    'LARGE_DOWNLOADS': row[11] == '1' if row[11] is not None else False,
                 })
     except oracledb.Error as e:
         logging.error(f"Oracle Database error in get_all_edms_users: {e}", exc_info=True)
@@ -129,7 +130,7 @@ async def get_security_levels():
     return levels
 
 
-async def add_edms_user(user_system_id: int, security_level_id: int, lang: str = 'en', theme: str = 'light', quota: int = 1073741824):
+async def add_edms_user(user_system_id: int, security_level_id: int, lang: str = 'en', theme: str = 'light', quota: int = 1073741824, LARGE_DOWNLOADS: bool = False):
     """Adds a new user to LKP_EDMS_USR_SECUR table."""
     conn = await get_async_connection()
     if not conn:
@@ -147,15 +148,16 @@ async def add_edms_user(user_system_id: int, security_level_id: int, lang: str =
             
             # Insert new user
             insert_query = """
-                INSERT INTO LKP_EDMS_USR_SECUR (SYSTEM_ID, USER_ID, SECURITY_LEVEL_ID, LANG, THEME, DISABLED, SECTION)
-                VALUES ((SELECT NVL(MAX(SYSTEM_ID), 0) + 1 FROM LKP_EDMS_USR_SECUR), :user_id, :security_level_id, :lang, :theme, '0', '0000')
+                INSERT INTO LKP_EDMS_USR_SECUR (SYSTEM_ID, USER_ID, SECURITY_LEVEL_ID, LANG, THEME, DISABLED, SECTION, LARGE_DOWNLOADS)
+                VALUES ((SELECT NVL(MAX(SYSTEM_ID), 0) + 1 FROM LKP_EDMS_USR_SECUR), :user_id, :security_level_id, :lang, :theme, '0', '0000', :LARGE_DOWNLOADS)
             """
             await cursor.execute(
                 insert_query,
                 user_id=user_system_id,
                 security_level_id=security_level_id,
                 lang=lang,
-                theme=theme
+                theme=theme,
+                LARGE_DOWNLOADS='1' if LARGE_DOWNLOADS else '0'
             )
             
             # Get the newly created EDMS User ID
@@ -209,7 +211,7 @@ async def delete_edms_user(edms_user_id: int):
             await conn.close()
 
 
-async def update_edms_user(edms_user_id: int, security_level_id: int, lang: str = 'en', theme: str = 'light', remaining_quota: int = None, quota: int = None):
+async def update_edms_user(edms_user_id: int, security_level_id: int, lang: str = 'en', theme: str = 'light', remaining_quota: int = None, quota: int = None, LARGE_DOWNLOADS: bool = None):
     """Updates an existing user in LKP_EDMS_USR_SECUR table."""
     conn = await get_async_connection()
     if not conn:
@@ -217,20 +219,28 @@ async def update_edms_user(edms_user_id: int, security_level_id: int, lang: str 
 
     try:
         async with conn.cursor() as cursor:
-            update_query = """
+            update_fields = [
+                "SECURITY_LEVEL_ID = :security_level_id",
+                "LANG = :lang",
+                "THEME = :theme"
+            ]
+            params = {
+                "security_level_id": security_level_id,
+                "lang": lang,
+                "theme": theme,
+                "edms_user_id": edms_user_id
+            }
+
+            if LARGE_DOWNLOADS is not None:
+                update_fields.append("LARGE_DOWNLOADS = :LARGE_DOWNLOADS")
+                params["LARGE_DOWNLOADS"] = '1' if LARGE_DOWNLOADS else '0'
+
+            update_query = f"""
                 UPDATE LKP_EDMS_USR_SECUR 
-                SET SECURITY_LEVEL_ID = :security_level_id,
-                    LANG = :lang,
-                    THEME = :theme
+                SET {', '.join(update_fields)}
                 WHERE SYSTEM_ID = :edms_user_id
             """
-            await cursor.execute(
-                update_query,
-                security_level_id=security_level_id,
-                lang=lang,
-                theme=theme,
-                edms_user_id=edms_user_id
-            )
+            await cursor.execute(update_query, params)
             
             if cursor.rowcount == 0:
                 return False, "User not found"

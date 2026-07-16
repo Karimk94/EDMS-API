@@ -4,6 +4,7 @@ from pydantic import BaseModel
 import logging
 import wsdl_client
 from database import admin as admin_db
+from database import documents as documents_db
 from database import tab_permissions as tab_perms_db
 from schemas.auth import EdmsUserResponse, AddEdmsUserRequest, SecurityLevelResponse, PeopleSearchResult, UpdateEdmsUserRequest
 from services.processing_queue import processing_queue, set_worker_paused, is_worker_paused, request_worker_drain, get_worker_mode, set_worker_mode
@@ -130,9 +131,18 @@ async def check_access(request: Request):
 
 @router.get("/api/admin/history/{docnumber}")
 async def get_document_history(request: Request, docnumber: int):
-    """Get activity history for a specific document/folder. Requires admin access."""
-    if not check_admin_access(request):
-        raise HTTPException(status_code=403, detail="Access denied. Admin privileges required.")
+    """Get activity history for a specific document/folder. Requires admin or owner access."""
+    user = request.session.get('user')
+    if not user:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+        
+    is_admin = check_admin_access(request)
+    
+    if not is_admin:
+        doc = await documents_db.get_document_by_id(docnumber)
+        username = user.get('username')
+        if not doc or doc.get('author') != username:
+            raise HTTPException(status_code=403, detail="Access denied. Admin or owner privileges required.")
     
     history = await admin_db.get_document_history(docnumber)
     return {"history": history}

@@ -17,7 +17,7 @@ async def api_get_image(doc_id: int, user=Depends(get_current_user)):
     if not dst:
         raise HTTPException(status_code=500, detail='DMS login failed.')
 
-    image_data, _ = await db_connector.get_media_content_from_dms_async(dst, doc_id)
+    image_data = await db_connector.get_media_content_from_dms_async(dst, doc_id)
     if image_data:
         return Response(content=bytes(image_data), media_type='image/jpeg')
     raise HTTPException(status_code=404, detail='Image not found in EDMS.')
@@ -28,7 +28,7 @@ async def api_get_pdf(doc_id: int, user=Depends(get_current_user)):
     if not dst:
         raise HTTPException(status_code=500, detail='DMS login failed.')
 
-    pdf_data, _ = await db_connector.get_media_content_from_dms_async(dst, doc_id)
+    pdf_data = await db_connector.get_media_content_from_dms_async(dst, doc_id)
     if pdf_data:
         return Response(content=bytes(pdf_data), media_type='application/pdf')
     raise HTTPException(status_code=404, detail='PDF not found in EDMS.')
