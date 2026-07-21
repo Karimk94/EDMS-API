@@ -245,6 +245,7 @@ async def login(request: Request, creds: LoginRequest):
 
         user_details = {
             'username': creds.username,
+            'full_name': db_prefs.get('full_name') if db_prefs else creds.username,
             'token': dst,
             'security_level': security_str,
             'dms_security_level': security_level,  # Numeric for logic

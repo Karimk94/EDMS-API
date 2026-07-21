@@ -61,17 +61,19 @@ async def get_user_details(username):
                 query = """
                     SELECT sl.NAME, us.LANG, us.THEME, us.VIEW_MODE, us.LARGE_DOWNLOADS,
                            COALESCE(ud.QUOTA, 1073741824), 
-                           COALESCE(ud.REMAINING_QUOTA, COALESCE(ud.QUOTA, 1073741824))
+                           COALESCE(ud.REMAINING_QUOTA, COALESCE(ud.QUOTA, 1073741824)),
+                           p.FULL_NAME
                     FROM LKP_EDMS_USR_SECUR us
                     JOIN LKP_EDMS_SECURITY sl ON us.SECURITY_LEVEL_ID = sl.SYSTEM_ID
                     LEFT JOIN LKP_EDMS_USR_DATA ud ON us.SYSTEM_ID = ud.USER_ID
+                    JOIN PEOPLE p ON us.USER_ID = p.SYSTEM_ID
                     WHERE us.USER_ID = :user_id
                 """
                 await cursor.execute(query, user_id=user_id)
                 details_result = await cursor.fetchone()
 
                 if details_result:
-                    security_level, lang, theme, view_mode, LARGE_DOWNLOADS, quota, remaining_quota = details_result
+                    security_level, lang, theme, view_mode, LARGE_DOWNLOADS, quota, remaining_quota, full_name = details_result
                     # Also fetch the security_level_id for tab permissions lookup
                     await cursor.execute(
                         "SELECT SECURITY_LEVEL_ID FROM LKP_EDMS_USR_SECUR WHERE USER_ID = :user_id",
@@ -82,6 +84,7 @@ async def get_user_details(username):
 
                     user_details = {
                         'username': username,
+                        'full_name': full_name,
                         'people_system_id': user_id,
                         'security_level': security_level,
                         'security_level_id': security_level_id,
