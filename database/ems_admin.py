@@ -617,7 +617,7 @@ async def get_departments_by_agency(agency_system_id: int):
     try:
         async with conn.cursor() as cursor:
             query = """
-                SELECT DEPTID, AGENCYID, NAME, SHORT
+                SELECT DEPTID, SYSTEM_ID, AGENCYID, NAME, SHORT
                 FROM LKP_DEPT
                 WHERE AGENCYID = :agency_system_id AND DISABLED = 'N'
                 ORDER BY NAME
@@ -627,10 +627,11 @@ async def get_departments_by_agency(agency_system_id: int):
             
             for row in rows:
                 departments.append({
-                    'DEPTID': row[0],
-                    'SYSTEM_ID': row[1],
-                    'NAME': row[2],
-                    'SHORT': row[3]
+                    'DEPTID': row[0],     # e.g. "D0001" (string code)
+                    'SYSTEM_ID': row[1],  # integer PK — this is what LKP_SECTION.DEPTID stores
+                    'AGENCYID': row[2],
+                    'NAME': row[3],
+                    'SHORT': row[4]
                 })
     except oracledb.Error as ex:
         error, = ex.args
@@ -725,7 +726,7 @@ async def get_ems_sections(dept_system_id: int = None, name: str = "", page: int
     }
 
 
-async def is_ems_section_duplicate_under_department(name: str, dept_system_id: int) -> bool:
+async def is_ems_section_duplicate_under_department(name: str, ems_sec_id: int) -> bool:
     """Check if an EMS section name already exists under the given department."""
     conn = await get_async_connection()
     if not conn:
@@ -734,8 +735,8 @@ async def is_ems_section_duplicate_under_department(name: str, dept_system_id: i
     try:
         async with conn.cursor() as cursor:
             await cursor.execute(
-                "SELECT COUNT(*) FROM LKP_SECTION WHERE DEPTID = :dept_system_id AND UPPER(NAME) = UPPER(:name)",
-                dept_system_id=dept_system_id,
+                "SELECT COUNT(*) FROM LKP_SECTION WHERE SECID = :ems_sec_id AND UPPER(NAME) = UPPER(:name)",
+                ems_sec_id=ems_sec_id,
                 name=name
             )
             result = await cursor.fetchone()
@@ -749,10 +750,10 @@ async def is_ems_section_duplicate_under_department(name: str, dept_system_id: i
             await conn.close()
 
 
-async def add_ems_section(name: str, translation: str, dept_system_id: int):
+async def add_ems_section(name: str, translation: str, ems_code: str, dept_system_id: int):
     """Add a new EMS section within a department. Checks for duplicate name within the department first."""
     # Check for duplicate name within the same department
-    if await is_ems_section_duplicate_under_department(name, dept_system_id):
+    if await is_ems_section_duplicate_under_department(name, ems_code):
         return False, f'Section name "{name}" already exists under this department. Please choose a different name.'
     
     conn = await get_async_connection()
@@ -761,9 +762,9 @@ async def add_ems_section(name: str, translation: str, dept_system_id: int):
 
     try:
         # Generate new SECID (numeric string)
-        new_secid = await get_next_secid()
-        if not new_secid:
-            return False, "Failed to generate SECID"
+        # new_secid = await get_next_secid()
+        # if not new_secid:
+        #     return False, "Failed to generate SECID"
         
         # Generate new SYSTEM_ID from sequence
         new_system_id = await get_next_system_id_sequence()
@@ -774,11 +775,11 @@ async def add_ems_section(name: str, translation: str, dept_system_id: int):
             # Final existence check within the same connection to prevent race conditions
             await cursor.execute(
                 "SELECT COUNT(*) FROM LKP_SECTION WHERE SECID = :secid",
-                secid=new_secid
+                secid=ems_code   
             )
             count_result = await cursor.fetchone()
             if count_result[0] > 0:
-                return False, f'SECID "{new_secid}" already exists in LKP_SECTION. Please try again.'
+                return False, f'SECID "{ems_code}" already exists in LKP_SECTION. Please try again.'
             
             query = """
                 INSERT INTO LKP_SECTION (SECID, SYSTEM_ID, NAME, TRANSLATION, DISABLED, DEPTID, LAST_UPDATE)
@@ -786,14 +787,14 @@ async def add_ems_section(name: str, translation: str, dept_system_id: int):
             """
             await cursor.execute(
                 query,
-                secid=new_secid,
+                secid=ems_code,
                 system_id=new_system_id,
                 name=name,
                 translation=translation,
                 parent_dept_system_id=dept_system_id
             )
             await conn.commit()
-            return True, f"EMS Section created with ID {new_secid}"
+            return True, f"EMS Section created with ID {ems_code}"
     except oracledb.Error as ex:
         error, = ex.args
         logging.error(f"Error adding EMS section: {error.message}")
@@ -803,20 +804,56 @@ async def add_ems_section(name: str, translation: str, dept_system_id: int):
             await conn.close()
 
 
-async def update_ems_section(system_id: int, name: str, translation: str, disabled: str, parent_dept_system_id: int):
-    """Update an existing EMS section by SYSTEM_ID."""
+async def update_ems_section(system_id: int, name: str, translation: str, disabled: str, parent_dept_system_id: int, new_ems_code: str = None):
+    """Update an existing EMS section by SYSTEM_ID. Optionally updates SECID if new_ems_code is provided."""
     conn = await get_async_connection()
     if not conn:
         return False, "Failed to connect to database"
 
     try:
         async with conn.cursor() as cursor:
-            query = """
-                UPDATE LKP_SECTION
-                SET NAME = :name, TRANSLATION = :translation, DISABLED = :disabled, LAST_UPDATE = SYSDATE, DEPTID = :parent_dept_system_id
-                WHERE SYSTEM_ID = :system_id
-            """
-            await cursor.execute(query, system_id=system_id, name=name, translation=translation, disabled=disabled, parent_dept_system_id=parent_dept_system_id)
+            # If a new EMS code is supplied, validate it first
+            if new_ems_code:
+                # Fetch the current SECID so we only check for duplicates when the code actually changed
+                await cursor.execute(
+                    "SELECT SECID FROM LKP_SECTION WHERE SYSTEM_ID = :system_id",
+                    system_id=system_id
+                )
+                current_row = await cursor.fetchone()
+                current_secid = current_row[0] if current_row else None
+
+                if new_ems_code != current_secid:
+                    # Check that the new code is not already taken by another record
+                    await cursor.execute(
+                        "SELECT COUNT(*) FROM LKP_SECTION WHERE SECID = :secid",
+                        secid=new_ems_code
+                    )
+                    dup_result = await cursor.fetchone()
+                    if dup_result[0] > 0:
+                        return False, f'EMS Code "{new_ems_code}" already exists. Please choose a different code.'
+
+                    query = """
+                        UPDATE LKP_SECTION
+                        SET SECID = :new_secid, NAME = :name, TRANSLATION = :translation, DISABLED = :disabled, LAST_UPDATE = SYSDATE, DEPTID = :parent_dept_system_id
+                        WHERE SYSTEM_ID = :system_id
+                    """
+                    await cursor.execute(query, system_id=system_id, new_secid=new_ems_code, name=name, translation=translation, disabled=disabled, parent_dept_system_id=parent_dept_system_id)
+                else:
+                    # Code unchanged — skip SECID update
+                    query = """
+                        UPDATE LKP_SECTION
+                        SET NAME = :name, TRANSLATION = :translation, DISABLED = :disabled, LAST_UPDATE = SYSDATE, DEPTID = :parent_dept_system_id
+                        WHERE SYSTEM_ID = :system_id
+                    """
+                    await cursor.execute(query, system_id=system_id, name=name, translation=translation, disabled=disabled, parent_dept_system_id=parent_dept_system_id)
+            else:
+                query = """
+                    UPDATE LKP_SECTION
+                    SET NAME = :name, TRANSLATION = :translation, DISABLED = :disabled, LAST_UPDATE = SYSDATE, DEPTID = :parent_dept_system_id
+                    WHERE SYSTEM_ID = :system_id
+                """
+                await cursor.execute(query, system_id=system_id, name=name, translation=translation, disabled=disabled, parent_dept_system_id=parent_dept_system_id)
+
             await conn.commit()
             return True, "EMS Section updated successfully"
     except oracledb.Error as ex:
@@ -826,3 +863,4 @@ async def update_ems_section(system_id: int, name: str, translation: str, disabl
     finally:
         if conn:
             await conn.close()
+

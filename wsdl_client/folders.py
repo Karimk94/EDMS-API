@@ -2,7 +2,7 @@ import logging
 from collections import deque
 from .base import get_soap_client, find_client_with_operation
 from .config import SMART_EDMS_ROOT_ID, DMS_USER
-from .utils import parse_binary_result_buffer
+from .utils import parse_dms_buffer, parse_binary_result_buffer
 from .documents import get_doc_version_info
 import os
 from zeep import Client, Settings, xsd
@@ -10,8 +10,91 @@ from zeep import Client, Settings, xsd
 IMAGE_EXTS = {'jpg', 'jpeg', 'png', 'gif', 'bmp', 'tif', 'tiff', 'webp', 'heic'}
 VIDEO_EXTS = {'mp4', 'mov', 'avi', 'mkv', 'wmv', 'flv', 'webm', '3gp'}
 PDF_LIKE_EXTS = {'pdf', 'doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx', 'txt'}
-FOLDER_TRAILING_SUFFIXES = (' D', ' N', ' F')
 IMAGE_VIDEO_TYPES = {'image', 'video'}
+
+# Column names matching the SOAP retProperties order for folder content queries
+FOLDER_CONTENT_COLUMNS = ['FI.DOCNUMBER', '%DISPLAY_NAME', 'FI.NODE_TYPE', 'DOCNAME',
+                          'APPLICATION', 'APP_ID', 'DOSEXTENSION']
+FOLDER_APPS = {'FOLDER', 'DEF_PROF', 'SAVED_SEARCHES', 'CONTENTSCOLLECTION'}
+
+
+def _parse_folder_buffer(container):
+    """
+    Parse a binary result buffer from a folder-content SOAP response using
+    the structured parse_dms_buffer (length-prefixed UTF-16-LE fields).
+
+    Falls back to the legacy heuristic parser if the structured parser
+    returns no results (e.g. unexpected binary format).
+
+    Returns a list of item dicts with keys: id, name, type, media_type,
+    node_type, is_standard.
+    """
+    if not hasattr(container, 'resultBuffer') or not container.resultBuffer:
+        return []
+
+    actual_rows = getattr(container, 'actualRows', None)
+    columns = getattr(container, 'columns', None)
+
+    # Strategy 1: Structured parsing (handles names with spaces correctly)
+    rows = parse_dms_buffer(
+        container.resultBuffer,
+        column_names=FOLDER_CONTENT_COLUMNS,
+        actual_rows=actual_rows,
+        actual_cols=columns or len(FOLDER_CONTENT_COLUMNS),
+    )
+
+    if rows:
+        return _convert_parsed_rows_to_items(rows)
+
+    # Strategy 2: Legacy heuristic fallback
+    return parse_binary_result_buffer(container.resultBuffer)
+
+
+def _convert_parsed_rows_to_items(rows):
+    """
+    Convert structured rows (dicts keyed by column name) into the item
+    format expected by list_folder_contents / get_recursive_doc_ids.
+    """
+    items = []
+    for row in rows:
+        doc_number = (row.get('FI.DOCNUMBER') or row.get('col0') or '').strip()
+        display_name = (row.get('%DISPLAY_NAME') or row.get('col1') or '').strip()
+        node_type = (row.get('FI.NODE_TYPE') or row.get('col2') or '').strip()
+        application = (row.get('APPLICATION') or row.get('col4') or '').strip()
+        dos_extension = (row.get('DOSEXTENSION') or row.get('col6') or '').strip().lower().replace('.', '')
+
+        if not doc_number:
+            continue
+
+        # Fall back to DOCNAME if display name is empty
+        if not display_name:
+            display_name = (row.get('DOCNAME') or row.get('col3') or 'Untitled').strip()
+
+        is_folder = (node_type == 'F' or application.upper() in FOLDER_APPS)
+        item_type = 'folder' if is_folder else 'file'
+
+        if is_folder:
+            media_type = 'folder'
+        else:
+            media_type = 'resolve'
+            # Quick-resolve from DOSEXTENSION if available
+            if dos_extension:
+                if dos_extension in IMAGE_EXTS:
+                    media_type = 'image'
+                elif dos_extension in VIDEO_EXTS:
+                    media_type = 'video'
+                elif dos_extension in PDF_LIKE_EXTS:
+                    media_type = 'pdf'
+
+        items.append({
+            'id': str(doc_number),
+            'name': display_name,
+            'type': item_type,
+            'media_type': media_type,
+            'node_type': node_type or ('F' if is_folder else 'N'),
+            'is_standard': False,
+        })
+    return items
 
 def create_dms_folder(dst, folder_name, description="", parent_id=None, user_id=None):
     target_parent_id = parent_id if parent_id and str(parent_id).strip() else SMART_EDMS_ROOT_ID
@@ -195,11 +278,10 @@ async def get_recursive_doc_ids(dst, media_type_filter=None, search_term=None, s
 
                 if not items_batch and hasattr(data_reply, 'resultSetData') and data_reply.resultSetData:
                     container = data_reply.resultSetData
-                    if hasattr(container, 'resultBuffer') and container.resultBuffer:
-                        parsed = parse_binary_result_buffer(container.resultBuffer)
-                        if parsed:
-                            has_data = True
-                            items_batch.extend(parsed)
+                    parsed = _parse_folder_buffer(container)
+                    if parsed:
+                        has_data = True
+                        items_batch.extend(parsed)
 
                 if not has_data or not items_batch: break
 
@@ -396,15 +478,14 @@ async def list_folder_contents(dst, parent_id=None, app_source=None, scope=None,
 
         if hasattr(data_reply, 'resultSetData') and data_reply.resultSetData:
             container = data_reply.resultSetData
-            if hasattr(container, 'resultBuffer') and container.resultBuffer:
-                parsed_items = parse_binary_result_buffer(container.resultBuffer)
-                if parsed_items:
-                    items.extend(parsed_items)
-                    try:
-                        search_client.service.ReleaseData(call={'resultSetID': result_set_id})
-                        search_client.service.ReleaseObject(call={'objectID': result_set_id})
-                    except:
-                        pass
+            parsed_items = _parse_folder_buffer(container)
+            if parsed_items:
+                items.extend(parsed_items)
+                try:
+                    search_client.service.ReleaseData(call={'resultSetID': result_set_id})
+                    search_client.service.ReleaseObject(call={'objectID': result_set_id})
+                except:
+                    pass
 
         if not items:
             row_nodes = None
@@ -424,8 +505,7 @@ async def list_folder_contents(dst, parent_id=None, app_source=None, scope=None,
                         node_type = props[2]
                         is_folder = (node_type == 'F')
                         media_type_item = 'folder' if is_folder else 'resolve'
-                        if name_str.endswith(FOLDER_TRAILING_SUFFIXES):
-                            name_str = name_str[:-2]
+
                         items.append({'id': str(doc_id), 'name': name_str, 'type': 'folder' if is_folder else 'file',
                                       'media_type': media_type_item, 'node_type': str(node_type), 'is_standard': False})
                     except Exception:
@@ -631,14 +711,27 @@ async def delete_folder_contents(dst, folder_id, delete_root=True):
                 if hasattr(d_reply, 'resultSetData') and d_reply.resultSetData:
                     container = d_reply.resultSetData
                     if hasattr(container, 'resultBuffer') and container.resultBuffer:
-                        parsed = parse_binary_result_buffer(container.resultBuffer)
+                        version_columns = [
+                            'VERSION_ID', 'VERSION_LABEL', 'AUTHOR', 'TYPIST', 'COMMENTS',
+                            'LASTEDITDATE', 'LASTEDITTIME', 'VERSION', 'SUBVERSION',
+                            'STATUS', '%WHERE_READONLY', 'FILE_EXTENSION'
+                        ]
+                        actual_rows = getattr(container, 'actualRows', None)
+                        columns = getattr(container, 'columns', None)
+                        parsed = parse_dms_buffer(
+                            container.resultBuffer,
+                            column_names=version_columns,
+                            actual_rows=actual_rows,
+                            actual_cols=columns or len(version_columns),
+                        )
+                        if not parsed:
+                            # Fallback to legacy parser
+                            parsed = parse_binary_result_buffer(container.resultBuffer)
                         if parsed and isinstance(parsed, list) and len(parsed) > 0:
-                            # Assuming first item, and looking for VERSION_ID or first value
                             first_item = parsed[0]
                             if isinstance(first_item, dict):
                                 if 'VERSION_ID' in first_item:
                                     return first_item['VERSION_ID']
-                                # If dict but no VERSION_ID key, likely positional, take first value
                                 return list(first_item.values())[0]
 
                 # 2. Try XML RowNode

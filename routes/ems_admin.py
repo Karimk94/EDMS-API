@@ -331,12 +331,13 @@ async def add_ems_section_endpoint(request: Request, data: dict):
     try:
         name = data.get("name")
         translation = data.get("translation", "")
+        ems_code = data.get("ems_code")
         dept_system_id = data.get("dept_system_id")
         
-        if not name or not dept_system_id:
+        if not name or not ems_code:
             raise HTTPException(status_code=400, detail="Name and department are required")
         
-        success, message = await add_ems_section(name, translation, dept_system_id)
+        success, message = await add_ems_section(name, translation, ems_code, dept_system_id)
         
         if not success:
             return {"success": False, "error": message}
@@ -360,6 +361,7 @@ async def update_ems_section_endpoint(request: Request, data: dict):
     
     try:
         system_id = data.get("system_id")
+        new_ems_code = data.get("new_ems_code", "").strip().upper() if data.get("new_ems_code") else None
         name = data.get("name")
         translation = data.get("translation", "")
         disabled = data.get("disabled", "N")
@@ -368,7 +370,7 @@ async def update_ems_section_endpoint(request: Request, data: dict):
         if not system_id or not name or not parent_dept_system_id:
             raise HTTPException(status_code=400, detail="System ID, name, and department are required")
         
-        success, message = await update_ems_section(system_id, name, translation, disabled, parent_dept_system_id)
+        success, message = await update_ems_section(system_id, name, translation, disabled, parent_dept_system_id, new_ems_code)
         
         if not success:
             return {"success": False, "error": message}
