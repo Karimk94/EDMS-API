@@ -3,9 +3,6 @@ import logging
 from datetime import datetime
 from database.connection import get_async_connection
 
-# --- Constants ---
-SECTION_DEPTID = 8988  # Fixed DEPTID for companies/sections in LKP_SECTION
-
 # --- Helper Functions for ID Generation ---
 
 async def get_next_system_id_sequence():
@@ -207,7 +204,8 @@ async def get_agencies():
 # --- SECTIONS (Companies) ---
 
 async def get_sections(name: str = "", disabled: str = None, page: int = 1, per_page: int = 10):
-    """Get sections (companies) from LKP_SECTION with pagination and search. Only returns items from the last 2 days. Always filters by DEPTID for companies."""
+    """Get sections from LKP_SECTION with pagination and search. Only returns items from the last 2 days.
+    Joins with LKP_DEPT on DEPTID = LKP_DEPT.SYSTEM_ID to ensure DEPTID references a valid department."""
     conn = await get_async_connection()
     if not conn:
         return {"sections": [], "total_records": 0, "total_pages": 0, "current_page": 1, "per_page": per_page}
@@ -216,25 +214,30 @@ async def get_sections(name: str = "", disabled: str = None, page: int = 1, per_
     total = 0
     try:
         async with conn.cursor() as cursor:
-            # Build search condition - always filter by SECTION_DEPTID for companies
-            search_condition = f"AND DEPTID = :section_deptid"
-            params = {'section_deptid': SECTION_DEPTID}
+            # Build search condition - DEPTID is a FK to LKP_DEPT.SYSTEM_ID, enforced via INNER JOIN
+            search_condition = ""
+            params = {}
             
             if name.strip():
-                search_condition += " AND (UPPER(NAME) LIKE UPPER(:name) OR UPPER(SECID) LIKE UPPER(:name) OR UPPER(TRANSLATION) LIKE UPPER(:name))"
+                search_condition += " AND (UPPER(s.NAME) LIKE UPPER(:name) OR UPPER(s.SECID) LIKE UPPER(:name) OR UPPER(s.TRANSLATION) LIKE UPPER(:name))"
                 params['name'] = f"%{name}%"
             else:
-                search_condition += " AND LAST_UPDATE >= SYSDATE - 2"
+                search_condition += " AND s.LAST_UPDATE >= SYSDATE - 2"
             
             # Handle disabled filter - default is to show only enabled (DISABLED = 'N')
             if disabled == 'Y':
-                search_condition += " AND DISABLED = 'Y'"
+                search_condition += " AND s.DISABLED = 'Y'"
             else:
                 # Default: only show enabled sections
-                search_condition += " AND DISABLED = 'N'"
+                search_condition += " AND s.DISABLED = 'N'"
             
-            # Count total
-            count_query = f"SELECT COUNT(*) FROM LKP_SECTION WHERE 1=1 {search_condition}"
+            # Count total - INNER JOIN ensures DEPTID references a valid LKP_DEPT.SYSTEM_ID
+            count_query = f"""
+                SELECT COUNT(*) 
+                FROM LKP_SECTION s
+                INNER JOIN LKP_DEPT d ON s.DEPTID = d.SYSTEM_ID
+                WHERE 1=1 {search_condition}
+            """
             await cursor.execute(count_query, params)
             count_result = await cursor.fetchone()
             total = count_result[0] if count_result else 0
@@ -242,18 +245,21 @@ async def get_sections(name: str = "", disabled: str = None, page: int = 1, per_
             # Calculate offset
             offset = (page - 1) * per_page
             
-            # Fetch paginated results
+            # Fetch paginated results - join with LKP_DEPT to validate DEPTID = SYSTEM_ID
             data_query = f"""
                 SELECT * FROM (
                     SELECT 
-                        SECID,
-                        NAME,
-                        TRANSLATION,
-                        DISABLED,
-                        LAST_UPDATE,
-                        SYSTEM_ID,
-                        ROW_NUMBER() OVER (ORDER BY SECID ASC) as rn
-                    FROM LKP_SECTION
+                        s.SECID,
+                        s.NAME,
+                        s.TRANSLATION,
+                        s.DISABLED,
+                        s.LAST_UPDATE,
+                        s.SYSTEM_ID,
+                        s.DEPTID,
+                        d.NAME AS DEPT_NAME,
+                        ROW_NUMBER() OVER (ORDER BY s.SECID ASC) as rn
+                    FROM LKP_SECTION s
+                    INNER JOIN LKP_DEPT d ON s.DEPTID = d.SYSTEM_ID
                     WHERE 1=1 {search_condition}
                 )
                 WHERE rn > :offset AND rn <= :end_row
@@ -271,7 +277,9 @@ async def get_sections(name: str = "", disabled: str = None, page: int = 1, per_
                     'TRANSLATION': row[2],
                     'DISABLED': row[3],
                     'LAST_UPDATE': row[4],
-                    'SYSTEM_ID': row[5]
+                    'SYSTEM_ID': row[5],
+                    'DEPTID': row[6],
+                    'DEPT_NAME': row[7]
                 })
     except oracledb.Error as ex:
         error, = ex.args
@@ -290,8 +298,8 @@ async def get_sections(name: str = "", disabled: str = None, page: int = 1, per_
     }
 
 
-async def is_section_name_duplicate(name: str) -> bool:
-    """Check if a section (company) name already exists in LKP_SECTION under the companies DEPTID."""
+async def is_section_name_duplicate(name: str, dept_system_id: int) -> bool:
+    """Check if a section name already exists in LKP_SECTION under the given department (DEPTID = LKP_DEPT.SYSTEM_ID)."""
     conn = await get_async_connection()
     if not conn:
         return False
@@ -299,9 +307,9 @@ async def is_section_name_duplicate(name: str) -> bool:
     try:
         async with conn.cursor() as cursor:
             await cursor.execute(
-                "SELECT COUNT(*) FROM LKP_SECTION WHERE UPPER(NAME) = UPPER(:name) AND DEPTID = :deptid",
+                "SELECT COUNT(*) FROM LKP_SECTION WHERE UPPER(NAME) = UPPER(:name) AND DEPTID = :dept_system_id",
                 name=name,
-                deptid=SECTION_DEPTID
+                dept_system_id=dept_system_id
             )
             result = await cursor.fetchone()
             return result[0] > 0
@@ -314,11 +322,12 @@ async def is_section_name_duplicate(name: str) -> bool:
             await conn.close()
 
 
-async def add_section(name: str, translation: str):
-    """Add a new section (company) to LKP_SECTION. Checks for duplicate names first."""
+async def add_section(name: str, translation: str, dept_system_id: int):
+    """Add a new section to LKP_SECTION under the given department. Checks for duplicate names first.
+    DEPTID stores LKP_DEPT.SYSTEM_ID (the parent department's primary key)."""
     # Check for duplicate name before proceeding
-    if await is_section_name_duplicate(name):
-        return False, f'Company name "{name}" already exists. Please choose a different name.'
+    if await is_section_name_duplicate(name, dept_system_id):
+        return False, f'Section name "{name}" already exists under this department. Please choose a different name.'
     
     conn = await get_async_connection()
     if not conn:
@@ -347,7 +356,7 @@ async def add_section(name: str, translation: str):
             
             query = """
                 INSERT INTO LKP_SECTION (SECID, SYSTEM_ID, NAME, TRANSLATION, DISABLED, DEPTID, LAST_UPDATE)
-                VALUES (:secid, :system_id, :name, :translation, 'N', :deptid, SYSDATE)
+                VALUES (:secid, :system_id, :name, :translation, 'N', :dept_system_id, SYSDATE)
             """
             await cursor.execute(
                 query,
@@ -355,7 +364,7 @@ async def add_section(name: str, translation: str):
                 system_id=new_system_id,
                 name=name,
                 translation=translation,
-                deptid=SECTION_DEPTID
+                dept_system_id=dept_system_id
             )
             await conn.commit()
             return True, f"Section created with ID {new_secid}"

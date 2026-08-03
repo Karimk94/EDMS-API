@@ -140,11 +140,14 @@ async def add_section_endpoint(request: Request, data: dict):
     try:
         name = data.get("name")
         translation = data.get("translation", "")
+        dept_system_id = data.get("dept_system_id")
         
         if not name:
             raise HTTPException(status_code=400, detail="Section name is required")
+        if not dept_system_id:
+            raise HTTPException(status_code=400, detail="Department is required")
         
-        success, message = await add_section(name, translation)
+        success, message = await add_section(name, translation, dept_system_id)
         
         if not success:
             return {"success": False, "error": message}
