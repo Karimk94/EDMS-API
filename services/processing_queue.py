@@ -2,9 +2,10 @@ import asyncio
 import logging
 import os
 import sqlite3
+import time
 from threading import Lock
 from datetime import datetime, timedelta
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import db_connector
 from services.processor import process_document
@@ -55,6 +56,15 @@ class LocalProcessingQueue:
                     actor TEXT,
                     reason TEXT,
                     changed_at TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS worker_state (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
                 )
                 """
             )
@@ -353,12 +363,91 @@ class LocalProcessingQueue:
             "changed_at": str(row["changed_at"] or ""),
         }
 
+    def persist_worker_mode(self, mode: str) -> None:
+        """Persist the worker mode so manual pause/resume survives restarts."""
+        now_iso = datetime.utcnow().isoformat()
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO worker_state (key, value, updated_at) VALUES ('worker_mode', ?, ?)",
+                ((mode or "").strip().lower(), now_iso),
+            )
+            conn.commit()
+
+    def load_persisted_worker_mode(self) -> Optional[str]:
+        """Load the persisted worker mode, or None if not set."""
+        try:
+            with self._connect() as conn:
+                row = conn.execute(
+                    "SELECT value FROM worker_state WHERE key = 'worker_mode'"
+                ).fetchone()
+            return str(row["value"]).strip().lower() if row else None
+        except Exception:
+            return None
+
+    def recover_stale_in_progress_jobs(self, stale_after_seconds: Optional[int] = None) -> int:
+        """Requeue jobs stuck in 'in_progress' (e.g., after a crash/restart).
+
+        Only recovers jobs whose updated_at is older than the threshold so that
+        legitimately in-flight jobs are not disturbed.
+        """
+        if stale_after_seconds is None:
+            stale_after_seconds = DEFAULT_TASK_TIMEOUT_SECONDS + 60
+        cutoff_iso = (datetime.utcnow() - timedelta(seconds=max(1, int(stale_after_seconds)))).isoformat()
+        now_iso = datetime.utcnow().isoformat()
+        with self._connect() as conn:
+            updated = conn.execute(
+                """
+                UPDATE processing_jobs
+                SET status = 'queued',
+                    available_at = ?,
+                    updated_at = ?,
+                    last_error = 'Recovered: was stuck in_progress (restart/timeout)'
+                WHERE status = 'in_progress' AND updated_at <= ?
+                """,
+                (now_iso, now_iso, cutoff_iso),
+            ).rowcount
+            conn.commit()
+        return int(updated or 0)
+
 
 _queue_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "database", "processing_queue.sqlite3")
 processing_queue = LocalProcessingQueue(_queue_path)
 
 _worker_state_lock = Lock()
-_worker_mode = "paused"  # running | draining | paused
+
+
+def _resolve_initial_worker_mode() -> str:
+    """Determine the worker mode at startup.
+
+    Priority:
+      1. Persisted mode (so an admin's manual pause/resume survives restarts).
+      2. PROCESSING_WORKER_MODE env var.
+      3. Default "running" so queued documents are actually processed.
+
+    The previous hard-coded default of "paused" meant that every application
+    restart left the worker paused, silently stranding queued documents.
+    """
+    try:
+        persisted = processing_queue.load_persisted_worker_mode()
+        if persisted in ("running", "paused"):
+            return persisted
+        # 'draining' is transient; if we restarted mid-drain, resume normal work.
+    except Exception:
+        logging.exception("Failed to load persisted worker mode; falling back to env/default.")
+
+    env_mode = os.getenv("PROCESSING_WORKER_MODE", "running").strip().lower()
+    return "paused" if env_mode == "paused" else "running"
+
+
+def _persist_mode_safe(mode: str) -> None:
+    try:
+        processing_queue.persist_worker_mode(mode)
+    except Exception:
+        logging.exception(f"Failed to persist worker mode '{mode}'.")
+
+
+# running | draining | paused  (persisted across restarts; defaults to running)
+_worker_mode = _resolve_initial_worker_mode()
 
 
 def set_worker_paused(paused: bool) -> bool:
@@ -366,9 +455,11 @@ def set_worker_paused(paused: bool) -> bool:
     with _worker_state_lock:
         previous_mode = _worker_mode
         _worker_mode = "paused" if bool(paused) else "running"
-    if previous_mode != _worker_mode:
-        processing_queue.insert_worker_mode_audit(previous_mode, _worker_mode, actor="system", reason="worker pause toggle")
-    return _worker_mode == "paused"
+        new_mode = _worker_mode
+    _persist_mode_safe(new_mode)
+    if previous_mode != new_mode:
+        processing_queue.insert_worker_mode_audit(previous_mode, new_mode, actor="system", reason="worker pause toggle")
+    return new_mode == "paused"
 
 
 def request_worker_drain() -> str:
@@ -392,6 +483,10 @@ def set_worker_mode(new_mode: str, actor: str = "system", reason: str = "") -> s
         previous_mode = _worker_mode
         _worker_mode = normalized_mode
 
+    # Persist non-transient modes so the decision survives restarts.
+    if normalized_mode in ("running", "paused"):
+        _persist_mode_safe(normalized_mode)
+
     if previous_mode != _worker_mode:
         processing_queue.insert_worker_mode_audit(previous_mode, _worker_mode, actor=actor, reason=reason)
     return _worker_mode
@@ -408,9 +503,31 @@ def is_worker_paused() -> bool:
 
 async def processing_worker_loop(stop_event: asyncio.Event):
     """Continuously claims queued jobs and processes them with existing processor logic."""
+    # One-time startup recovery: requeue jobs stranded in 'in_progress' by a prior
+    # crash/restart so they are not stuck forever.
+    try:
+        recovered = processing_queue.recover_stale_in_progress_jobs()
+        if recovered:
+            logging.info(f"Startup recovery: requeued {recovered} stale in_progress job(s).")
+    except Exception:
+        logging.exception("Startup recovery of stale in_progress jobs failed.")
+
+    last_stale_sweep = time.monotonic()
+
     while not stop_event.is_set():
         try:
             mode = get_worker_mode()
+
+            # Periodic safety sweep: requeue any job stuck in_progress longer than
+            # the task timeout (guards against hard crashes while running).
+            if time.monotonic() - last_stale_sweep >= 60:
+                last_stale_sweep = time.monotonic()
+                try:
+                    swept = processing_queue.recover_stale_in_progress_jobs()
+                    if swept:
+                        logging.info(f"Recovered {swept} stale in_progress job(s) during sweep.")
+                except Exception:
+                    logging.exception("Periodic stale-job sweep failed.")
 
             if mode == "paused":
                 await asyncio.sleep(1)
@@ -469,11 +586,23 @@ async def processing_worker_loop(stop_event: asyncio.Event):
                     )
                     continue
 
-                await db_connector.update_document_processing_status(**result_data)
+                db_updated = await db_connector.update_document_processing_status(**result_data)
 
                 status = int(result_data.get("status", 2))
                 attempts = int(result_data.get("attempts", 0))
                 error = str(result_data.get("error", ""))
+
+                if not db_updated:
+                    # Oracle status write failed; requeue so the doc is not stranded
+                    # as 'pending' upstream while the local job is closed.
+                    logging.error(f"Oracle status update FAILED for docnumber {docnumber}; requeueing.")
+                    processing_queue.requeue_with_delay(
+                        docnumber,
+                        attempts=attempts,
+                        error="DB status update failed; will retry",
+                        delay_seconds=30
+                    )
+                    continue
 
                 if status == 3:
                     processing_queue.mark_completed(docnumber)

@@ -3,6 +3,9 @@ import logging
 from datetime import datetime
 from database.connection import get_async_connection
 
+# --- Constants ---
+SECTION_DEPTID = 8988  # Fixed DEPTID for companies/sections in LKP_SECTION
+
 # --- Helper Functions for ID Generation ---
 
 async def get_next_system_id_sequence():
@@ -298,8 +301,8 @@ async def get_sections(name: str = "", disabled: str = None, page: int = 1, per_
     }
 
 
-async def is_section_name_duplicate(name: str, dept_system_id: int) -> bool:
-    """Check if a section name already exists in LKP_SECTION under the given department (DEPTID = LKP_DEPT.SYSTEM_ID)."""
+async def is_section_name_duplicate(name: str) -> bool:
+    """Check if a section name already exists in LKP_SECTION under the fixed department (DEPTID = SECTION_DEPTID)."""
     conn = await get_async_connection()
     if not conn:
         return False
@@ -307,9 +310,9 @@ async def is_section_name_duplicate(name: str, dept_system_id: int) -> bool:
     try:
         async with conn.cursor() as cursor:
             await cursor.execute(
-                "SELECT COUNT(*) FROM LKP_SECTION WHERE UPPER(NAME) = UPPER(:name) AND DEPTID = :dept_system_id",
+                "SELECT COUNT(*) FROM LKP_SECTION WHERE UPPER(NAME) = UPPER(:name) AND DEPTID = :deptid",
                 name=name,
-                dept_system_id=dept_system_id
+                deptid=SECTION_DEPTID
             )
             result = await cursor.fetchone()
             return result[0] > 0
@@ -322,12 +325,11 @@ async def is_section_name_duplicate(name: str, dept_system_id: int) -> bool:
             await conn.close()
 
 
-async def add_section(name: str, translation: str, dept_system_id: int):
-    """Add a new section to LKP_SECTION under the given department. Checks for duplicate names first.
-    DEPTID stores LKP_DEPT.SYSTEM_ID (the parent department's primary key)."""
+async def add_section(name: str, translation: str):
+    """Add a new section to LKP_SECTION. Checks for duplicate names first."""
     # Check for duplicate name before proceeding
-    if await is_section_name_duplicate(name, dept_system_id):
-        return False, f'Section name "{name}" already exists under this department. Please choose a different name.'
+    if await is_section_name_duplicate(name):
+        return False, f'Company name "{name}" already exists. Please choose a different name.'
     
     conn = await get_async_connection()
     if not conn:
@@ -356,7 +358,7 @@ async def add_section(name: str, translation: str, dept_system_id: int):
             
             query = """
                 INSERT INTO LKP_SECTION (SECID, SYSTEM_ID, NAME, TRANSLATION, DISABLED, DEPTID, LAST_UPDATE)
-                VALUES (:secid, :system_id, :name, :translation, 'N', :dept_system_id, SYSDATE)
+                VALUES (:secid, :system_id, :name, :translation, 'N', :deptid, SYSDATE)
             """
             await cursor.execute(
                 query,
@@ -364,7 +366,7 @@ async def add_section(name: str, translation: str, dept_system_id: int):
                 system_id=new_system_id,
                 name=name,
                 translation=translation,
-                dept_system_id=dept_system_id
+                deptid=SECTION_DEPTID
             )
             await conn.commit()
             return True, f"Section created with ID {new_secid}"
@@ -404,8 +406,8 @@ async def update_section(system_id: str, name: str, translation: str, disabled: 
 
 # --- DEPARTMENTS ---
 
-async def get_departments(name: str = "", agency_id: int = None, page: int = 1, per_page: int = 10):
-    """Get departments from LKP_DEPT with pagination and search. Only returns items from the last 2 days."""
+async def get_departments(name: str = "", agency_id: int = None, page: int = 1, per_page: int = 10, fetch_all: bool = False):
+    """Get departments from LKP_DEPT with pagination and search. By default only returns items from the last 2 days unless fetch_all=True."""
     conn = await get_async_connection()
     if not conn:
         return {"departments": [], "total_records": 0, "total_pages": 0, "current_page": 1, "per_page": per_page}
@@ -421,7 +423,7 @@ async def get_departments(name: str = "", agency_id: int = None, page: int = 1, 
             if name.strip():
                 search_condition += " AND (UPPER(NAME) LIKE UPPER(:name) OR UPPER(SHORT) LIKE UPPER(:name) OR UPPER(TRANSLATION) LIKE UPPER(:name))"
                 params['name'] = f"%{name}%"
-            else:
+            elif not fetch_all:
                 search_condition += " AND LAST_UPDATE >= SYSDATE - 2"
             
             if agency_id is not None:

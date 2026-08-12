@@ -73,15 +73,21 @@ async def lifespan(app: FastAPI):
 
     cache_cleanup_task = asyncio.create_task(periodic_cache_cleanup())
     log_cleanup_task = asyncio.create_task(periodic_log_cleanup())
-    # Background processing is moved to a dedicated worker process.
-    # This keeps FastAPI request handling isolated from heavy queue work.
+    
+    # Import and run the background processing worker
+    from services.processing_queue import processing_worker_loop
+    worker_stop_event = asyncio.Event()
+    worker_task = asyncio.create_task(processing_worker_loop(worker_stop_event))
+    logging.info("Started background processing worker loop.")
 
     try:
         yield
     finally:
+        worker_stop_event.set()
         cache_cleanup_task.cancel()
         log_cleanup_task.cancel()
-        await asyncio.gather(cache_cleanup_task, log_cleanup_task, return_exceptions=True)
+        # Give worker a moment to shut down gracefully, then gather all
+        await asyncio.gather(worker_task, cache_cleanup_task, log_cleanup_task, return_exceptions=True)
 
 app = FastAPI(title="EDMS Middleware API", lifespan=lifespan)
 

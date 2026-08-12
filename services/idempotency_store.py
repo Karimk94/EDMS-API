@@ -120,6 +120,37 @@ class IdempotencyStore:
         except Exception as e:
             logging.error(f"Error deleting idempotency key {key}: {e}")
 
+    def mark_cancelled(self, key: str):
+        """
+        Flags an in-progress upload as cancelled.
+
+        This is stored in the shared SQLite database (rather than only in
+        process memory) so that a cancel request handled by one worker is
+        visible to the worker that is actually streaming the file to the DMS.
+        """
+        try:
+            with self._connect() as conn:
+                conn.execute(
+                    "UPDATE idempotency_keys SET status = 'CANCELLED' WHERE idempotency_key = ?",
+                    (key,)
+                )
+                conn.commit()
+        except Exception as e:
+            logging.error(f"Error marking idempotency key {key} cancelled: {e}")
+
+    def is_cancelled(self, key: str) -> bool:
+        """Return whether the given key has been flagged as cancelled."""
+        try:
+            with self._connect() as conn:
+                row = conn.execute(
+                    "SELECT status FROM idempotency_keys WHERE idempotency_key = ?",
+                    (key,)
+                ).fetchone()
+                return bool(row and row["status"] == "CANCELLED")
+        except Exception as e:
+            logging.error(f"Error checking cancelled idempotency key {key}: {e}")
+            return False
+
 # Global instance
 import db_connector
 

@@ -26,4 +26,5 @@ libs/
 wheels/
 packages/
 download_cache/
+diagrams/
 web.config

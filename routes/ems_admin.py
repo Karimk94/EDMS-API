@@ -140,14 +140,11 @@ async def add_section_endpoint(request: Request, data: dict):
     try:
         name = data.get("name")
         translation = data.get("translation", "")
-        dept_system_id = data.get("dept_system_id")
         
         if not name:
             raise HTTPException(status_code=400, detail="Section name is required")
-        if not dept_system_id:
-            raise HTTPException(status_code=400, detail="Department is required")
         
-        success, message = await add_section(name, translation, dept_system_id)
+        success, message = await add_section(name, translation)
         
         if not success:
             return {"success": False, "error": message}
@@ -202,14 +199,15 @@ async def get_departments_endpoint(
     name: str = "",
     agency_id: int = None,
     page: int = 1,
-    per_page: int = 10
+    per_page: int = 10,
+    fetch_all: bool = False
 ):
     """Get departments with pagination, search, and agency filter."""
     if not await check_admin_access(request):
         raise HTTPException(status_code=403, detail="Access denied")
     
     try:
-        result = await get_departments(name=name, agency_id=agency_id, page=page, per_page=per_page)
+        result = await get_departments(name=name, agency_id=agency_id, page=page, per_page=per_page, fetch_all=fetch_all)
         return {
             **result,
             "success": True

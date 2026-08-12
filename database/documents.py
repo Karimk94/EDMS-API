@@ -9,9 +9,23 @@ from database.media import (
     get_media_info_from_dms,
     get_media_content_from_dms,
     create_thumbnail,
-    thumbnail_cache_dir
+    thumbnail_cache_dir,
+    DOC_IMAGE_EXTS,
+    DOC_VIDEO_EXTS,
+    DOC_PDF_EXTS
 )
 import os
+
+# File extensions the AI processing pipeline can actually handle (images, videos, PDFs).
+# Office documents (xlsx, pptx, docx...), text files, archives, and any other
+# unsupported types must never be queued for AI tagging.
+PROCESSABLE_EXTS = (
+    DOC_IMAGE_EXTS
+    | DOC_VIDEO_EXTS
+    | DOC_PDF_EXTS
+    | {'m4v', 'mts', 'ts', '3g2'}  # extra video types handled via filename fallback
+)
+
 
 try:
     import vector_client
@@ -429,28 +443,63 @@ async def fetch_documents_from_oracle(page=1, page_size=20, search_term=None, da
             await conn.close()
     return documents, total_rows
 
-async def get_documents_to_process():
-    """Gets a batch of documents that need AI processing."""
-    conn = await get_async_connection()
-    if not conn: return []
+def _process_candidates_sql(join_column: str, select_clause: str, extra_clause: str = "") -> str:
+    """Builds the processing-candidates SQL restricted to AI-supported file types.
 
-    try:
-        async with conn.cursor() as cursor:
-            sql = """
-            SELECT p.docnumber, p.abstract,
-                   NVL(q.o_detected, 0) as o_detected,
-                   NVL(q.OCR, 0) as ocr,
-                   NVL(q.face, 0) as face,
-                   NVL(q.attempts, 0) as attempts
+    Joins APPS to resolve each document's extension and only allows extensions
+    the AI pipeline can process (images, videos, PDFs). This prevents office
+    files (xlsx, pptx, docx...), text files, archives, etc. from ever reaching
+    the TAGGING_QUEUE / processing queue.
+    """
+    ext_list = ",".join(f"'{ext}'" for ext in sorted(PROCESSABLE_EXTS))
+    return f"""
+            SELECT {select_clause}
             FROM PROFILE p
             LEFT JOIN TAGGING_QUEUE q ON p.docnumber = q.docnumber
+            LEFT JOIN APPS a ON p.APPLICATION = a.{join_column}
             WHERE p.form = :form_id
               AND p.docnumber >= 19677386 --19662092
               AND (q.STATUS <> 3 OR q.STATUS IS NULL)
               AND (q.ATTEMPTS <= 3 OR q.ATTEMPTS IS NULL)
-            FETCH FIRST 10 ROWS ONLY
+              AND TRIM(LOWER(REPLACE(a.DEFAULT_EXTENSION, '.', ''))) IN ({ext_list})
+            {extra_clause}
             """
-            await cursor.execute(sql, {'form_id': 2740})
+
+
+async def _execute_process_candidates_sql(cursor, select_clause: str, extra_clause: str = ""):
+    """Runs the candidates query, falling back to the APPLICATION join column
+    if the APPS table has no SYSTEM_ID column."""
+    try:
+        await cursor.execute(
+            _process_candidates_sql('SYSTEM_ID', select_clause, extra_clause),
+            {'form_id': 2740}
+        )
+    except oracledb.DatabaseError:
+        logging.warning("APPS.SYSTEM_ID join failed, falling back to APPS.APPLICATION column.")
+        await cursor.execute(
+            _process_candidates_sql('APPLICATION', select_clause, extra_clause),
+            {'form_id': 2740}
+        )
+
+
+async def get_documents_to_process():
+    """Gets a batch of documents that need AI processing.
+
+    Only file types supported by the AI pipeline (images, videos, PDFs) are
+    eligible; office documents and other unsupported types are excluded.
+    """
+    conn = await get_async_connection()
+    if not conn: return []
+
+    select_clause = """p.docnumber, p.abstract,
+                   NVL(q.o_detected, 0) as o_detected,
+                   NVL(q.OCR, 0) as ocr,
+                   NVL(q.face, 0) as face,
+                   NVL(q.attempts, 0) as attempts"""
+
+    try:
+        async with conn.cursor() as cursor:
+            await _execute_process_candidates_sql(cursor, select_clause, "FETCH FIRST 10 ROWS ONLY")
             columns = [col[0].lower() for col in cursor.description]
             rows = await cursor.fetchall()
             return [dict(zip(columns, row)) for row in rows]
@@ -459,24 +508,20 @@ async def get_documents_to_process():
             await conn.close()
 
 
+
 async def get_documents_to_process_count():
-    """Gets the total count of Oracle TAGGING_QUEUE candidates pending processing."""
+    """Gets the total count of Oracle TAGGING_QUEUE candidates pending processing.
+
+    Counts only file types supported by the AI pipeline (images, videos, PDFs),
+    matching the filter applied by get_documents_to_process().
+    """
     conn = await get_async_connection()
     if not conn:
         return 0
 
     try:
         async with conn.cursor() as cursor:
-            sql = """
-            SELECT COUNT(1)
-            FROM PROFILE p
-            LEFT JOIN TAGGING_QUEUE q ON p.docnumber = q.docnumber
-            WHERE p.form = :form_id
-              AND p.docnumber >= 19677386 --19662092
-              AND (q.STATUS <> 3 OR q.STATUS IS NULL)
-              AND (q.ATTEMPTS <= 3 OR q.ATTEMPTS IS NULL)
-            """
-            await cursor.execute(sql, {'form_id': 2740})
+            await _execute_process_candidates_sql(cursor, "COUNT(1)")
             row = await cursor.fetchone()
             return int(row[0] or 0) if row else 0
     except Exception as e:
@@ -486,13 +531,18 @@ async def get_documents_to_process_count():
         if conn:
             await conn.close()
 
+
 async def update_document_processing_status(docnumber, new_abstract, o_detected, ocr, face, status, error, transcript,
                                             attempts):
-    """Updates the processing status of a document in the database with robust transaction handling."""
+    """Updates the processing status of a document in the database with robust transaction handling.
+
+    Returns:
+        bool: True if the Oracle write was committed successfully, False otherwise.
+    """
     conn = await get_async_connection()
     if not conn:
         logging.error(f"DB_UPDATE_FAILURE: Could not get a database connection for docnumber {docnumber}.")
-        return
+        return False
 
     try:
         async with conn.cursor() as cursor:
@@ -526,6 +576,8 @@ async def update_document_processing_status(docnumber, new_abstract, o_detected,
                 except Exception as e:
                     logging.error(f"Failed to update vector index for doc_id {docnumber}: {e}", exc_info=True)
 
+        return True
+
     except oracledb.Error as e:
         logging.error(f"DB_UPDATE_ERROR: Oracle error while updating docnumber {docnumber}: {e}", exc_info=True)
         try:
@@ -533,6 +585,7 @@ async def update_document_processing_status(docnumber, new_abstract, o_detected,
         except oracledb.Error as rb_e:
             logging.error(f"DB_ROLLBACK_ERROR: Failed to rollback transaction for docnumber {docnumber}: {rb_e}",
                           exc_info=True)
+        return False
     finally:
         if conn:
             await conn.close()
