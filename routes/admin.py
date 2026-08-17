@@ -6,6 +6,7 @@ import wsdl_client
 from database import admin as admin_db
 from database import documents as documents_db
 from database import tab_permissions as tab_perms_db
+from database import login_logs as login_logs_db
 from schemas.auth import EdmsUserResponse, AddEdmsUserRequest, SecurityLevelResponse, PeopleSearchResult, UpdateEdmsUserRequest
 from services.processing_queue import processing_queue, set_worker_paused, is_worker_paused, request_worker_drain, get_worker_mode, set_worker_mode
 import db_connector
@@ -366,6 +367,50 @@ async def delete_tab_permission(request: Request, permission_id: int):
     if not success:
         raise HTTPException(status_code=400, detail=message)
     
+    return {"message": message}
+
+
+# --- Login History Endpoints ---
+
+@router.get("/api/admin/login-history")
+async def get_login_history(
+    request: Request,
+    search: str = Query(""),
+    page: int = Query(1, ge=1),
+    limit: int = Query(20, ge=1, le=100)
+):
+    """Get Smart EDMS login history. Requires admin access."""
+    if not check_admin_access(request):
+        raise HTTPException(status_code=403, detail="Access denied. Admin privileges required.")
+
+    result = await login_logs_db.get_login_history(search=search, page=page, limit=limit)
+    return result
+
+
+@router.get("/api/admin/active-sessions")
+async def get_active_sessions(request: Request):
+    """Get all currently active Smart EDMS sessions. Requires admin access."""
+    if not check_admin_access(request):
+        raise HTTPException(status_code=403, detail="Access denied. Admin privileges required.")
+
+    sessions = await login_logs_db.get_active_sessions()
+    return {"sessions": sessions}
+
+
+class TerminateSessionRequest(BaseModel):
+    session_id: str
+
+
+@router.post("/api/admin/active-sessions/terminate")
+async def terminate_session(request: Request, data: TerminateSessionRequest):
+    """Terminate an active session server-side. Requires admin access."""
+    if not check_admin_access(request):
+        raise HTTPException(status_code=403, detail="Access denied. Admin privileges required.")
+
+    success, message = await login_logs_db.terminate_session(data.session_id)
+    if not success:
+        raise HTTPException(status_code=400, detail=message)
+
     return {"message": message}
 
 

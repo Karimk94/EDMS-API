@@ -725,7 +725,8 @@ async def download_shared_document(
 async def download_shared_folder_zip(
         token: str,
         req: SharedDocumentDownloadRequest = Depends(),
-        part: Optional[int] = Query(None)
+        part: Optional[int] = Query(None),
+        folder_id: Optional[str] = Query(None)
 ):
     """
     Downloads a shared folder's contents as a ZIP archive.
@@ -733,6 +734,8 @@ async def download_shared_folder_zip(
     - Without `part`: returns a JSON manifest listing how many parts are available.
     - With `part=N`: returns the Nth partition as a ZIP file.
     For folders ≤ 500 MB, always returns a single ZIP (ignores `part`).
+
+    Optional `folder_id` parameter allows downloading a specific subfolder within the share.
     """
     try:
         viewer_email = req.viewer_email
@@ -758,27 +761,36 @@ async def download_shared_folder_zip(
 
         root_folder_id = str(share_info['folder_id'])
 
-        # 5. Login with system credentials
+        # 5. Determine target folder (subfolder or root)
+        target_folder_id = root_folder_id
+        if folder_id and str(folder_id) != root_folder_id:
+            # Security check: verify the requested folder is within the shared hierarchy
+            is_subfolder = await folders_db.verify_folder_in_hierarchy(root_folder_id, str(folder_id))
+            if not is_subfolder:
+                raise HTTPException(status_code=403, detail="Access denied. Folder is outside shared scope.")
+            target_folder_id = str(folder_id)
+
+        # 6. Login with system credentials
         dst = await run_in_threadpool(wsdl_client.dms_system_login)
         if not dst:
             raise HTTPException(status_code=500, detail="Failed to authenticate with DMS")
 
-        # 6. Get folder name
+        # 7. Get folder name for the target folder
         try:
-            root_info = await folders_db.get_folder_by_docnumber(root_folder_id)
-            root_name = root_info['name'] if root_info else f"Folder_{root_folder_id}"
+            target_info = await folders_db.get_folder_by_docnumber(target_folder_id)
+            target_name = target_info['name'] if target_info else f"Folder_{target_folder_id}"
         except Exception:
-            root_name = f"Folder_{root_folder_id}"
+            target_name = f"Folder_{target_folder_id}"
 
-        # 7. Collect direct files from the root shared folder
+        # 8. Collect all files recursively from the target folder (including subfolders)
         try:
-            direct_files = await folders_db.get_folder_files(root_folder_id)
+            all_files = await folders_db.get_folder_files_recursive(target_folder_id)
         except Exception as e:
-            logging.error(f"Failed to list files in shared folder {root_folder_id}: {e}")
+            logging.error(f"Failed to list files in shared folder {target_folder_id}: {e}")
             raise HTTPException(status_code=500, detail='Failed to list folder contents')
 
         file_entries: list[tuple[str, str]] = [
-            (f['id'], f['name']) for f in direct_files
+            (f['id'], f['archive_path']) for f in all_files
         ]
 
         if not file_entries:
@@ -819,7 +831,7 @@ async def download_shared_folder_zip(
                 detail='Not allowed to download the folder because it is bigger than 1 GB. If you want to enable this feature, contact the system administrator.'
             )
 
-        safe_name = root_name.replace('"', '').replace('/', '_').replace('\\', '_') or root_folder_id
+        safe_name = target_name.replace('"', '').replace('/', '_').replace('\\', '_') or target_folder_id
 
         # --- Single ZIP (total ≤ 500 MB) ---
         if total_bytes <= ZIP_PART_SIZE_LIMIT_BYTES:

@@ -14,6 +14,7 @@ from database.connection import ensure_performance_indexes
 
 # Import Routers
 from routes import auth, documents, media, tags, events, folders, favorites, memories, sharing, admin, edocs_admin, ems_admin, profilesearch, edms_people
+from middleware.session_validation import SessionValidationMiddleware
 from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 
@@ -141,6 +142,10 @@ app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 secret_key = os.getenv('FLASK_SECRET_KEY')
 if not secret_key:
     raise RuntimeError("FLASK_SECRET_KEY environment variable is not set. Cannot start without it.")
+
+# Session validation must run AFTER SessionMiddleware populates the session,
+# so register it BEFORE SessionMiddleware (SessionMiddleware becomes outer).
+app.add_middleware(SessionValidationMiddleware)
 
 app.add_middleware(
     SessionMiddleware,
