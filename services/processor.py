@@ -60,6 +60,9 @@ async def async_translate_text(text):
 async def async_tokenize_transcript(transcript):
     return await run_in_threadpool(api_client.tokenize_transcript, transcript)
 
+async def async_get_image_by_docnumber(dms_session_token, docnumber):
+    return await run_in_threadpool(wsdl_client.get_image_by_docnumber, dms_session_token, docnumber)
+
 async def process_document(doc, dms_session_token):
     docnumber = doc['docnumber']
     logging.info(f"Starting processing for document: {docnumber}")
@@ -78,8 +81,8 @@ async def process_document(doc, dms_session_token):
         "attempts": doc.get('attempts', 0) + 1
     }
     try:
-        # get_image_by_docnumber is still sync in wsdl_client because it doesn't hit DB
-        media_bytes, filename = wsdl_client.get_image_by_docnumber(dms_session_token, docnumber)
+        # get_image_by_docnumber is sync in wsdl_client, so offload it to the threadpool.
+        media_bytes, filename = await async_get_image_by_docnumber(dms_session_token, docnumber)
         if not media_bytes:
             raise Exception(f"Failed to retrieve media for docnumber {docnumber} from WSDL service.")
 

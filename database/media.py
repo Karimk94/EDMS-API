@@ -1,8 +1,10 @@
+import asyncio
 import os
 import io
 import shutil
 import logging
 import time
+import uuid
 import oracledb
 from datetime import datetime
 from PIL import Image
@@ -98,12 +100,24 @@ def dms_system_login():
     """Logs into the DMS SOAP service using system credentials."""
     return wsdl_client.dms_system_login()
 
+async def dms_system_login_async():
+    return await asyncio.to_thread(dms_system_login)
+
 def stream_document_from_dms(dst, doc_number):
     """
     Returns a generator that yields file content chunks and the filename.
     Returns: (generator, filename)
     """
     return wsdl_client.stream_document_content(dst, doc_number)
+
+async def stream_document_from_dms_async(dst, doc_number):
+    return await asyncio.to_thread(stream_document_from_dms, dst, doc_number)
+
+async def get_media_content_from_dms_async(dst, doc_number):
+    return await asyncio.to_thread(get_media_content_from_dms, dst, doc_number)
+
+async def get_dms_stream_details_async(dst, doc_number):
+    return await asyncio.to_thread(get_dms_stream_details, dst, doc_number)
 
 def get_exif_date(image_stream):
     """Extracts the 'Date Taken' from image EXIF data."""
@@ -273,6 +287,12 @@ def get_media_content_from_dms(dst, doc_number):
 def get_dms_stream_details(dst, doc_number):
     return wsdl_client.get_dms_stream_details(dst, doc_number)
 
+async def get_dms_stream_details_async(dst, doc_number):
+    return await asyncio.to_thread(get_dms_stream_details, dst, doc_number)
+
+async def cache_document_stream_to_file_async(dst, doc_number, final_cache_path):
+    return await asyncio.to_thread(cache_document_stream_to_file, dst, doc_number, final_cache_path)
+
 def get_download_cache_path(doc_number, file_ext):
     normalized_ext = file_ext or ''
     if normalized_ext and not normalized_ext.startswith('.'):
@@ -281,7 +301,7 @@ def get_download_cache_path(doc_number, file_ext):
 
 def stream_and_cache_generator(obj_client, stream_id, content_id, final_cache_path):
     """Generator for streaming data."""
-    temp_cache_path = final_cache_path + ".tmp"
+    temp_cache_path = final_cache_path + f".{uuid.uuid4().hex}.tmp"
     try:
         with open(temp_cache_path, "wb") as f:
             while True:
@@ -291,7 +311,7 @@ def stream_and_cache_generator(obj_client, stream_id, content_id, final_cache_pa
                 if not chunk_data: break
                 f.write(chunk_data)
                 yield chunk_data
-        os.rename(temp_cache_path, final_cache_path)
+        os.replace(temp_cache_path, final_cache_path)
     except Exception as e:
         logging.error(f"Error streaming: {e}")
     finally:
@@ -300,7 +320,11 @@ def stream_and_cache_generator(obj_client, stream_id, content_id, final_cache_pa
             if content_id: obj_client.service.ReleaseObject(call={'objectID': content_id})
         except:
             pass
-        if os.path.exists(temp_cache_path): os.remove(temp_cache_path)
+        if os.path.exists(temp_cache_path): 
+            try:
+                os.remove(temp_cache_path)
+            except OSError:
+                pass
 
 def cache_document_stream_to_file(dst, doc_number, final_cache_path):
     """Streams a document from DMS into a local cache file without buffering it in memory."""
@@ -521,3 +545,53 @@ async def resolve_media_types_from_db(doc_ids):
     finally:
         if conn: conn.close()
     return resolved_map
+
+async def get_metadata_for_docs(doc_ids):
+    """Queries the database to fetch metadata (size, date) for documents."""
+    if not doc_ids: return {}
+
+    conn = get_connection()
+    if not conn: return {}
+
+    metadata_map = {}
+    try:
+        with conn.cursor() as cursor:
+            valid_doc_ids = []
+            for did in doc_ids:
+                try:
+                    valid_doc_ids.append(int(did))
+                except Exception:
+                    continue
+
+            if not valid_doc_ids:
+                return {}
+
+            for start in range(0, len(valid_doc_ids), 1000): # Hardcoding limit here for safety
+                chunk = valid_doc_ids[start:start + 1000]
+                bind_names = [f"id{i}" for i in range(len(chunk))]
+                in_clause = ",".join(f":{name}" for name in bind_names)
+                bind_params = {name: value for name, value in zip(bind_names, chunk)}
+
+                sql = f"""
+                    SELECT p.DOCNUMBER, TO_CHAR(p.CREATION_DATE, 'YYYY-MM-DD"T"HH24:MI:SS"Z"')
+                    FROM PROFILE p
+                    WHERE p.DOCNUMBER IN ({in_clause})
+                """
+
+                try:
+                    cursor.execute(sql, bind_params)
+                    rows = cursor.fetchall()
+                    for doc_id, c_date in rows:
+                        metadata_map[str(doc_id)] = {
+                            'date': c_date,
+                            'size': 0
+                        }
+                except Exception as e:
+                    logging.error(f"Error executing metadata query: {e}")
+
+    except Exception as e:
+        logging.error(f"Error fetching document metadata: {e}")
+    finally:
+        if conn: conn.close()
+        
+    return metadata_map

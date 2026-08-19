@@ -1,11 +1,13 @@
 from database.connection import get_async_connection, get_connection, BLOCKLIST
 from database.media import (
-    dms_system_login, get_media_info_from_dms, get_media_content_from_dms,
-    stream_document_from_dms, get_dms_stream_details, stream_and_cache_generator,
-    cache_document_stream_to_file, get_download_cache_path,
+    dms_system_login, dms_system_login_async, get_media_info_from_dms, get_media_content_from_dms,
+    get_media_content_from_dms_async, stream_document_from_dms, stream_document_from_dms_async,
+    get_dms_stream_details, get_dms_stream_details_async, stream_and_cache_generator,
+    cache_document_stream_to_file, cache_document_stream_to_file_async, get_download_cache_path,
     create_thumbnail, clear_thumbnail_cache, clear_video_cache, get_media_type_counts,
     resolve_media_types_from_db, get_app_id_from_extension, get_exif_date,
-    thumbnail_cache_dir, video_cache_dir, temp_thumbnail_cache_dir, download_cache_dir
+    thumbnail_cache_dir, video_cache_dir, temp_thumbnail_cache_dir, download_cache_dir,
+    get_metadata_for_docs
 )
 from database.documents import (
     fetch_documents_from_oracle, get_documents_to_process,
@@ -22,7 +24,7 @@ from database.tags import (
 )
 from database.users import (
     get_user_security_level, get_user_details, update_user_language,
-    update_user_theme, get_user_system_id
+    update_user_theme, update_user_view_mode, get_user_system_id
 )
 from database.events import (
     get_events, create_event, link_document_to_event,

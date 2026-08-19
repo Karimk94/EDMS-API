@@ -1,12 +1,13 @@
-from fastapi import APIRouter, HTTPException, Request, Query, Depends
+from fastapi import APIRouter, HTTPException, Request, Query, Depends, Header
 from fastapi.responses import JSONResponse
 from starlette.concurrency import run_in_threadpool
 import asyncio
 import os
+import uuid
 import db_connector
 import wsdl_client
 from wsdl_client import users as wsdl_users
-from schemas.auth import LoginRequest, LangUpdateRequest, ThemeUpdateRequest, GroupMember, TrusteeResponse, Group
+from schemas.auth import LoginRequest, LangUpdateRequest, ThemeUpdateRequest, ViewModeUpdateRequest, GroupMember, TrusteeResponse, Group
 from typing import List
 from services import processor
 from utils.common import get_current_user, get_session_token
@@ -197,18 +198,38 @@ def _ensure_ems_admin_tab_permission(tab_permissions: list, is_ems_admin_group_m
 
 @router.post('/api/auth/login')
 @limiter.limit("255/minute")
-async def login(request: Request, creds: LoginRequest):
-    dst, error_msg = wsdl_client.dms_user_login(creds.username, creds.password)
+async def login(
+    request: Request,
+    creds: LoginRequest,
+    x_app_source: str = Header("unknown", alias="X-App-Source"),
+):
+    dst, error_msg = await run_in_threadpool(wsdl_client.dms_user_login, creds.username, creds.password)
     if dst:
         # Mandatory: Check if user exists in Smart EDMS local DB
         db_user = await db_connector.get_user_details(creds.username)
         if not db_user:
             raise HTTPException(status_code=403, detail="User doesn't have smart EDMS account")
 
+        # Generate a server-side session id and persist the session (best-effort,
+        # never block login). The same id is stored in the cookie session so the
+        # SessionValidationMiddleware can enforce termination.
+        session_id = str(uuid.uuid4())
+        try:
+            from database.login_logs import log_login
+            client_ip = request.client.host if request.client else None
+            await log_login(
+                people_system_id=db_user.get('people_system_id'),
+                session_id=session_id,
+                app_source=x_app_source,
+                ip_address=client_ip,
+            )
+        except Exception as login_log_err:
+            logging.warning(f"Could not log login for {creds.username}: {login_log_err}")
+
         # Get user's groups from DMS (proven working query)
         group_flags = {'is_ems_admin_group_member': False}
         try:
-            user_groups = wsdl_client.get_groups_for_user(dst, creds.username)
+            user_groups = await run_in_threadpool(wsdl_client.get_groups_for_user, dst, creds.username)
             # logging.info(f"User {creds.username} belongs to groups: {[g.get('group_id') for g in user_groups]}")
 
             group_flags = _extract_group_membership_flags(user_groups)
@@ -245,6 +266,7 @@ async def login(request: Request, creds: LoginRequest):
 
         user_details = {
             'username': creds.username,
+            'full_name': db_prefs.get('full_name') if db_prefs else creds.username,
             'token': dst,
             'security_level': security_str,
             'dms_security_level': security_level,  # Numeric for logic
@@ -254,16 +276,28 @@ async def login(request: Request, creds: LoginRequest):
             **group_flags,
         }
 
+        request.session['session_id'] = session_id
         request.session['user'] = user_details
 
         # Strip internal token before sending to client
         safe_user = {k: v for k, v in user_details.items() if k != 'token'}
+        safe_user['session_id'] = session_id
         return {"message": "Login successful", "user": safe_user}
     else:
         raise HTTPException(status_code=401, detail=error_msg or "Invalid DMS credentials")
 
 @router.post('/api/auth/logout')
 async def logout(request: Request):
+    session_id = request.session.get('session_id')
+
+    # Best-effort: mark this server-side session inactive before clearing cookie.
+    if session_id:
+        try:
+            from database.login_logs import mark_session_logout
+            await mark_session_logout(session_id)
+        except Exception as logout_log_err:
+            logging.warning(f"Could not mark session logout for {session_id}: {logout_log_err}")
+
     request.session.clear()
     return {"message": "Logout successful"}
 
@@ -304,6 +338,7 @@ async def get_user(request: Request):
 
             # Strip internal token before sending to client
             safe_user = {k: v for k, v in user_details.items() if k != 'token'}
+            safe_user['session_id'] = request.session.get('session_id')
             return {'user': safe_user}
         else:
             request.session.pop('user', None)
@@ -345,6 +380,24 @@ async def api_update_user_theme(request: Request, data: ThemeUpdateRequest):
         return {"message": "Theme updated"}
     else:
         raise HTTPException(status_code=500, detail="Failed to update theme")
+
+@router.put('/api/user/view-mode')
+async def api_update_user_view_mode(request: Request, data: ViewModeUpdateRequest):
+    user = request.session.get('user')
+    if not user:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    if data.view_mode not in ['grid', 'list']:
+        raise HTTPException(status_code=400, detail="Invalid view mode")
+
+    username = user['username']
+    success = await db_connector.update_user_view_mode(username, data.view_mode)
+    if success:
+        user['view_mode'] = data.view_mode
+        request.session['user'] = user
+        return {"message": "View mode updated"}
+    else:
+        raise HTTPException(status_code=500, detail="Failed to update view mode")
 
 # --- Groups & Security Endpoints (Updated to use Session) ---
 

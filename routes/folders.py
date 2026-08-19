@@ -4,7 +4,8 @@ import os
 import zipfile
 
 from fastapi import APIRouter, Request, HTTPException, Header, Depends
-from fastapi.responses import StreamingResponse
+from fastapi.concurrency import run_in_threadpool
+from fastapi.responses import StreamingResponse, JSONResponse
 from typing import Optional
 import wsdl_client
 from schemas.folders import CreateFolderRequest, RenameFolderRequest, MoveItemsRequest
@@ -12,7 +13,8 @@ from utils.common import get_current_user, build_content_disposition
 from database import user_data, folders as db_folders
 import db_connector
 
-ZIP_SIZE_LIMIT_BYTES = 300 * 1024 * 1024  # 300 MB
+ZIP_PART_SIZE_LIMIT_BYTES = 500 * 1024 * 1024  # 500 MB per partition
+ZIP_TOTAL_SIZE_LIMIT_BYTES = 1 * 1024 * 1024 * 1024  # 1 GB total limit unless bypassed
 
 router = APIRouter()
 
@@ -28,13 +30,13 @@ async def _resolve_edms_user_id(username):
         logging.warning(f"Could not resolve EDMS user ID for {username}: {e}")
     return None
 
-def _get_file_size_from_dms(dst, doc_number):
+async def _get_file_size_from_dms(dst, doc_number):
     """
     Gets the file size of a document from the DMS by reading its content.
     Returns the size in bytes, or 0 if the size cannot be determined.
     """
     try:
-        content_bytes = db_connector.get_media_content_from_dms(dst, doc_number)
+        content_bytes = await db_connector.get_media_content_from_dms_async(dst, doc_number)
         if content_bytes:
             return len(content_bytes)
     except Exception as e:
@@ -53,7 +55,7 @@ async def _get_folder_direct_file_size_sum(dst, folder_id):
         for file_item in folder_files:
             file_id = file_item.get('id')
             if file_id:
-                total_size += _get_file_size_from_dms(dst, file_id)
+                total_size += await _get_file_size_from_dms(dst, file_id)
     except Exception as e:
         logging.warning(f"Could not calculate direct file size sum for folder {folder_id}: {e}")
 
@@ -75,7 +77,7 @@ async def api_list_folders(
     # Get the current logged-in user's username for permission filtering
     username = user.get('username')
 
-    dst = wsdl_client.dms_system_login()
+    dst = await run_in_threadpool(wsdl_client.dms_system_login)
     if not dst:
         raise HTTPException(status_code=500, detail="Failed to authenticate with DMS")
 
@@ -96,25 +98,26 @@ async def api_create_folder(request: Request, data: CreateFolderRequest, user=De
     if not parent_id or str(parent_id).strip() == "":
         parent_id = None
 
-    dst = wsdl_client.dms_system_login()
+    dst = await run_in_threadpool(wsdl_client.dms_system_login)
     if not dst:
         raise HTTPException(status_code=500, detail="Failed to authenticate")
 
     try:
         # wsdl_client.create_dms_folder is synchronous (SOAP only), so no await needed
-        new_folder_id = wsdl_client.create_dms_folder(
-            dst=dst,
-            folder_name=data.name,
-            description=data.description,
-            parent_id=parent_id,
-            user_id=username
+        new_folder_id = await run_in_threadpool(
+            wsdl_client.create_dms_folder,
+            dst,
+            data.name,
+            data.description,
+            parent_id,
+            username
         )
         if new_folder_id:
             # Build trustee list: start from parent folder's trustees then add/ensure creator
             trustees = []
             if parent_id:
                 try:
-                    parent_trustees = wsdl_client.get_object_trustees(dst, str(parent_id))
+                    parent_trustees = await run_in_threadpool(wsdl_client.get_object_trustees, dst, str(parent_id))
                     if parent_trustees:
                         trustees = list(parent_trustees)
                 except Exception as te:
@@ -128,12 +131,13 @@ async def api_create_folder(request: Request, data: CreateFolderRequest, user=De
             if not creator_in_list:
                 trustees.append({'username': username, 'rights': 255, 'flag': 2})
 
-            success, message = wsdl_client.set_trustees(
-                dst=dst,
-                doc_id=str(new_folder_id),
-                library='RTA_MAIN',
-                trustees=trustees,
-                security_enabled='1'
+            success, message = await run_in_threadpool(
+                wsdl_client.set_trustees,
+                dst,
+                str(new_folder_id),
+                'RTA_MAIN',
+                trustees,
+                '1'
             )
             if not success:
                 logging.warning(f"Failed to set security on folder {new_folder_id}: {message}")
@@ -148,7 +152,7 @@ async def api_create_folder(request: Request, data: CreateFolderRequest, user=De
 @router.put('/api/folders/{folder_id}')
 async def api_rename_folder(folder_id: str, request: Request, data: RenameFolderRequest, user=Depends(get_current_user)):
 
-    dst = wsdl_client.dms_system_login()
+    dst = await run_in_threadpool(wsdl_client.dms_system_login)
     if not dst:
         raise HTTPException(status_code=500, detail="Failed to authenticate")
 
@@ -156,7 +160,7 @@ async def api_rename_folder(folder_id: str, request: Request, data: RenameFolder
         if not hasattr(data, 'system_id') or not data.system_id:
             raise HTTPException(status_code=400, detail="system_id is required for renaming")
 
-        success = wsdl_client.rename_folder_display(dst, data.system_id, data.name)
+        success = await run_in_threadpool(wsdl_client.rename_folder_display, dst, data.system_id, data.name)
 
         if success:
             return {"message": "Renamed", "id": folder_id}
@@ -170,7 +174,7 @@ async def api_rename_folder(folder_id: str, request: Request, data: RenameFolder
 
 @router.delete('/api/folders/{folder_id}')
 async def api_delete_folder(folder_id: str, request: Request, force: bool = False, user=Depends(get_current_user)):
-    dst = wsdl_client.dms_system_login()
+    dst = await run_in_threadpool(wsdl_client.dms_system_login)
     if not dst:
         raise HTTPException(status_code=500, detail="Failed to authenticate")
 
@@ -193,20 +197,24 @@ async def api_delete_folder(folder_id: str, request: Request, force: bool = Fals
 
         bytes_freed = await _get_folder_direct_file_size_sum(dst, folder_id)
     else:
-        bytes_freed = _get_file_size_from_dms(dst, folder_id)
+        bytes_freed = await _get_file_size_from_dms(dst, folder_id)
+
+    logging.info(f"Delete {folder_id}: is_folder={is_folder}, edms_user_id={edms_user_id}, bytes_freed={bytes_freed}")
 
     try:
         # Try standard delete first
-        success, message = wsdl_client.delete_document(dst, folder_id)
+        success, message = await run_in_threadpool(wsdl_client.delete_document, dst, folder_id)
 
         if success:
             if edms_user_id and bytes_freed > 0:
-                await user_data.restore_user_quota(edms_user_id, bytes_freed)
+                restore_ok, restore_msg = await user_data.restore_user_quota(edms_user_id, bytes_freed)
+                logging.info(f"Quota restore for user {edms_user_id} after deleting {folder_id}: {restore_ok}, {restore_msg}")
+            else:
+                logging.warning(f"Skipped quota restore for {folder_id}: edms_user_id={edms_user_id}, bytes_freed={bytes_freed}")
             return {"message": "Folder deleted", "id": folder_id}
 
         # Check for specific "Referenced by" error to prompt user
-        if "referenced by one or more folders" in message.lower() or "referenced" in message.lower():
-            # Automatically proceed to force delete without confirmation
+        if "referenced by one or more folders" in str(message).lower() or "referenced" in str(message).lower():
             total_bytes_deleted = await wsdl_client.delete_folder_contents(dst, folder_id, delete_root=True)
 
             if total_bytes_deleted is False:
@@ -215,17 +223,14 @@ async def api_delete_folder(folder_id: str, request: Request, force: bool = Fals
                     detail="Failed to clear folder contents. Some items may still be referenced elsewhere. Check logs for details."
                 )
 
-            # --- Restore Quota for all recursively deleted files ---
-            bytes_freed = total_bytes_deleted if isinstance(total_bytes_deleted, int) else 0
-            if not is_folder:
-                bytes_freed += _get_file_size_from_dms(dst, folder_id)
+            if is_folder:
+                bytes_freed = total_bytes_deleted if isinstance(total_bytes_deleted, int) else 0
 
             if edms_user_id and bytes_freed > 0:
                 await user_data.restore_user_quota(edms_user_id, bytes_freed)
 
             return {"message": "Folder and contents deleted", "id": folder_id}
 
-        # Other errors
         raise HTTPException(status_code=500, detail="Failed to delete folder. It may be referenced elsewhere.")
 
     except HTTPException as he:
@@ -245,7 +250,7 @@ async def api_move_items_to_folder(data: MoveItemsRequest, request: Request, use
     if destination_parent_id in ['null', 'undefined', '']:
         destination_parent_id = None
 
-    dst = wsdl_client.dms_system_login()
+    dst = await run_in_threadpool(wsdl_client.dms_system_login)
     if not dst:
         raise HTTPException(status_code=500, detail='Failed to authenticate with DMS')
 
@@ -265,11 +270,12 @@ async def api_move_items_to_folder(data: MoveItemsRequest, request: Request, use
                 except Exception:
                     display_name = None
 
-            ok, message = wsdl_client.move_item_to_parent(
-                dst=dst,
-                doc_number=item_id,
-                new_parent_id=destination_parent_id,
-                display_name=display_name,
+            ok, message = await run_in_threadpool(
+                wsdl_client.move_item_to_parent,
+                dst,
+                item_id,
+                destination_parent_id,
+                display_name
             )
 
             if ok:
@@ -290,13 +296,23 @@ async def api_move_items_to_folder(data: MoveItemsRequest, request: Request, use
 
 
 @router.get('/api/folders/{folder_id}/download-zip')
-async def api_download_folder_zip(folder_id: str, request: Request, user=Depends(get_current_user)):
+async def api_download_folder_zip(
+        folder_id: str,
+        request: Request,
+        part: Optional[int] = None,
+        user=Depends(get_current_user)
+):
     """
     Downloads the direct file contents of a folder as a ZIP archive.
     Subfolders are intentionally skipped — only files in the immediate folder are included.
-    Rejects the request if the total uncompressed size exceeds 500 MB.
+
+    If the total size exceeds 500 MB, the response depends on the `part` parameter:
+    - Without `part`: returns a JSON manifest listing how many parts are available.
+    - With `part=N`: returns the Nth partition as a ZIP file.
+
+    For folders ≤ 500 MB, always returns a single ZIP (ignores `part`).
     """
-    dst = wsdl_client.dms_system_login()
+    dst = await run_in_threadpool(wsdl_client.dms_system_login)
     if not dst:
         raise HTTPException(status_code=500, detail='Failed to authenticate with DMS')
 
@@ -320,46 +336,139 @@ async def api_download_folder_zip(folder_id: str, request: Request, user=Depends
     if not file_entries:
         raise HTTPException(status_code=404, detail='Folder has no files to download')
 
-    # Download all files and build the ZIP in memory, guarding the 100 MB limit
-    zip_buffer = io.BytesIO()
+    # --- Download all file contents and measure sizes ---
+    downloaded_files: list[tuple[str, bytes, str]] = []  # (archive_path, content, doc_id)
     total_bytes = 0
 
+    for doc_id, archive_path in file_entries:
+        try:
+            content, dms_filename = await run_in_threadpool(wsdl_client.get_image_by_docnumber, dst, doc_id)
+        except Exception as e:
+            logging.warning(f"Skipping doc {doc_id} in ZIP (download error): {e}")
+            continue
+
+        if not content:
+            continue
+
+        # Ensure the archive path has the correct file extension from DMS
+        _, dms_ext = os.path.splitext(dms_filename or '')
+        if dms_ext:
+            base, existing_ext = os.path.splitext(archive_path)
+            if existing_ext.lower() != dms_ext.lower():
+                archive_path = base + dms_ext
+
+        total_bytes += len(content)
+        downloaded_files.append((archive_path, bytes(content), doc_id))
+
+    if not downloaded_files:
+        raise HTTPException(status_code=404, detail='No files could be downloaded from this folder')
+
+    # --- 1 GB Total Limit Check ---
+    allow_large = user.get('LARGE_DOWNLOADS', False)
+    if total_bytes > ZIP_TOTAL_SIZE_LIMIT_BYTES and not allow_large:
+        raise HTTPException(
+            status_code=413,
+            detail='Not allowed to download the folder because it is bigger than 1 GB. If you want to enable this feature, contact the system administrator.'
+        )
+
+    safe_name = root_name.replace('"', '').replace('/', '_').replace('\\', '_') or folder_id
+
+    # --- Single ZIP (total ≤ 500 MB) ---
+    if total_bytes <= ZIP_PART_SIZE_LIMIT_BYTES:
+        zip_buffer = io.BytesIO()
+        try:
+            with zipfile.ZipFile(zip_buffer, mode='w', compression=zipfile.ZIP_DEFLATED, allowZip64=True) as zf:
+                for archive_path, content, _ in downloaded_files:
+                    zf.writestr(archive_path, content)
+        except Exception as e:
+            logging.error(f"Error building ZIP for folder {folder_id}: {e}", exc_info=True)
+            raise HTTPException(status_code=500, detail='Failed to build ZIP archive')
+
+        zip_buffer.seek(0)
+        content_disposition = build_content_disposition(f'{safe_name}.zip', 'attachment')
+
+        try:
+            username = request.session['user'].get('username')
+            system_id = await db_connector.get_user_system_id(username)
+            if system_id:
+                from database.activity import log_activity
+                await log_activity(int(folder_id), 'Download', int(system_id))
+        except Exception as e:
+            logging.error(f"Failed to log folder download activity: {e}")
+
+        return StreamingResponse(
+            iter([zip_buffer.read()]),
+            media_type='application/zip',
+            headers={'Content-Disposition': content_disposition}
+        )
+
+    # --- Multipart: partition files into ~500 MB chunks ---
+    parts: list[list[tuple[str, bytes]]] = []
+    current_part: list[tuple[str, bytes]] = []
+    current_part_size = 0
+
+    for archive_path, content, _ in downloaded_files:
+        file_size = len(content)
+
+        # If adding this file would exceed the limit and current part is non-empty, start a new part
+        if current_part and (current_part_size + file_size) > ZIP_PART_SIZE_LIMIT_BYTES:
+            parts.append(current_part)
+            current_part = []
+            current_part_size = 0
+
+        current_part.append((archive_path, content))
+        current_part_size += file_size
+
+    # Don't forget the last part
+    if current_part:
+        parts.append(current_part)
+
+    total_parts = len(parts)
+
+    # --- No part requested: return manifest ---
+    if part is None:
+        manifest_parts = []
+        for i, p in enumerate(parts):
+            part_size = sum(len(c) for _, c in p)
+            manifest_parts.append({
+                'part': i + 1,
+                'file_count': len(p),
+                'size_bytes': part_size
+            })
+        return JSONResponse({
+            'multipart': True,
+            'total_parts': total_parts,
+            'folder_name': safe_name,
+            'total_size_bytes': total_bytes,
+            'parts': manifest_parts
+        })
+
+    # --- Part requested: validate and return that partition ---
+    if part < 1 or part > total_parts:
+        raise HTTPException(status_code=400, detail=f'Invalid part number. Must be between 1 and {total_parts}.')
+
+    selected_files = parts[part - 1]
+    zip_buffer = io.BytesIO()
     try:
         with zipfile.ZipFile(zip_buffer, mode='w', compression=zipfile.ZIP_DEFLATED, allowZip64=True) as zf:
-            for doc_id, archive_path in file_entries:
-                try:
-                    content, dms_filename = wsdl_client.get_image_by_docnumber(dst, doc_id)
-                except Exception as e:
-                    logging.warning(f"Skipping doc {doc_id} in ZIP (download error): {e}")
-                    continue
-
-                if not content:
-                    continue
-
-                # Ensure the archive path has the correct file extension from DMS
-                _, dms_ext = os.path.splitext(dms_filename or '')
-                if dms_ext:
-                    base, existing_ext = os.path.splitext(archive_path)
-                    if existing_ext.lower() != dms_ext.lower():
-                        archive_path = base + dms_ext
-
-                total_bytes += len(content)
-                if total_bytes > ZIP_SIZE_LIMIT_BYTES:
-                    raise HTTPException(
-                        status_code=413,
-                        detail='Folder exceeds the 500 MB download limit. Please download individual files instead.'
-                    )
-
-                zf.writestr(archive_path, bytes(content))
-    except HTTPException:
-        raise
+            for archive_path, content in selected_files:
+                zf.writestr(archive_path, content)
     except Exception as e:
-        logging.error(f"Error building ZIP for folder {folder_id}: {e}", exc_info=True)
+        logging.error(f"Error building ZIP part {part} for folder {folder_id}: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail='Failed to build ZIP archive')
 
     zip_buffer.seek(0)
-    safe_name = root_name.replace('"', '').replace('/', '_').replace('\\', '_') or folder_id
-    content_disposition = build_content_disposition(f'{safe_name}.zip', 'attachment')
+    part_filename = f'{safe_name}_Part{part}of{total_parts}.zip'
+    content_disposition = build_content_disposition(part_filename, 'attachment')
+
+    try:
+        username = request.session['user'].get('username')
+        system_id = await db_connector.get_user_system_id(username)
+        if system_id:
+            from database.activity import log_activity
+            await log_activity(int(folder_id), 'Download', int(system_id))
+    except Exception as e:
+        logging.error(f"Failed to log folder part download activity: {e}")
 
     return StreamingResponse(
         iter([zip_buffer.read()]),

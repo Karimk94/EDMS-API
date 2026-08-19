@@ -11,6 +11,9 @@ class LangUpdateRequest(BaseModel):
 class ThemeUpdateRequest(BaseModel):
     theme: str
 
+class ViewModeUpdateRequest(BaseModel):
+    view_mode: str
+
 class User(BaseModel):
     username: str
     token: str
@@ -44,6 +47,7 @@ class EdmsUserResponse(BaseModel):
     lang: str
     theme: str
     quota: int
+    LARGE_DOWNLOADS: bool = False
 
 
 class AddEdmsUserRequest(BaseModel):
@@ -52,6 +56,7 @@ class AddEdmsUserRequest(BaseModel):
     lang: str = 'en'
     theme: str = 'light'
     quota: int = 1073741824
+    LARGE_DOWNLOADS: bool = False
 
 
 class SecurityLevelResponse(BaseModel):
@@ -68,6 +73,7 @@ class PeopleSearchResult(BaseModel):
 class UpdateEdmsUserRequest(BaseModel):
     security_level_id: int
     lang: str = 'en'
-    theme: str = 'light'
+    theme: Optional[str] = None
     remaining_quota: Optional[int] = None
     quota: Optional[int] = None
+    LARGE_DOWNLOADS: Optional[bool] = None

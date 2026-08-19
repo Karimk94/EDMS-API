@@ -68,9 +68,13 @@ async def get_edms_people(search: str = "", page: int = 1, limit: int = 20) -> D
                 FROM PEOPLE p
                 LEFT JOIN GROUPS g ON p.PRIMARY_GROUP = g.SYSTEM_ID
                 LEFT JOIN (
-                    SELECT LOGIN, MAX(AGENCYID) as AGENCYID, MAX(DEPARTMENTID) as DEPARTMENTID, MAX(SECTIONID) as SECTIONID
-                    FROM LKP_HR_EMPLOYEES
-                    GROUP BY LOGIN
+                    SELECT LOGIN, AGENCYID, DEPARTMENTID, SECTIONID
+                    FROM (
+                        SELECT LOGIN, AGENCYID, DEPARTMENTID, SECTIONID,
+                               ROW_NUMBER() OVER (PARTITION BY UPPER(LOGIN) ORDER BY AGENCYID DESC NULLS LAST) as rn
+                        FROM LKP_HR_EMPLOYEES
+                    )
+                    WHERE rn = 1
                 ) hr ON UPPER(p.USER_ID) = UPPER(hr.LOGIN)
                 LEFT JOIN PEOPLEGROUPS pg ON p.SYSTEM_ID = pg.PEOPLE_SYSTEM_ID
                 WHERE (:search IS NULL OR UPPER(p.USER_ID) LIKE UPPER('%' || :search || '%')
@@ -514,13 +518,19 @@ async def get_edms_people_export(search: str = "") -> List[Dict[str, Any]]:
                         ''
                     ), 
                     'N/A'
-                ) as HR_HIERARCHY
+                ) as HR_HIERARCHY,
+                CASE WHEN su.USER_ID IS NOT NULL THEN 'Yes' ELSE 'No' END as IS_SERVICE_USER
             FROM PEOPLE p
             LEFT JOIN (
-                SELECT LOGIN, MAX(AGENCY) as AGENCY, MAX(DEPARTEMENT) as DEPARTEMENT, MAX(SECTION_ORG) as SECTION_ORG
-                FROM LKP_HR_EMPLOYEES
-                GROUP BY LOGIN
+                SELECT LOGIN, AGENCY, DEPARTEMENT, SECTION_ORG
+                FROM (
+                    SELECT LOGIN, AGENCY, DEPARTEMENT, SECTION_ORG,
+                           ROW_NUMBER() OVER (PARTITION BY UPPER(LOGIN) ORDER BY AGENCYID DESC NULLS LAST) as rn
+                    FROM LKP_HR_EMPLOYEES
+                )
+                WHERE rn = 1
             ) hr ON UPPER(p.USER_ID) = UPPER(hr.LOGIN)
+            LEFT JOIN LKP_SERVICE_USERS su ON UPPER(p.USER_ID) = UPPER(su.USER_ID) AND su.DISABLED = 'N'
             WHERE (:search IS NULL OR :search = '' OR UPPER(p.USER_ID) LIKE UPPER('%' || :search || '%')
                    OR UPPER(p.FULL_NAME) LIKE UPPER('%' || :search || '%')
                    OR UPPER(p.EMAIL_ADDRESS) LIKE UPPER('%' || :search || '%'))
@@ -553,11 +563,13 @@ async def get_edms_people_export(search: str = "") -> List[Dict[str, Any]]:
                     "Username": row_dict.get("user_id", ""),
                     "Full Name": row_dict.get("full_name", ""),
                     "Email": row_dict.get("email_address", ""),
+                    "Last Login Date": row_dict.get("last_login_date", ""),
+                    "Groups": "",  # Will be populated next
+                    "Profiles": "",  # Will be populated next
+                    "Agency - Department - Section": row_dict.get("hr_hierarchy", "N/A"),
+                    "Service User": row_dict.get("is_service_user", "No"),
                     "Allow Login": "Yes" if row_dict.get("allow_login") == "Y" else "No",
                     "Disabled": "Yes" if row_dict.get("disabled") == "Y" else "No",
-                    "Agency - Department - Section": row_dict.get("hr_hierarchy", "N/A"),
-                    "Groups": "",  # Will be populated next
-                    "Last Login Date": row_dict.get("last_login_date", "")
                 }
                 system_ids.append(sys_id)
             
@@ -592,6 +604,37 @@ async def get_edms_people_export(search: str = "") -> List[Dict[str, Any]]:
                                 users_dict[sys_id]["Groups"] += ', ' + group_name
                             else:
                                 users_dict[sys_id]["Groups"] = group_name
+
+                # Third query: Fetch profiles for these users (User -> PEOPLEGROUPS -> FORM_USER -> FORMS)
+                profiles_query = """
+                    SELECT DISTINCT pg.PEOPLE_SYSTEM_ID, f.FORM_NAME
+                    FROM PEOPLEGROUPS pg
+                    JOIN FORM_USER fu ON pg.GROUPS_SYSTEM_ID = fu.PERSONORGROUP
+                    JOIN FORMS f ON fu.FORM = f.SYSTEM_ID
+                    JOIN PEOPLE p ON pg.PEOPLE_SYSTEM_ID = p.SYSTEM_ID
+                    WHERE f.FORM_TYPE = 'P'
+                      AND UPPER(f.FORM_NAME) NOT LIKE UPPER('%SEARCH%')
+                      AND (:search IS NULL OR :search = '' OR UPPER(p.USER_ID) LIKE UPPER('%' || :search || '%')
+                           OR UPPER(p.FULL_NAME) LIKE UPPER('%' || :search || '%')
+                           OR UPPER(p.EMAIL_ADDRESS) LIKE UPPER('%' || :search || '%'))
+                    ORDER BY pg.PEOPLE_SYSTEM_ID, f.FORM_NAME
+                """
+                await cursor.execute(profiles_query, params)
+
+                if cursor.description:
+                    p_cols = [col[0].lower() for col in cursor.description]
+                    profiles_rows = await cursor.fetchall()
+
+                    # Aggregate profiles per user
+                    for profile_row in profiles_rows:
+                        profile_dict = dict(zip(p_cols, profile_row))
+                        sys_id = profile_dict['people_system_id']
+                        form_name = profile_dict.get('form_name', '')
+                        if sys_id in users_dict:
+                            if users_dict[sys_id]["Profiles"]:
+                                users_dict[sys_id]["Profiles"] += ', ' + form_name
+                            else:
+                                users_dict[sys_id]["Profiles"] = form_name
             
             # Convert dict to list maintaining order
             export_data = [users_dict[sid] for sid in system_ids]

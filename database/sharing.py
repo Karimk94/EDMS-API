@@ -115,9 +115,10 @@ async def get_share_details(token):
 
     query = """
         SELECT ds.system_id, ds.docnumber, ds.folder_id, st.name as share_type, 
-               ds.created_by, ds.target_email, ds.expiry, ds.is_active 
+               ds.created_by, ds.target_email, ds.expiry, ds.is_active, us.LARGE_DOWNLOADS
         FROM lkp_document_share ds
         LEFT JOIN lkp_share_type st ON ds.share_type_id = st.system_id
+        LEFT JOIN lkp_edms_usr_secur us ON ds.created_by = us.USER_ID
         WHERE ds.token = :token
     """
 
@@ -127,7 +128,7 @@ async def get_share_details(token):
             row = await cursor.fetchone()
 
             if row:
-                share_id, doc_id, folder_id, share_type, created_by, target_email, expiry, is_active = row
+                share_id, doc_id, folder_id, share_type, created_by, target_email, expiry, is_active, allow_large = row
 
                 # Check expiration
                 if expiry and expiry < datetime.now():
@@ -140,10 +141,11 @@ async def get_share_details(token):
                     "share_id": share_id,
                     "document_id": doc_id,
                     "folder_id": folder_id,
-                    "share_type": share_type or 'file',  # Default to 'file' for backward compatibility
+                    "share_type": share_type or 'file',
                     "created_by": created_by,
-                    "target_email": target_email,  # Will be None if not restricted
-                    "expiry_date": expiry
+                    "target_email": target_email,
+                    "expiry_date": expiry,
+                    "LARGE_DOWNLOADS": allow_large == '1' if allow_large is not None else False
                 }
             return None
     finally:

@@ -29,7 +29,8 @@ async def get_next_system_id_sequence():
 
 
 async def get_next_secid():
-    """Generate next SECID globally (pattern: A0001, A0002, ..., A9999, B0001, etc.)."""
+    """Generate next SECID globally (pattern: A0001, A0002, ..., A9999, B0001, etc.).
+    Includes a uniqueness verification loop to prevent duplicate SECIDs."""
     conn = await get_async_connection()
     if not conn:
         return None
@@ -59,10 +60,36 @@ async def get_next_secid():
                     else:
                         number += 1
                     
-                    return f"{prefix}{number:04d}"
+                    new_secid = f"{prefix}{number:04d}"
+                else:
+                    new_secid = "A0001"
+            else:
+                # Start with A0001 if no records exist
+                new_secid = "A0001"
             
-            # Start with A0001 if no records exist
-            return "A0001"
+            # Verify uniqueness - loop until we find an unused SECID
+            while True:
+                await cursor.execute(
+                    "SELECT COUNT(*) FROM LKP_SECTION WHERE SECID = :secid",
+                    secid=new_secid
+                )
+                count_result = await cursor.fetchone()
+                if count_result[0] == 0:
+                    return new_secid
+                else:
+                    # SECID already exists, increment and try again
+                    current_prefix = new_secid[0].upper()
+                    current_number = int(new_secid[1:])
+                    
+                    if current_number >= 9999:
+                        current_number = 1
+                        current_prefix = chr(ord(current_prefix) + 1)
+                        if current_prefix > 'Z':
+                            logging.warning("SECID sequence reached Z9999 limit during uniqueness check")
+                            return None
+                    else:
+                        current_number += 1
+                    new_secid = f"{current_prefix}{current_number:04d}"
     except oracledb.Error as ex:
         error, = ex.args
         logging.error(f"Error generating SECID: {error.message}")
@@ -73,7 +100,8 @@ async def get_next_secid():
 
 
 async def get_next_deptid():
-    """Generate next DEPTID for departments (pattern: D0001, D0002, ..., D9999, E0001, etc.)."""
+    """Generate next DEPTID for departments (pattern: D0001, D0002, ..., D9999, E0001, etc.).
+    Includes a uniqueness verification loop to prevent duplicate DEPTIDs."""
     conn = await get_async_connection()
     if not conn:
         return None
@@ -103,10 +131,36 @@ async def get_next_deptid():
                     else:
                         number += 1
                     
-                    return f"{prefix}{number:04d}"
+                    new_deptid = f"{prefix}{number:04d}"
+                else:
+                    new_deptid = "D0001"
+            else:
+                # Start with D0001 if no records exist
+                new_deptid = "D0001"
             
-            # Start with D0001 if no records exist
-            return "D0001"
+            # Verify uniqueness - loop until we find an unused DEPTID
+            while True:
+                await cursor.execute(
+                    "SELECT COUNT(*) FROM LKP_DEPT WHERE DEPTID = :deptid",
+                    deptid=new_deptid
+                )
+                count_result = await cursor.fetchone()
+                if count_result[0] == 0:
+                    return new_deptid
+                else:
+                    # DEPTID already exists, increment and try again
+                    current_prefix = new_deptid[0].upper()
+                    current_number = int(new_deptid[1:])
+                    
+                    if current_number >= 9999:
+                        current_number = 1
+                        current_prefix = chr(ord(current_prefix) + 1)
+                        if current_prefix > 'Z':
+                            logging.warning("DEPTID sequence reached Z9999 limit during uniqueness check")
+                            return None
+                    else:
+                        current_number += 1
+                    new_deptid = f"{current_prefix}{current_number:04d}"
     except oracledb.Error as ex:
         error, = ex.args
         logging.error(f"Error generating DEPTID: {error.message}")
@@ -153,7 +207,8 @@ async def get_agencies():
 # --- SECTIONS (Companies) ---
 
 async def get_sections(name: str = "", disabled: str = None, page: int = 1, per_page: int = 10):
-    """Get sections (companies) from LKP_SECTION with pagination and search. Only returns items from the last 2 days. Always filters by DEPTID for companies."""
+    """Get sections from LKP_SECTION with pagination and search. Only returns items from the last 2 days.
+    Joins with LKP_DEPT on DEPTID = LKP_DEPT.SYSTEM_ID to ensure DEPTID references a valid department."""
     conn = await get_async_connection()
     if not conn:
         return {"sections": [], "total_records": 0, "total_pages": 0, "current_page": 1, "per_page": per_page}
@@ -162,25 +217,30 @@ async def get_sections(name: str = "", disabled: str = None, page: int = 1, per_
     total = 0
     try:
         async with conn.cursor() as cursor:
-            # Build search condition - always filter by SECTION_DEPTID for companies
-            search_condition = f"AND DEPTID = :section_deptid"
-            params = {'section_deptid': SECTION_DEPTID}
+            # Build search condition - DEPTID is a FK to LKP_DEPT.SYSTEM_ID, enforced via INNER JOIN
+            search_condition = ""
+            params = {}
             
             if name.strip():
-                search_condition += " AND (UPPER(NAME) LIKE UPPER(:name) OR UPPER(SECID) LIKE UPPER(:name) OR UPPER(TRANSLATION) LIKE UPPER(:name))"
+                search_condition += " AND (UPPER(s.NAME) LIKE UPPER(:name) OR UPPER(s.SECID) LIKE UPPER(:name) OR UPPER(s.TRANSLATION) LIKE UPPER(:name))"
                 params['name'] = f"%{name}%"
             else:
-                search_condition += " AND LAST_UPDATE >= SYSDATE - 2"
+                search_condition += " AND s.LAST_UPDATE >= SYSDATE - 2"
             
             # Handle disabled filter - default is to show only enabled (DISABLED = 'N')
             if disabled == 'Y':
-                search_condition += " AND DISABLED = 'Y'"
+                search_condition += " AND s.DISABLED = 'Y'"
             else:
                 # Default: only show enabled sections
-                search_condition += " AND DISABLED = 'N'"
+                search_condition += " AND s.DISABLED = 'N'"
             
-            # Count total
-            count_query = f"SELECT COUNT(*) FROM LKP_SECTION WHERE 1=1 {search_condition}"
+            # Count total - INNER JOIN ensures DEPTID references a valid LKP_DEPT.SYSTEM_ID
+            count_query = f"""
+                SELECT COUNT(*) 
+                FROM LKP_SECTION s
+                INNER JOIN LKP_DEPT d ON s.DEPTID = d.SYSTEM_ID
+                WHERE 1=1 {search_condition}
+            """
             await cursor.execute(count_query, params)
             count_result = await cursor.fetchone()
             total = count_result[0] if count_result else 0
@@ -188,18 +248,21 @@ async def get_sections(name: str = "", disabled: str = None, page: int = 1, per_
             # Calculate offset
             offset = (page - 1) * per_page
             
-            # Fetch paginated results
+            # Fetch paginated results - join with LKP_DEPT to validate DEPTID = SYSTEM_ID
             data_query = f"""
                 SELECT * FROM (
                     SELECT 
-                        SECID,
-                        NAME,
-                        TRANSLATION,
-                        DISABLED,
-                        LAST_UPDATE,
-                        SYSTEM_ID,
-                        ROW_NUMBER() OVER (ORDER BY SECID ASC) as rn
-                    FROM LKP_SECTION
+                        s.SECID,
+                        s.NAME,
+                        s.TRANSLATION,
+                        s.DISABLED,
+                        s.LAST_UPDATE,
+                        s.SYSTEM_ID,
+                        s.DEPTID,
+                        d.NAME AS DEPT_NAME,
+                        ROW_NUMBER() OVER (ORDER BY s.SECID ASC) as rn
+                    FROM LKP_SECTION s
+                    INNER JOIN LKP_DEPT d ON s.DEPTID = d.SYSTEM_ID
                     WHERE 1=1 {search_condition}
                 )
                 WHERE rn > :offset AND rn <= :end_row
@@ -217,7 +280,9 @@ async def get_sections(name: str = "", disabled: str = None, page: int = 1, per_
                     'TRANSLATION': row[2],
                     'DISABLED': row[3],
                     'LAST_UPDATE': row[4],
-                    'SYSTEM_ID': row[5]
+                    'SYSTEM_ID': row[5],
+                    'DEPTID': row[6],
+                    'DEPT_NAME': row[7]
                 })
     except oracledb.Error as ex:
         error, = ex.args
@@ -236,8 +301,36 @@ async def get_sections(name: str = "", disabled: str = None, page: int = 1, per_
     }
 
 
+async def is_section_name_duplicate(name: str) -> bool:
+    """Check if a section name already exists in LKP_SECTION under the fixed department (DEPTID = SECTION_DEPTID)."""
+    conn = await get_async_connection()
+    if not conn:
+        return False
+    
+    try:
+        async with conn.cursor() as cursor:
+            await cursor.execute(
+                "SELECT COUNT(*) FROM LKP_SECTION WHERE UPPER(NAME) = UPPER(:name) AND DEPTID = :deptid",
+                name=name,
+                deptid=SECTION_DEPTID
+            )
+            result = await cursor.fetchone()
+            return result[0] > 0
+    except oracledb.Error as ex:
+        error, = ex.args
+        logging.error(f"Error checking duplicate section name: {error.message}")
+        return False
+    finally:
+        if conn:
+            await conn.close()
+
+
 async def add_section(name: str, translation: str):
-    """Add a new section (company) to LKP_SECTION."""
+    """Add a new section to LKP_SECTION. Checks for duplicate names first."""
+    # Check for duplicate name before proceeding
+    if await is_section_name_duplicate(name):
+        return False, f'Company name "{name}" already exists. Please choose a different name.'
+    
     conn = await get_async_connection()
     if not conn:
         return False, "Failed to connect to database"
@@ -254,6 +347,15 @@ async def add_section(name: str, translation: str):
             return False, "Failed to generate SYSTEM_ID"
         
         async with conn.cursor() as cursor:
+            # Final existence check within the same connection to prevent race conditions
+            await cursor.execute(
+                "SELECT COUNT(*) FROM LKP_SECTION WHERE SECID = :secid",
+                secid=new_secid
+            )
+            count_result = await cursor.fetchone()
+            if count_result[0] > 0:
+                return False, f'SECID "{new_secid}" already exists in LKP_SECTION. Please try again.'
+            
             query = """
                 INSERT INTO LKP_SECTION (SECID, SYSTEM_ID, NAME, TRANSLATION, DISABLED, DEPTID, LAST_UPDATE)
                 VALUES (:secid, :system_id, :name, :translation, 'N', :deptid, SYSDATE)
@@ -277,7 +379,7 @@ async def add_section(name: str, translation: str):
             await conn.close()
 
 
-async def update_section(secid: str, name: str, translation: str, disabled: str):
+async def update_section(system_id: str, name: str, translation: str, disabled: str):
     """Update an existing section in LKP_SECTION."""
     conn = await get_async_connection()
     if not conn:
@@ -288,9 +390,9 @@ async def update_section(secid: str, name: str, translation: str, disabled: str)
             query = """
                 UPDATE LKP_SECTION
                 SET NAME = :name, TRANSLATION = :translation, DISABLED = :disabled, LAST_UPDATE = SYSDATE
-                WHERE SECID = :secid
+                WHERE SYSTEM_ID = :system_id
             """
-            await cursor.execute(query, secid=secid, name=name, translation=translation, disabled=disabled)
+            await cursor.execute(query, system_id=system_id, name=name, translation=translation, disabled=disabled)
             await conn.commit()
             return True, "Section updated successfully"
     except oracledb.Error as ex:
@@ -304,8 +406,8 @@ async def update_section(secid: str, name: str, translation: str, disabled: str)
 
 # --- DEPARTMENTS ---
 
-async def get_departments(name: str = "", agency_id: int = None, page: int = 1, per_page: int = 10):
-    """Get departments from LKP_DEPT with pagination and search. Only returns items from the last 2 days."""
+async def get_departments(name: str = "", agency_id: int = None, page: int = 1, per_page: int = 10, fetch_all: bool = False):
+    """Get departments from LKP_DEPT with pagination and search. By default only returns items from the last 2 days unless fetch_all=True."""
     conn = await get_async_connection()
     if not conn:
         return {"departments": [], "total_records": 0, "total_pages": 0, "current_page": 1, "per_page": per_page}
@@ -321,7 +423,7 @@ async def get_departments(name: str = "", agency_id: int = None, page: int = 1, 
             if name.strip():
                 search_condition += " AND (UPPER(NAME) LIKE UPPER(:name) OR UPPER(SHORT) LIKE UPPER(:name) OR UPPER(TRANSLATION) LIKE UPPER(:name))"
                 params['name'] = f"%{name}%"
-            else:
+            elif not fetch_all:
                 search_condition += " AND LAST_UPDATE >= SYSDATE - 2"
             
             if agency_id is not None:
@@ -347,6 +449,7 @@ async def get_departments(name: str = "", agency_id: int = None, page: int = 1, 
                         DISABLED,
                         LAST_UPDATE,
                         AGENCYID,
+                        SYSTEM_ID,
                         ROW_NUMBER() OVER (ORDER BY NAME) as rn
                     FROM LKP_DEPT
                     WHERE DISABLED = 'N' {search_condition}
@@ -366,7 +469,8 @@ async def get_departments(name: str = "", agency_id: int = None, page: int = 1, 
                     'SHORT': row[2],
                     'DISABLED': row[3],
                     'LAST_UPDATE': row[4],
-                    'SYSTEM_ID': row[5] # Keep dictionary key as SYSTEM_ID for frontend compatibility, but it holds AGENCYID
+                    'AGENCYID': row[5],
+                    'SYSTEM_ID': row[6]
                 })
     except oracledb.Error as ex:
         error, = ex.args
@@ -385,8 +489,62 @@ async def get_departments(name: str = "", agency_id: int = None, page: int = 1, 
     }
 
 
+async def is_department_name_duplicate(name: str) -> bool:
+    """Check if a department name already exists in LKP_DEPT."""
+    conn = await get_async_connection()
+    if not conn:
+        return False
+    
+    try:
+        async with conn.cursor() as cursor:
+            await cursor.execute(
+                "SELECT COUNT(*) FROM LKP_DEPT WHERE UPPER(NAME) = UPPER(:name)",
+                name=name
+            )
+            result = await cursor.fetchone()
+            return result[0] > 0
+    except oracledb.Error as ex:
+        error, = ex.args
+        logging.error(f"Error checking duplicate department name: {error.message}")
+        return False
+    finally:
+        if conn:
+            await conn.close()
+
+
+async def is_department_short_duplicate(short: str) -> bool:
+    """Check if a department SHORT (EMS Department ID) already exists in LKP_DEPT."""
+    conn = await get_async_connection()
+    if not conn:
+        return False
+    
+    try:
+        async with conn.cursor() as cursor:
+            await cursor.execute(
+                "SELECT COUNT(*) FROM LKP_DEPT WHERE UPPER(SHORT) = UPPER(:short)",
+                short=short
+            )
+            result = await cursor.fetchone()
+            return result[0] > 0
+    except oracledb.Error as ex:
+        error, = ex.args
+        logging.error(f"Error checking duplicate department SHORT: {error.message}")
+        return False
+    finally:
+        if conn:
+            await conn.close()
+
+
 async def add_department(name: str, translation: str, short: str, agency_system_id: int):
-    """Add a new department to LKP_DEPT."""
+    """Add a new department to LKP_DEPT. Checks for duplicate name and SHORT first."""
+    # Check for duplicate name
+    if await is_department_name_duplicate(name):
+        return False, f'Department name "{name}" already exists. Please choose a different name.'
+    
+    # Check for duplicate SHORT (EMS Department ID)
+    if short and await is_department_short_duplicate(short):
+        return False, f'EMS Department ID "{short}" already exists. Please choose a different ID.'
+    
     conn = await get_async_connection()
     if not conn:
         return False, "Failed to connect to database"
@@ -401,6 +559,15 @@ async def add_department(name: str, translation: str, short: str, agency_system_
         # The SHORT column has a max of 5 characters (validated in frontend)
         
         async with conn.cursor() as cursor:
+            # Final existence check within the same connection to prevent race conditions
+            await cursor.execute(
+                "SELECT COUNT(*) FROM LKP_DEPT WHERE DEPTID = :deptid",
+                deptid=new_deptid
+            )
+            count_result = await cursor.fetchone()
+            if count_result[0] > 0:
+                return False, f'DEPTID "{new_deptid}" already exists in LKP_DEPT. Please try again.'
+            
             query = """
                 INSERT INTO LKP_DEPT (DEPTID, NAME, TRANSLATION, SHORT, DISABLED, AGENCYID, LAST_UPDATE)
                 VALUES (:deptid, :name, :translation, :short, 'N', :agency_system_id, SYSDATE)
@@ -424,8 +591,8 @@ async def add_department(name: str, translation: str, short: str, agency_system_
             await conn.close()
 
 
-async def update_department(deptid: str, name: str, translation: str):
-    """Update an existing department in LKP_DEPT."""
+async def update_department(system_id: int, name: str, translation: str):
+    """Update an existing department in LKP_DEPT by SYSTEM_ID."""
     conn = await get_async_connection()
     if not conn:
         return False, "Failed to connect to database"
@@ -435,9 +602,9 @@ async def update_department(deptid: str, name: str, translation: str):
             query = """
                 UPDATE LKP_DEPT
                 SET NAME = :name, TRANSLATION = :translation, LAST_UPDATE = SYSDATE
-                WHERE DEPTID = :deptid
+                WHERE SYSTEM_ID = :system_id
             """
-            await cursor.execute(query, deptid=deptid, name=name, translation=translation)
+            await cursor.execute(query, system_id=system_id, name=name, translation=translation)
             await conn.commit()
             return True, "Department updated successfully"
     except oracledb.Error as ex:
@@ -461,7 +628,7 @@ async def get_departments_by_agency(agency_system_id: int):
     try:
         async with conn.cursor() as cursor:
             query = """
-                SELECT DEPTID, AGENCYID, NAME, SHORT
+                SELECT DEPTID, SYSTEM_ID, AGENCYID, NAME, SHORT
                 FROM LKP_DEPT
                 WHERE AGENCYID = :agency_system_id AND DISABLED = 'N'
                 ORDER BY NAME
@@ -471,10 +638,11 @@ async def get_departments_by_agency(agency_system_id: int):
             
             for row in rows:
                 departments.append({
-                    'DEPTID': row[0],
-                    'SYSTEM_ID': row[1],
-                    'NAME': row[2],
-                    'SHORT': row[3]
+                    'DEPTID': row[0],     # e.g. "D0001" (string code)
+                    'SYSTEM_ID': row[1],  # integer PK — this is what LKP_SECTION.DEPTID stores
+                    'AGENCYID': row[2],
+                    'NAME': row[3],
+                    'SHORT': row[4]
                 })
     except oracledb.Error as ex:
         error, = ex.args
@@ -569,17 +737,45 @@ async def get_ems_sections(dept_system_id: int = None, name: str = "", page: int
     }
 
 
-async def add_ems_section(name: str, translation: str, dept_system_id: int):
-    """Add a new EMS section within a department."""
+async def is_ems_section_duplicate_under_department(name: str, ems_sec_id: int) -> bool:
+    """Check if an EMS section name already exists under the given department."""
+    conn = await get_async_connection()
+    if not conn:
+        return False
+    
+    try:
+        async with conn.cursor() as cursor:
+            await cursor.execute(
+                "SELECT COUNT(*) FROM LKP_SECTION WHERE SECID = :ems_sec_id AND UPPER(NAME) = UPPER(:name)",
+                ems_sec_id=ems_sec_id,
+                name=name
+            )
+            result = await cursor.fetchone()
+            return result[0] > 0
+    except oracledb.Error as ex:
+        error, = ex.args
+        logging.error(f"Error checking duplicate EMS section: {error.message}")
+        return False
+    finally:
+        if conn:
+            await conn.close()
+
+
+async def add_ems_section(name: str, translation: str, ems_code: str, dept_system_id: int):
+    """Add a new EMS section within a department. Checks for duplicate name within the department first."""
+    # Check for duplicate name within the same department
+    if await is_ems_section_duplicate_under_department(name, ems_code):
+        return False, f'Section name "{name}" already exists under this department. Please choose a different name.'
+    
     conn = await get_async_connection()
     if not conn:
         return False, "Failed to connect to database"
 
     try:
         # Generate new SECID (numeric string)
-        new_secid = await get_next_secid()
-        if not new_secid:
-            return False, "Failed to generate SECID"
+        # new_secid = await get_next_secid()
+        # if not new_secid:
+        #     return False, "Failed to generate SECID"
         
         # Generate new SYSTEM_ID from sequence
         new_system_id = await get_next_system_id_sequence()
@@ -587,20 +783,29 @@ async def add_ems_section(name: str, translation: str, dept_system_id: int):
             return False, "Failed to generate SYSTEM_ID"
         
         async with conn.cursor() as cursor:
+            # Final existence check within the same connection to prevent race conditions
+            await cursor.execute(
+                "SELECT COUNT(*) FROM LKP_SECTION WHERE SECID = :secid",
+                secid=ems_code   
+            )
+            count_result = await cursor.fetchone()
+            if count_result[0] > 0:
+                return False, f'SECID "{ems_code}" already exists in LKP_SECTION. Please try again.'
+            
             query = """
                 INSERT INTO LKP_SECTION (SECID, SYSTEM_ID, NAME, TRANSLATION, DISABLED, DEPTID, LAST_UPDATE)
                 VALUES (:secid, :system_id, :name, :translation, 'N', :parent_dept_system_id, SYSDATE)
             """
             await cursor.execute(
                 query,
-                secid=new_secid,
+                secid=ems_code,
                 system_id=new_system_id,
                 name=name,
                 translation=translation,
                 parent_dept_system_id=dept_system_id
             )
             await conn.commit()
-            return True, f"EMS Section created with ID {new_secid}"
+            return True, f"EMS Section created with ID {ems_code}"
     except oracledb.Error as ex:
         error, = ex.args
         logging.error(f"Error adding EMS section: {error.message}")
@@ -610,20 +815,56 @@ async def add_ems_section(name: str, translation: str, dept_system_id: int):
             await conn.close()
 
 
-async def update_ems_section(secid: str, name: str, translation: str, disabled: str, parent_dept_system_id: int):
-    """Update an existing EMS section."""
+async def update_ems_section(system_id: int, name: str, translation: str, disabled: str, parent_dept_system_id: int, new_ems_code: str = None):
+    """Update an existing EMS section by SYSTEM_ID. Optionally updates SECID if new_ems_code is provided."""
     conn = await get_async_connection()
     if not conn:
         return False, "Failed to connect to database"
 
     try:
         async with conn.cursor() as cursor:
-            query = """
-                UPDATE LKP_SECTION
-                SET NAME = :name, TRANSLATION = :translation, DISABLED = :disabled, LAST_UPDATE = SYSDATE, DEPTID = :parent_dept_system_id
-                WHERE SECID = :secid
-            """
-            await cursor.execute(query, secid=secid, name=name, translation=translation, disabled=disabled, parent_dept_system_id=parent_dept_system_id)
+            # If a new EMS code is supplied, validate it first
+            if new_ems_code:
+                # Fetch the current SECID so we only check for duplicates when the code actually changed
+                await cursor.execute(
+                    "SELECT SECID FROM LKP_SECTION WHERE SYSTEM_ID = :system_id",
+                    system_id=system_id
+                )
+                current_row = await cursor.fetchone()
+                current_secid = current_row[0] if current_row else None
+
+                if new_ems_code != current_secid:
+                    # Check that the new code is not already taken by another record
+                    await cursor.execute(
+                        "SELECT COUNT(*) FROM LKP_SECTION WHERE SECID = :secid",
+                        secid=new_ems_code
+                    )
+                    dup_result = await cursor.fetchone()
+                    if dup_result[0] > 0:
+                        return False, f'EMS Code "{new_ems_code}" already exists. Please choose a different code.'
+
+                    query = """
+                        UPDATE LKP_SECTION
+                        SET SECID = :new_secid, NAME = :name, TRANSLATION = :translation, DISABLED = :disabled, LAST_UPDATE = SYSDATE, DEPTID = :parent_dept_system_id
+                        WHERE SYSTEM_ID = :system_id
+                    """
+                    await cursor.execute(query, system_id=system_id, new_secid=new_ems_code, name=name, translation=translation, disabled=disabled, parent_dept_system_id=parent_dept_system_id)
+                else:
+                    # Code unchanged — skip SECID update
+                    query = """
+                        UPDATE LKP_SECTION
+                        SET NAME = :name, TRANSLATION = :translation, DISABLED = :disabled, LAST_UPDATE = SYSDATE, DEPTID = :parent_dept_system_id
+                        WHERE SYSTEM_ID = :system_id
+                    """
+                    await cursor.execute(query, system_id=system_id, name=name, translation=translation, disabled=disabled, parent_dept_system_id=parent_dept_system_id)
+            else:
+                query = """
+                    UPDATE LKP_SECTION
+                    SET NAME = :name, TRANSLATION = :translation, DISABLED = :disabled, LAST_UPDATE = SYSDATE, DEPTID = :parent_dept_system_id
+                    WHERE SYSTEM_ID = :system_id
+                """
+                await cursor.execute(query, system_id=system_id, name=name, translation=translation, disabled=disabled, parent_dept_system_id=parent_dept_system_id)
+
             await conn.commit()
             return True, "EMS Section updated successfully"
     except oracledb.Error as ex:
@@ -633,3 +874,4 @@ async def update_ems_section(secid: str, name: str, translation: str, disabled: 
     finally:
         if conn:
             await conn.close()
+

@@ -1,10 +1,23 @@
 import os
+import asyncio
 import logging
 from zeep.exceptions import Fault
 from .base import get_soap_client, find_client_with_operation
 from .config import DMS_USER, SMART_EDMS_ROOT_ID
 from zeep import xsd, Settings, Client
 from lxml import etree
+
+
+class UploadCancelled(Exception):
+    """
+    Raised when an in-progress upload is cancelled by the client.
+    Carries the partially-created DMS document number (if any) so the
+    caller can clean it up after the write stream has been released.
+    """
+
+    def __init__(self, message, doc_number=None):
+        super().__init__(message)
+        self.doc_number = doc_number
 
 def get_doc_version_info(dst, doc_number):
     try:
@@ -31,7 +44,15 @@ def get_doc_version_info(dst, doc_number):
         pass
     return "0"
 
-async def upload_document_to_dms(dst, file_stream, metadata, parent_id=None):
+async def upload_document_to_dms(dst, file_stream, metadata, parent_id=None, cancel_check=None):
+    """
+    Uploads a file stream to the DMS.
+
+    cancel_check: optional callable returning True when the upload should be
+    aborted. It is polled between chunks; when it returns True the partially
+    created document is reported via UploadCancelled so the caller can clean
+    it up after the write stream has been released.
+    """
     import db_connector
 
     svc_client, obj_client = None, None
@@ -119,6 +140,16 @@ async def upload_document_to_dms(dst, file_stream, metadata, parent_id=None):
 
         chunk_size = 48 * 1024
         while True:
+            # Yield to the event loop so cancel/disconnect handling can run,
+            # then check whether this upload has been cancelled.
+            await asyncio.sleep(0)
+            if cancel_check is not None and cancel_check():
+                logging.info(f"Upload cancelled for document {created_doc_number}")
+                raise UploadCancelled(
+                    f"Upload cancelled for document {created_doc_number}",
+                    doc_number=created_doc_number
+                )
+
             try:
                 chunk = file_stream.read(chunk_size)
             except Exception:
@@ -230,6 +261,10 @@ async def upload_document_to_dms(dst, file_stream, metadata, parent_id=None):
 
         return created_doc_number
 
+    except UploadCancelled:
+        # Propagate so the caller can distinguish cancellation and clean up
+        # the partially-created document after the stream is released below.
+        raise
     except Exception as e:
         logging.error(f"upload_document_to_dms failed: {e}", exc_info=True)
         return None

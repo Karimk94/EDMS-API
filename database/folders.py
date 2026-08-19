@@ -213,6 +213,36 @@ async def get_folder_contents(folder_docnumber: str) -> list:
 
     return folders + files
 
+
+async def get_folder_files_recursive(folder_docnumber: str, prefix: str = '', max_depth: int = 20) -> list:
+    """
+    Recursively collects all files from a folder and its subfolders.
+    Returns a list of dicts with 'id', 'name', and 'archive_path' (relative path preserving folder structure).
+    """
+    if max_depth <= 0:
+        return []
+
+    all_files = []
+
+    # Get direct files in this folder
+    direct_files = await get_folder_files(folder_docnumber)
+    for f in direct_files:
+        archive_path = f'{prefix}{f["name"]}' if prefix else f['name']
+        all_files.append({
+            'id': f['id'],
+            'name': f['name'],
+            'archive_path': archive_path
+        })
+
+    # Recurse into subfolders
+    subfolders = await get_folder_children(folder_docnumber)
+    for subfolder in subfolders:
+        sub_prefix = f'{prefix}{subfolder["name"]}/' if prefix else f'{subfolder["name"]}/'
+        sub_files = await get_folder_files_recursive(subfolder['id'], sub_prefix, max_depth - 1)
+        all_files.extend(sub_files)
+
+    return all_files
+
 async def get_folder_by_id(folder_id: str) -> dict | None:
     """
     Alias for get_folder_by_docnumber for backward compatibility.
@@ -295,7 +325,7 @@ async def build_breadcrumb_path(root_folder_docnumber: str, current_folder_docnu
             'name': folder_info.get('name', 'Shared Folder') if folder_info else 'Shared Folder'
         }]
 
-    # Collect all docnumbers in the path first
+    # Collect all docnumbers in the path first (child → parent order, reversed later)
     docnumbers = [current_folder_docnumber]
     current_docnumber = current_folder_docnumber
     max_depth = 50
@@ -319,14 +349,19 @@ async def build_breadcrumb_path(root_folder_docnumber: str, current_folder_docnu
                     break
 
                 parent_docnumber = str(row[0])
+
+                if str(parent_docnumber) == str(root_folder_docnumber):
+                    # Add root and stop — don't duplicate
+                    docnumbers.append(parent_docnumber)
+                    break
+
                 if parent_docnumber not in docnumbers:
                     docnumbers.append(parent_docnumber)
 
-                if str(parent_docnumber) == str(root_folder_docnumber):
-                    docnumbers.insert(0, str(root_folder_docnumber))
-                    break
-
                 current_docnumber = parent_docnumber
+
+            # Reverse: we collected child→parent, but need parent→child (root first)
+            docnumbers.reverse()
 
             # Now batch-fetch all folder info in one query
             if not docnumbers:

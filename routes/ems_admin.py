@@ -1,4 +1,5 @@
 from fastapi import APIRouter, HTTPException, Request
+from fastapi.concurrency import run_in_threadpool
 import logging
 import wsdl_client
 from database.ems_admin import (
@@ -53,7 +54,7 @@ async def check_admin_access(request: Request) -> bool:
     original_username = user.get("username")
     if token and original_username:
         try:
-            user_groups = wsdl_client.get_groups_for_user(token, original_username)
+            user_groups = await run_in_threadpool(wsdl_client.get_groups_for_user, token, original_username)
             target_group = EMS_ADMIN_GROUP_ID.upper()
             for group in user_groups or []:
                 group_id = str(group.get("group_id", "")).strip().upper()
@@ -146,7 +147,7 @@ async def add_section_endpoint(request: Request, data: dict):
         success, message = await add_section(name, translation)
         
         if not success:
-            raise HTTPException(status_code=400, detail=message)
+            return {"success": False, "error": message}
         
         return {
             "success": True,
@@ -166,18 +167,18 @@ async def update_section_endpoint(request: Request, data: dict):
         raise HTTPException(status_code=403, detail="Access denied")
     
     try:
-        secid = data.get("secid")
+        system_id = data.get("system_id")
         name = data.get("name")
         translation = data.get("translation", "")
         disabled = data.get("disabled", "N")
         
-        if not secid or not name:
-            raise HTTPException(status_code=400, detail="Section ID and name are required")
+        if not system_id or not name:
+            raise HTTPException(status_code=400, detail="System ID and name are required")
         
-        success, message = await update_section(secid, name, translation, disabled)
+        success, message = await update_section(system_id, name, translation, disabled)
         
         if not success:
-            raise HTTPException(status_code=400, detail=message)
+            return {"success": False, "error": message}
         
         return {
             "success": True,
@@ -198,14 +199,15 @@ async def get_departments_endpoint(
     name: str = "",
     agency_id: int = None,
     page: int = 1,
-    per_page: int = 10
+    per_page: int = 10,
+    fetch_all: bool = False
 ):
     """Get departments with pagination, search, and agency filter."""
     if not await check_admin_access(request):
         raise HTTPException(status_code=403, detail="Access denied")
     
     try:
-        result = await get_departments(name=name, agency_id=agency_id, page=page, per_page=per_page)
+        result = await get_departments(name=name, agency_id=agency_id, page=page, per_page=per_page, fetch_all=fetch_all)
         return {
             **result,
             "success": True
@@ -233,7 +235,7 @@ async def add_department_endpoint(request: Request, data: dict):
         success, message = await add_department(name, translation, short, agency_system_id)
         
         if not success:
-            raise HTTPException(status_code=400, detail=message)
+            return {"success": False, "error": message}
         
         return {
             "success": True,
@@ -253,17 +255,17 @@ async def update_department_endpoint(request: Request, data: dict):
         raise HTTPException(status_code=403, detail="Access denied")
     
     try:
-        deptid = data.get("deptid")
+        system_id = data.get("system_id")
         name = data.get("name")
         translation = data.get("translation", "")
         
-        if not deptid or not name:
-            raise HTTPException(status_code=400, detail="Department ID and name are required")
+        if not system_id or not name:
+            raise HTTPException(status_code=400, detail="System ID and name are required")
         
-        success, message = await update_department(deptid, name, translation)
+        success, message = await update_department(system_id, name, translation)
         
         if not success:
-            raise HTTPException(status_code=400, detail=message)
+            return {"success": False, "error": message}
         
         return {
             "success": True,
@@ -330,15 +332,16 @@ async def add_ems_section_endpoint(request: Request, data: dict):
     try:
         name = data.get("name")
         translation = data.get("translation", "")
+        ems_code = data.get("ems_code")
         dept_system_id = data.get("dept_system_id")
         
-        if not name or not dept_system_id:
+        if not name or not ems_code:
             raise HTTPException(status_code=400, detail="Name and department are required")
         
-        success, message = await add_ems_section(name, translation, dept_system_id)
+        success, message = await add_ems_section(name, translation, ems_code, dept_system_id)
         
         if not success:
-            raise HTTPException(status_code=400, detail=message)
+            return {"success": False, "error": message}
         
         return {
             "success": True,
@@ -358,19 +361,20 @@ async def update_ems_section_endpoint(request: Request, data: dict):
         raise HTTPException(status_code=403, detail="Access denied")
     
     try:
-        secid = data.get("secid")
+        system_id = data.get("system_id")
+        new_ems_code = data.get("new_ems_code", "").strip().upper() if data.get("new_ems_code") else None
         name = data.get("name")
         translation = data.get("translation", "")
         disabled = data.get("disabled", "N")
         parent_dept_system_id = data.get("parent_dept_system_id")
         
-        if not secid or not name or not parent_dept_system_id:
-            raise HTTPException(status_code=400, detail="EMS Section ID, name, and department are required")
+        if not system_id or not name or not parent_dept_system_id:
+            raise HTTPException(status_code=400, detail="System ID, name, and department are required")
         
-        success, message = await update_ems_section(secid, name, translation, disabled, parent_dept_system_id)
+        success, message = await update_ems_section(system_id, name, translation, disabled, parent_dept_system_id, new_ems_code)
         
         if not success:
-            raise HTTPException(status_code=400, detail=message)
+            return {"success": False, "error": message}
         
         return {
             "success": True,

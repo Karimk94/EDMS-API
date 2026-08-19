@@ -13,7 +13,8 @@ from dotenv import load_dotenv
 from database.connection import ensure_performance_indexes
 
 # Import Routers
-from routes import auth, documents, media, tags, events, folders, favorites, memories, sharing, admin, ems_admin, profilesearch, edms_people
+from routes import auth, documents, media, tags, events, folders, favorites, memories, sharing, admin, edocs_admin, ems_admin, profilesearch, edms_people
+from middleware.session_validation import SessionValidationMiddleware
 from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 
@@ -24,11 +25,12 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # --- Log Filtering ---
-logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
+# Enable uvicorn access logs to see all requests (including 500 errors)
+logging.getLogger("uvicorn.access").setLevel(logging.INFO)
 
 # --- Background Cache Eviction ---
 from utils.cache_eviction import cleanup_video_cache
-from services.processing_queue import processing_worker_loop
+from utils.log_cleanup import cleanup_old_logs
 
 async def periodic_cache_cleanup():
     """Runs video cache cleanup every 6 hours."""
@@ -41,6 +43,18 @@ async def periodic_cache_cleanup():
         except Exception as e:
             logging.error(f"Cache cleanup error: {e}")
         await asyncio.sleep(6 * 3600)  # Every 6 hours
+
+async def periodic_log_cleanup():
+    """Runs log cleanup daily to delete IIS/app logs older than 14 days."""
+    logs_path = os.path.join(os.getcwd(), 'logs')
+    while True:
+        try:
+            result = cleanup_old_logs(logs_path, max_age_days=14)
+            if result.get('deleted_count', 0) > 0:
+                logging.info(f"Log cleanup: {result}")
+        except Exception as e:
+            logging.error(f"Log cleanup error: {e}")
+        await asyncio.sleep(24 * 3600)  # Every 24 hours
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -59,22 +73,54 @@ async def lifespan(app: FastAPI):
         logging.warning(f"Startup: ensure_performance_indexes failed — skipping: {e}")
 
     cache_cleanup_task = asyncio.create_task(periodic_cache_cleanup())
-    queue_stop_event = asyncio.Event()
-    queue_worker_task = asyncio.create_task(processing_worker_loop(queue_stop_event))
+    log_cleanup_task = asyncio.create_task(periodic_log_cleanup())
+    
+    # Import and run the background processing worker
+    from services.processing_queue import processing_worker_loop
+    worker_stop_event = asyncio.Event()
+    worker_task = asyncio.create_task(processing_worker_loop(worker_stop_event))
+    logging.info("Started background processing worker loop.")
 
     try:
         yield
     finally:
-        queue_stop_event.set()
+        worker_stop_event.set()
         cache_cleanup_task.cancel()
-        queue_worker_task.cancel()
-        await asyncio.gather(cache_cleanup_task, queue_worker_task, return_exceptions=True)
+        log_cleanup_task.cancel()
+        # Give worker a moment to shut down gracefully, then gather all
+        await asyncio.gather(worker_task, cache_cleanup_task, log_cleanup_task, return_exceptions=True)
 
 app = FastAPI(title="EDMS Middleware API", lifespan=lifespan)
 
 # --- Rate Limiting ---
 app.state.limiter = auth.limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+# --- Global Exception Handler (catches all unhandled errors) ---
+from fastapi.responses import JSONResponse
+import traceback
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request, exc):
+    """Log all unhandled exceptions with full traceback."""
+    error_id = str(uuid.uuid4())[:8]
+    tb = traceback.format_exc()
+    
+    # Log the full error with traceback
+    logging.error(
+        f"[ERROR-{error_id}] Unhandled exception on {request.method} {request.url.path}: "
+        f"{type(exc).__name__}: {exc}\n{tb}"
+    )
+    
+    return JSONResponse(
+        status_code=500,
+        content={
+            "error": "Internal server error",
+            "error_id": error_id,
+            "detail": str(exc),
+            "type": type(exc).__name__
+        }
+    )
 
 # --- Static Files Setup ---
 # Create static directory if it doesn't exist
@@ -96,6 +142,10 @@ app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 secret_key = os.getenv('FLASK_SECRET_KEY')
 if not secret_key:
     raise RuntimeError("FLASK_SECRET_KEY environment variable is not set. Cannot start without it.")
+
+# Session validation must run AFTER SessionMiddleware populates the session,
+# so register it BEFORE SessionMiddleware (SessionMiddleware becomes outer).
+app.add_middleware(SessionValidationMiddleware)
 
 app.add_middleware(
     SessionMiddleware,
@@ -172,7 +222,7 @@ class RequestMetricsMiddleware(BaseHTTPMiddleware):
                 "duration_ms": duration_ms,
                 "user": user,
             }
-            # logging.info(json.dumps(payload, ensure_ascii=True))
+            logging.info(json.dumps(payload, ensure_ascii=True))
 
 # --- Register Routes ---
 app.include_router(auth.router)
@@ -185,6 +235,7 @@ app.include_router(favorites.router)
 app.include_router(memories.router)
 app.include_router(sharing.router)
 app.include_router(admin.router)
+app.include_router(edocs_admin.router)
 app.include_router(ems_admin.router)
 app.include_router(profilesearch.router)
 app.include_router(edms_people.router)
@@ -192,6 +243,64 @@ app.include_router(edms_people.router)
 @app.get("/")
 def health_check():
     return {"status": "EDMS API is running"}
+
+
+@app.get("/api/health")
+async def diagnostic_health_check():
+    """
+    Diagnostic endpoint to test DB and DMS connectivity.
+    Helps identify which service is causing 500 errors.
+    """
+    results = {
+        "status": "healthy",
+        "timestamp": time.time(),
+        "checks": {}
+    }
+    
+    # Test 1: Database connectivity
+    try:
+        from database.connection import get_connection
+        conn = get_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT 1 FROM DUAL")
+        cursor.fetchone()
+        cursor.close()
+        conn.close()
+        results["checks"]["database"] = {"status": "ok", "message": "Connected successfully"}
+    except Exception as e:
+        results["checks"]["database"] = {"status": "error", "message": str(e)}
+        results["status"] = "unhealthy"
+    
+    # Test 2: DMS/WSDL connectivity
+    try:
+        import requests
+        wsdl_url = os.getenv('WSDL_URL')
+        if wsdl_url:
+            response = requests.get(wsdl_url, timeout=10)
+            if response.status_code == 200:
+                results["checks"]["dms_wsdl"] = {"status": "ok", "message": f"WSDL reachable at {wsdl_url}"}
+            else:
+                results["checks"]["dms_wsdl"] = {"status": "error", "message": f"WSDL returned status {response.status_code}"}
+                results["status"] = "unhealthy"
+        else:
+            results["checks"]["dms_wsdl"] = {"status": "error", "message": "WSDL_URL not configured"}
+            results["status"] = "unhealthy"
+    except Exception as e:
+        results["checks"]["dms_wsdl"] = {"status": "error", "message": str(e)}
+        results["status"] = "unhealthy"
+    
+    # Test 3: Environment variables
+    env_checks = {}
+    required_vars = ['DB_HOST', 'DB_PORT', 'DB_SERVICE_NAME', 'DB_USERNAME', 'DB_PASSWORD', 
+                     'WSDL_URL', 'DMS_USER', 'DMS_PASSWORD', 'FLASK_SECRET_KEY']
+    for var in required_vars:
+        value = os.getenv(var)
+        env_checks[var] = "set" if value else "MISSING"
+        if not value:
+            results["status"] = "unhealthy"
+    results["checks"]["environment"] = env_checks
+    
+    return results
 
 
 

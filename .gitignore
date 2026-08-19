@@ -19,13 +19,12 @@ __pycache__/
 #IDE and OS files
 .idea/
 .vscode/
+graphify-out/
 *.DS_Store
 *.xlsx
-/libs
-/packages/
-/wheels/
-/graphify-out/
-/diagrams/
-/packages/
-/download_cache/
-/web.config
+libs/
+wheels/
+packages/
+download_cache/
+diagrams/
+web.config
