@@ -6,6 +6,9 @@ from typing import Optional
 from datetime import datetime
 import os
 import io
+import time
+import asyncio
+import uuid
 import mimetypes
 import logging
 import db_connector
@@ -18,6 +21,8 @@ from slowapi.util import get_remote_address
 from utils.sanitize import sanitize_text, sanitize_filename
 from schemas.documents import ProcessUploadRequest, UpdateMetadataRequest, UpdateAbstractRequest, LinkEventRequest, SetTrusteesRequest
 from database import user_data
+from services.upload_cancel import upload_cancel_registry
+from wsdl_client.documents import UploadCancelled
 
 router = APIRouter()
 limiter = Limiter(key_func=get_remote_address)
@@ -99,18 +104,51 @@ async def process_batch(request: Request, user=Depends(get_current_user)):
 
 
 @router.post('/api/upload_document')
-@limiter.limit("10/minute")
+@limiter.limit("100/minute")
 async def api_upload_document(request: Request, file: UploadFile = File(...), docname: Optional[str] = Form(None),
                               abstract: str = Form("Uploaded via EDMS Viewer"),
                               event_id: Optional[str] = Form(None), parent_id: Optional[str] = Form(None),
                               date_taken: Optional[str] = Form(None),
                               x_app_source: str = Header("unknown", alias="X-App-Source"),
+                              idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key"),
                               user=Depends(get_current_user)):
     if not file.filename:
         raise HTTPException(status_code=400, detail="No selected file")
 
-    file_bytes = file.file.read()
-    file.file.seek(0)
+    original_filename = secure_filename(file.filename)
+
+    from services.idempotency_store import idempotency_store
+    if idempotency_key:
+        result = idempotency_store.get_result(idempotency_key)
+        if result:
+            if result["status"] == "SUCCESS":
+                return {
+                    "success": True, 
+                    "docnumber": result["doc_number"], 
+                    "filename": original_filename, 
+                    "message": "Idempotent hit: Returning cached success response"
+                }
+            elif result["status"] == "IN_PROGRESS":
+                raise HTTPException(status_code=409, detail="Upload already in progress. Please wait.")
+            elif result["status"] == "CANCELLED":
+                # This upload was cancelled before the handler got here — clear
+                # the key so a fresh retry is possible and stop immediately.
+                idempotency_store.mark_failed(idempotency_key)
+                raise HTTPException(status_code=499, detail="Upload cancelled.")
+
+        if not idempotency_store.claim_key(idempotency_key):
+            raise HTTPException(status_code=409, detail="Upload already in progress. Please wait.")
+
+    # Read the uploaded file. If the client aborts/cancels mid-transfer this read
+    # will be interrupted, so release the idempotency key and bail out cleanly.
+    try:
+        file_bytes = file.file.read()
+        file.file.seek(0)
+    except Exception as read_err:
+        if idempotency_key:
+            idempotency_store.mark_failed(idempotency_key)
+        logging.warning(f"Upload aborted during file transfer (client likely cancelled): {read_err}")
+        raise HTTPException(status_code=499, detail="Upload cancelled by client during transfer.")
     file_size = len(file_bytes)
 
     # --- Quota Check ---
@@ -150,7 +188,15 @@ async def api_upload_document(request: Request, file: UploadFile = File(...), do
     if parent_id and str(parent_id).strip().lower() in ['null', 'undefined', '']:
         parent_id = None
 
-    dst = wsdl_client.dms_system_login()
+    # If the client has disconnected/cancelled, abort BEFORE creating anything in the
+    # DMS so we don't leave an orphaned document the user never asked for.
+    if await request.is_disconnected():
+        if idempotency_key:
+            idempotency_store.mark_failed(idempotency_key)
+        logging.info(f"Client disconnected before DMS upload for '{original_filename}'; aborting.")
+        raise HTTPException(status_code=499, detail="Client disconnected; upload aborted.")
+
+    dst = await run_in_threadpool(wsdl_client.dms_system_login)
     if not dst:
         raise HTTPException(status_code=500, detail="Failed to authenticate with DMS.")
 
@@ -164,10 +210,81 @@ async def api_upload_document(request: Request, file: UploadFile = File(...), do
         "app_source": x_app_source
     }
 
+    # --- Cancellation support for the (potentially long) DMS transfer ---
+    # The flag is keyed by the idempotency key so the client can target this
+    # exact upload via POST /api/upload_document/cancel.
+    cancel_key = idempotency_key or f"_anon_{uuid.uuid4().hex}"
+    upload_cancel_registry.register(cancel_key)
+
+    # Throttled shared-store check so a cancel request that lands on a different
+    # worker process (uvicorn --workers N) still stops this upload.
+    _shared_check_state = {"last_check": 0.0}
+
+    def cancel_check():
+        # Fast path: in-memory flag (same-worker cancel or disconnect watcher)
+        if upload_cancel_registry.is_cancelled(cancel_key):
+            return True
+        # Slower path: shared SQLite flag, checked at most once per second
+        if idempotency_key:
+            now = time.monotonic()
+            if now - _shared_check_state["last_check"] >= 1.0:
+                _shared_check_state["last_check"] = now
+                if idempotency_store.is_cancelled(idempotency_key):
+                    upload_cancel_registry.cancel(cancel_key)  # latch locally
+                    return True
+        return False
+
+    # Belt-and-suspenders: also watch for a client disconnect (tab closed /
+    # XHR aborted) and flag cancellation so the DMS transfer stops promptly,
+    # even if the explicit cancel request never arrives.
+    async def _watch_disconnect():
+        try:
+            while True:
+                await asyncio.sleep(0.25)
+                if await request.is_disconnected():
+                    upload_cancel_registry.cancel(cancel_key)
+                    return
+        except asyncio.CancelledError:
+            pass
+
+    disconnect_watcher = asyncio.create_task(_watch_disconnect())
+
     # Passing file.file (SpooledTemporaryFile) acts like a stream
-    new_doc_number = await wsdl_client.upload_document_to_dms(dst, file.file, metadata, parent_id=parent_id)
+    try:
+        new_doc_number = await wsdl_client.upload_document_to_dms(
+            dst, file.file, metadata, parent_id=parent_id, cancel_check=cancel_check
+        )
+    except UploadCancelled as ce:
+        if idempotency_key:
+            idempotency_store.mark_failed(idempotency_key)
+        # Clean up the partially-created document now that the write stream has
+        # been released inside upload_document_to_dms.
+        if ce.doc_number:
+            try:
+                deleted, del_msg = await run_in_threadpool(
+                    wsdl_client.delete_document, dst, ce.doc_number, True
+                )
+                if not deleted:
+                    logging.warning(
+                        f"Could not delete cancelled partial document {ce.doc_number}: {del_msg}"
+                    )
+            except Exception as cleanup_err:
+                logging.warning(
+                    f"Error cleaning up cancelled partial document {ce.doc_number}: {cleanup_err}"
+                )
+        raise HTTPException(status_code=499, detail="Upload cancelled.")
+    except Exception as e:
+        if idempotency_key:
+            idempotency_store.mark_failed(idempotency_key)
+        raise e
+    finally:
+        disconnect_watcher.cancel()
+        upload_cancel_registry.unregister(cancel_key)
 
     if new_doc_number:
+        if idempotency_key:
+            idempotency_store.mark_success(idempotency_key, int(new_doc_number))
+            
         # --- Deduct Quota ---
         if user and 'edms_user_id' in locals():
             await user_data.deduct_user_quota(edms_user_id, file_size)
@@ -178,7 +295,7 @@ async def api_upload_document(request: Request, file: UploadFile = File(...), do
             trustees = []
             if parent_id:
                 try:
-                    parent_trustees = wsdl_client.get_object_trustees(dst, str(parent_id))
+                    parent_trustees = await run_in_threadpool(wsdl_client.get_object_trustees, dst, str(parent_id))
                     if parent_trustees:
                         trustees = list(parent_trustees)
                 except Exception as te:
@@ -192,12 +309,13 @@ async def api_upload_document(request: Request, file: UploadFile = File(...), do
             if not uploader_in_list:
                 trustees.append({'username': username, 'rights': 255, 'flag': 2})
 
-            success, message = wsdl_client.set_trustees(
-                dst=dst,
-                doc_id=str(new_doc_number),
-                library='RTA_MAIN',
-                trustees=trustees,
-                security_enabled='1'
+            success, message = await run_in_threadpool(
+                wsdl_client.set_trustees,
+                dst,
+                str(new_doc_number),
+                'RTA_MAIN',
+                trustees,
+                '1'
             )
             if not success:
                 logging.warning(f"Failed to set security on uploaded document {new_doc_number}: {message}")
@@ -205,32 +323,66 @@ async def api_upload_document(request: Request, file: UploadFile = File(...), do
 
         return {"success": True, "docnumber": new_doc_number, "filename": original_filename}
     else:
+        if idempotency_key:
+            idempotency_store.mark_failed(idempotency_key)
         raise HTTPException(status_code=500, detail="Failed to upload file to DMS.")
+
+
+@router.post('/api/upload_document/cancel')
+async def api_cancel_upload_document(request: Request, user=Depends(get_current_user)):
+    """
+    Cancels an in-progress upload identified by its Idempotency-Key.
+
+    The flag is checked between chunks while the file is being streamed to the
+    DMS, so the transfer stops shortly after this call and the partially-created
+    document is removed. Safe to call even if the upload has already finished.
+
+    The signal is written to both the in-memory registry (fast path, same
+    worker) and the shared idempotency store (works across worker processes).
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+
+    key = body.get('idempotency_key') or body.get('idempotencyKey')
+    if not key:
+        raise HTTPException(status_code=400, detail="idempotency_key is required.")
+
+    key = str(key)
+    cancelled_in_worker = upload_cancel_registry.cancel(key)
+
+    # Persist the cancellation so the worker streaming the file can see it even
+    # if this request was handled by a different worker process.
+    from services.idempotency_store import idempotency_store
+    idempotency_store.mark_cancelled(key)
+
+    return {"cancelled": cancelled_in_worker, "idempotency_key": key}
+
 
 @router.post('/api/process_uploaded_documents')
 async def api_process_uploaded_documents(data: ProcessUploadRequest, user=Depends(get_current_user)):
+    # --- AUTO AI PROCESSING DISABLED ---
+    # AI analysis on upload is disabled. Documents will only be processed
+    # when triggered by the scheduled Crawler Task via /process-batch.
+    # To re-enable, uncomment the enqueue call below.
+    # ---
     if not data.docnumbers:
         return {"processed": [], "failed": [], "in_progress": []}
 
-    queue_result = processing_queue.enqueue_docnumbers(data.docnumbers, source="upload")
-    queued_ids = []
-    for raw_doc in data.docnumbers:
-        try:
-            queued_ids.append(int(raw_doc))
-        except (TypeError, ValueError):
-            continue
+    # queue_result = processing_queue.enqueue_docnumbers(data.docnumbers, source="upload")
 
     return {
         "processed": [],
         "failed": [],
-        "in_progress": queued_ids,
-        "queue_details": queue_result,
+        "in_progress": [],
+        "message": "Auto AI processing is disabled. Documents will be processed by the scheduled crawler.",
     }
 
 @router.get('/api/document/{docnumber}')
 async def get_document_file(docnumber: int, request: Request, user=Depends(get_current_user)):
 
-    dst = wsdl_client.dms_system_login()
+    dst = await run_in_threadpool(wsdl_client.dms_system_login)
     if not dst:
         raise HTTPException(status_code=500, detail="Failed to get token")
 
@@ -247,9 +399,9 @@ async def get_document_file(docnumber: int, request: Request, user=Depends(get_c
         if disposition == 'attachment':
             cache_path = db_connector.get_download_cache_path(docnumber, file_ext)
             if not os.path.exists(cache_path):
-                did_cache = db_connector.cache_document_stream_to_file(dst, docnumber, cache_path)
+                did_cache = await db_connector.cache_document_stream_to_file_async(dst, docnumber, cache_path)
                 if not did_cache:
-                    file_bytes = db_connector.get_media_content_from_dms(dst, docnumber)
+                    file_bytes = await db_connector.get_media_content_from_dms_async(dst, docnumber)
                     if not file_bytes:
                         raise HTTPException(status_code=404, detail="Document not found")
                     _write_cached_download_fallback(cache_path, file_bytes)
@@ -264,7 +416,7 @@ async def get_document_file(docnumber: int, request: Request, user=Depends(get_c
                 }
             )
 
-        file_bytes = db_connector.get_media_content_from_dms(dst, docnumber)
+        file_bytes = await db_connector.get_media_content_from_dms_async(dst, docnumber)
         if not file_bytes:
             raise HTTPException(status_code=404, detail="Document not found")
 
@@ -321,7 +473,7 @@ async def api_download_watermarked(doc_id: int, request: Request, user=Depends(g
     username = request.session['user'].get('username', 'Unknown')
     system_id = await db_connector.get_user_system_id(username) or "UNKNOWN"
 
-    dst = wsdl_client.dms_system_login()
+    dst = await run_in_threadpool(wsdl_client.dms_system_login)
     if not dst:
         raise HTTPException(status_code=500, detail="Failed to get token")
 
@@ -341,12 +493,19 @@ async def api_download_watermarked(doc_id: int, request: Request, user=Depends(g
         mimetype, _ = get_mimetype_for_media(media_type, file_ext)
         cache_path = db_connector.get_download_cache_path(doc_id, file_ext)
         if not os.path.exists(cache_path):
-            did_cache = db_connector.cache_document_stream_to_file(dst, doc_id, cache_path)
+            did_cache = await db_connector.cache_document_stream_to_file_async(dst, doc_id, cache_path)
             if not did_cache:
-                file_bytes = db_connector.get_media_content_from_dms(dst, doc_id)
+                file_bytes = await db_connector.get_media_content_from_dms_async(dst, doc_id)
                 if not file_bytes:
                     raise HTTPException(status_code=500, detail="Failed to retrieve content")
                 _write_cached_download_fallback(cache_path, file_bytes)
+
+        try:
+            sys_id_int = int(system_id)
+            from database.activity import log_activity
+            await log_activity(doc_id, 'Download', sys_id_int)
+        except (ValueError, TypeError):
+            pass
 
         return FileResponse(
             cache_path,
@@ -359,7 +518,7 @@ async def api_download_watermarked(doc_id: int, request: Request, user=Depends(g
         )
     
     # --- PROCESSING PATH (Watermark Required or Fallback) ---
-    file_bytes = db_connector.get_media_content_from_dms(dst, doc_id)
+    file_bytes = await db_connector.get_media_content_from_dms_async(dst, doc_id)
     if not file_bytes:
         raise HTTPException(status_code=500, detail="Failed to retrieve content")
 
@@ -384,6 +543,13 @@ async def api_download_watermarked(doc_id: int, request: Request, user=Depends(g
         mimetype = "application/vnd.openxmlformats-officedocument.presentationml.presentation"
     elif media_type == 'text':
         mimetype = "text/plain"
+
+    try:
+        sys_id_int = int(system_id)
+        from database.activity import log_activity
+        await log_activity(doc_id, 'Download', sys_id_int)
+    except (ValueError, TypeError):
+        pass
 
     return StreamingResponse(
         io.BytesIO(processed_bytes),
@@ -430,7 +596,7 @@ async def set_document_security(doc_id: str, data: SetTrusteesRequest, request: 
         pass
 
     if not token:
-        token = wsdl_client.dms_system_login()
+        token = await run_in_threadpool(wsdl_client.dms_system_login)
         if not token:
             raise HTTPException(status_code=500, detail="Failed to authenticate with DMS.")
 
@@ -446,7 +612,7 @@ async def set_document_security(doc_id: str, data: SetTrusteesRequest, request: 
     # If user token failed, retry with a fresh system token
     if not success:
         logging.warning(f"set_trustees failed with user token for doc {doc_id}: {message}. Retrying with system token.")
-        sys_token = wsdl_client.dms_system_login(force_refresh=True)
+        sys_token = await run_in_threadpool(wsdl_client.dms_system_login, True)
         if sys_token and sys_token != token:
             success, message = await run_in_threadpool(
                 wsdl_client.set_trustees,

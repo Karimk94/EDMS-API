@@ -4,6 +4,7 @@ import db_connector
 from database import sharing as sharing_db
 from database import documents as documents_db
 from database import folders as folders_db
+from typing import Optional
 
 from schemas.sharing import (
     ShareLinkCreateRequest,
@@ -12,14 +13,17 @@ from schemas.sharing import (
     SharedFolderContentsRequest,
     SharedDocumentDownloadRequest
 )
+from database.activity import log_activity, get_or_create_viewer_person
 import logging
 import os
 import random
 from datetime import datetime
-from fastapi.responses import StreamingResponse, FileResponse
+from fastapi.responses import StreamingResponse, FileResponse, JSONResponse
 import io
+import zipfile
 import re
 import secrets
+import uuid
 import wsdl_client
 from database.media import video_cache_dir
 
@@ -31,6 +35,8 @@ from slowapi.util import get_remote_address
 router = APIRouter()
 limiter = Limiter(key_func=get_remote_address)
 ALLOWED_DOMAIN = "@rta.ae"
+ZIP_PART_SIZE_LIMIT_BYTES = 500 * 1024 * 1024  # 500 MB per partition
+ZIP_TOTAL_SIZE_LIMIT_BYTES = 1 * 1024 * 1024 * 1024  # 1 GB total limit unless bypassed
 
 @router.post('/api/share/generate')
 @limiter.limit("100/minute")
@@ -272,7 +278,7 @@ async def request_access_otp(request: Request, token: str, req: ShareAccessReque
         raise HTTPException(status_code=500, detail="Failed to process OTP request.")
 
 @router.post('/api/share/verify-access/{token}')
-@limiter.limit("10/minute")
+@limiter.limit("100/minute")
 async def verify_access_otp(request: Request, token: str, req: ShareVerifyRequest):
     """
     Step 2: Verifies OTP via Database (or skips for restricted shares).
@@ -317,6 +323,13 @@ async def verify_access_otp(request: Request, token: str, req: ShareVerifyReques
                 raise HTTPException(status_code=400, detail="Invalid or expired OTP.")
 
         await sharing_db.log_share_access(share_info['share_id'], viewer_email)
+        try:
+            viewer_sys_id = await get_or_create_viewer_person(viewer_email)
+            doc_or_folder = share_info.get('document_id') or share_info.get('folder_id')
+            if viewer_sys_id and doc_or_folder:
+                await log_activity(int(doc_or_folder), 'View Shared Link', viewer_sys_id)
+        except Exception as e:
+            logging.error(f"Failed to log view share activity: {e}")
 
         share_type = share_info.get('share_type', 'file')
 
@@ -462,7 +475,7 @@ async def stream_shared_document(
             document_id = share_info['document_id']
 
         # 5. Login with system credentials
-        dst = wsdl_client.dms_system_login()
+        dst = await run_in_threadpool(wsdl_client.dms_system_login)
         if not dst:
             raise HTTPException(status_code=500, detail="Failed to authenticate with DMS")
 
@@ -481,7 +494,7 @@ async def stream_shared_document(
             cache_filepath = os.path.join(video_cache_dir, cache_filename)
 
             if not os.path.exists(cache_filepath):
-                file_bytes = db_connector.get_media_content_from_dms(dst, document_id)
+                file_bytes = await db_connector.get_media_content_from_dms_async(dst, document_id)
                 if not file_bytes:
                     raise HTTPException(status_code=500, detail="Failed to retrieve content")
                 
@@ -504,7 +517,7 @@ async def stream_shared_document(
             )
 
         # 8. For other files, just stream inline (no watermark)
-        file_bytes = db_connector.get_media_content_from_dms(dst, document_id)
+        file_bytes = await db_connector.get_media_content_from_dms_async(dst, document_id)
         if not file_bytes:
             raise HTTPException(status_code=500, detail="Failed to retrieve content")
 
@@ -575,7 +588,7 @@ async def download_shared_document(
             document_id = share_info['document_id']
 
         # 5. Login with system credentials
-        dst = wsdl_client.dms_system_login()
+        dst = await run_in_threadpool(wsdl_client.dms_system_login)
         if not dst:
             raise HTTPException(status_code=500, detail="Failed to authenticate with DMS")
 
@@ -594,17 +607,31 @@ async def download_shared_document(
             mimetype, _ = get_mimetype_for_media(media_type, file_ext)
             cache_path = db_connector.get_download_cache_path(document_id, file_ext)
             if not os.path.exists(cache_path):
-                did_cache = db_connector.cache_document_stream_to_file(dst, document_id, cache_path)
+                did_cache = await db_connector.cache_document_stream_to_file_async(dst, document_id, cache_path)
                 if not did_cache:
-                    file_bytes = db_connector.get_media_content_from_dms(dst, document_id)
+                    file_bytes = await db_connector.get_media_content_from_dms_async(dst, document_id)
                     if not file_bytes:
                         raise HTTPException(status_code=500, detail="Failed to retrieve document content")
-                    temp_path = f"{cache_path}.tmp"
+                    temp_path = f"{cache_path}.{uuid.uuid4().hex}.tmp"
                     with open(temp_path, 'wb') as cache_file:
                         cache_file.write(file_bytes)
-                    os.replace(temp_path, cache_path)
+                    try:
+                        os.replace(temp_path, cache_path)
+                    except OSError as e:
+                        logging.error(f"Failed to replace temp cache: {e}")
+                        if os.path.exists(temp_path):
+                            try:
+                                os.remove(temp_path)
+                            except OSError:
+                                pass
 
             await sharing_db.log_share_access(share_info['share_id'], viewer_email)
+            try:
+                viewer_sys_id = await get_or_create_viewer_person(viewer_email)
+                if viewer_sys_id:
+                    await log_activity(int(document_id), 'Download', viewer_sys_id)
+            except Exception as e:
+                logging.error(f"Failed to log download activity: {e}")
 
             return FileResponse(
                 cache_path,
@@ -625,21 +652,25 @@ async def download_shared_document(
             if os.path.exists(raw_cache_path):
                 # logging.info(f"Using existing global raw cache for shared download: {document_id}{file_ext}")
                 try:
-                    with open(raw_cache_path, 'rb') as f:
-                        file_bytes = f.read()
+                    def read_raw_cache():
+                        with open(raw_cache_path, 'rb') as f:
+                            return f.read()
+                    file_bytes = await run_in_threadpool(read_raw_cache)
                 except Exception as e:
                     logging.warning(f"Failed to read cache {raw_cache_path}: {e}")
 
         if not file_bytes:
-            file_bytes = db_connector.get_media_content_from_dms(dst, document_id)
+            file_bytes = await db_connector.get_media_content_from_dms_async(dst, document_id)
             if not file_bytes:
                 raise HTTPException(status_code=500, detail="Failed to retrieve document content")
             
             # Populate cache if it's a video and we just downloaded it
             if media_type == 'video' and raw_cache_path:
                 try:
-                    with open(raw_cache_path, 'wb') as f:
-                        f.write(file_bytes)
+                    def write_raw_cache():
+                        with open(raw_cache_path, 'wb') as f:
+                            f.write(file_bytes)
+                    await run_in_threadpool(write_raw_cache)
                     # logging.info(f"Populated global raw cache for: {document_id}{file_ext}")
                 except Exception as e:
                     logging.warning(f"Failed to populate global cache: {e}")
@@ -666,6 +697,12 @@ async def download_shared_document(
 
         # 9. Log the download
         await sharing_db.log_share_access(share_info['share_id'], viewer_email)
+        try:
+            viewer_sys_id = await get_or_create_viewer_person(viewer_email)
+            if viewer_sys_id:
+                await log_activity(int(document_id), 'Download', viewer_sys_id)
+        except Exception as e:
+            logging.error(f"Failed to log download activity: {e}")
 
         # 10. Return the watermarked file
         return StreamingResponse(
@@ -682,3 +719,225 @@ async def download_shared_document(
     except Exception as e:
         logging.error(f"Share download error: {e}")
         raise HTTPException(status_code=500, detail="Failed to download document.")
+
+
+@router.get('/api/share/download-folder-zip/{token}')
+async def download_shared_folder_zip(
+        token: str,
+        req: SharedDocumentDownloadRequest = Depends(),
+        part: Optional[int] = Query(None),
+        folder_id: Optional[str] = Query(None)
+):
+    """
+    Downloads a shared folder's contents as a ZIP archive.
+    If the total size exceeds 500 MB, the response depends on the `part` parameter:
+    - Without `part`: returns a JSON manifest listing how many parts are available.
+    - With `part=N`: returns the Nth partition as a ZIP file.
+    For folders ≤ 500 MB, always returns a single ZIP (ignores `part`).
+
+    Optional `folder_id` parameter allows downloading a specific subfolder within the share.
+    """
+    try:
+        viewer_email = req.viewer_email
+
+        # 1. Validate email access
+        is_allowed, error_message = await sharing_db.validate_target_email_access(token, viewer_email)
+        if not is_allowed:
+            raise HTTPException(status_code=403, detail=error_message)
+
+        # 2. Verify the share link is valid
+        share_info = await sharing_db.get_share_details(token)
+        if not share_info:
+            raise HTTPException(status_code=404, detail="Link is invalid or expired")
+
+        # 3. Verify the viewer has verified access via OTP
+        has_access = await sharing_db.check_viewer_access(token, viewer_email)
+        if not has_access:
+            raise HTTPException(status_code=403, detail="Access not verified. Please complete OTP verification first.")
+
+        # 4. Verify this is a folder share
+        if share_info.get('share_type') != 'folder':
+            raise HTTPException(status_code=400, detail="This is not a folder share")
+
+        root_folder_id = str(share_info['folder_id'])
+
+        # 5. Determine target folder (subfolder or root)
+        target_folder_id = root_folder_id
+        if folder_id and str(folder_id) != root_folder_id:
+            # Security check: verify the requested folder is within the shared hierarchy
+            is_subfolder = await folders_db.verify_folder_in_hierarchy(root_folder_id, str(folder_id))
+            if not is_subfolder:
+                raise HTTPException(status_code=403, detail="Access denied. Folder is outside shared scope.")
+            target_folder_id = str(folder_id)
+
+        # 6. Login with system credentials
+        dst = await run_in_threadpool(wsdl_client.dms_system_login)
+        if not dst:
+            raise HTTPException(status_code=500, detail="Failed to authenticate with DMS")
+
+        # 7. Get folder name for the target folder
+        try:
+            target_info = await folders_db.get_folder_by_docnumber(target_folder_id)
+            target_name = target_info['name'] if target_info else f"Folder_{target_folder_id}"
+        except Exception:
+            target_name = f"Folder_{target_folder_id}"
+
+        # 8. Collect all files recursively from the target folder (including subfolders)
+        try:
+            all_files = await folders_db.get_folder_files_recursive(target_folder_id)
+        except Exception as e:
+            logging.error(f"Failed to list files in shared folder {target_folder_id}: {e}")
+            raise HTTPException(status_code=500, detail='Failed to list folder contents')
+
+        file_entries: list[tuple[str, str]] = [
+            (f['id'], f['archive_path']) for f in all_files
+        ]
+
+        if not file_entries:
+            raise HTTPException(status_code=404, detail='Folder has no files to download')
+
+        # --- Download all file contents and measure sizes ---
+        downloaded_files: list[tuple[str, bytes, str]] = []  # (archive_path, content, doc_id)
+        total_bytes = 0
+
+        for doc_id, archive_path in file_entries:
+            try:
+                content, dms_filename = await run_in_threadpool(wsdl_client.get_image_by_docnumber, dst, doc_id)
+            except Exception as e:
+                logging.warning(f"Skipping doc {doc_id} in ZIP (download error): {e}")
+                continue
+
+            if not content:
+                continue
+
+            # Ensure the archive path has the correct file extension from DMS
+            _, dms_ext = os.path.splitext(dms_filename or '')
+            if dms_ext:
+                base, existing_ext = os.path.splitext(archive_path)
+                if existing_ext.lower() != dms_ext.lower():
+                    archive_path = base + dms_ext
+
+            total_bytes += len(content)
+            downloaded_files.append((archive_path, bytes(content), doc_id))
+
+        if not downloaded_files:
+            raise HTTPException(status_code=404, detail='No files could be downloaded from this folder')
+
+        # --- 1 GB Total Limit Check ---
+        allow_large = share_info.get('LARGE_DOWNLOADS', False)
+        if total_bytes > ZIP_TOTAL_SIZE_LIMIT_BYTES and not allow_large:
+            raise HTTPException(
+                status_code=413,
+                detail='Not allowed to download the folder because it is bigger than 1 GB. If you want to enable this feature, contact the system administrator.'
+            )
+
+        safe_name = target_name.replace('"', '').replace('/', '_').replace('\\', '_') or target_folder_id
+
+        # --- Single ZIP (total ≤ 500 MB) ---
+        if total_bytes <= ZIP_PART_SIZE_LIMIT_BYTES:
+            zip_buffer = io.BytesIO()
+            try:
+                with zipfile.ZipFile(zip_buffer, mode='w', compression=zipfile.ZIP_DEFLATED, allowZip64=True) as zf:
+                    for archive_path, content, _ in downloaded_files:
+                        zf.writestr(archive_path, content)
+            except Exception as e:
+                logging.error(f"Error building ZIP for shared folder {root_folder_id}: {e}", exc_info=True)
+                raise HTTPException(status_code=500, detail='Failed to build ZIP archive')
+
+            zip_buffer.seek(0)
+            content_disposition = build_content_disposition(f'{safe_name}.zip', 'attachment')
+
+            # Log the download
+            await sharing_db.log_share_access(share_info['share_id'], viewer_email)
+            try:
+                viewer_sys_id = await get_or_create_viewer_person(viewer_email)
+                if viewer_sys_id:
+                    await log_activity(int(root_folder_id), 'Download', viewer_sys_id)
+            except Exception as e:
+                logging.error(f"Failed to log folder download activity: {e}")
+
+            return StreamingResponse(
+                iter([zip_buffer.read()]),
+                media_type='application/zip',
+                headers={'Content-Disposition': content_disposition}
+            )
+
+        # --- Multipart: partition files into ~500 MB chunks ---
+        parts: list[list[tuple[str, bytes]]] = []
+        current_part: list[tuple[str, bytes]] = []
+        current_part_size = 0
+
+        for archive_path, content, _ in downloaded_files:
+            file_size = len(content)
+
+            # If adding this file would exceed the limit and current part is non-empty, start a new part
+            if current_part and (current_part_size + file_size) > ZIP_PART_SIZE_LIMIT_BYTES:
+                parts.append(current_part)
+                current_part = []
+                current_part_size = 0
+
+            current_part.append((archive_path, content))
+            current_part_size += file_size
+
+        # Don't forget the last part
+        if current_part:
+            parts.append(current_part)
+
+        total_parts = len(parts)
+
+        # --- No part requested: return manifest ---
+        if part is None:
+            manifest_parts = []
+            for i, p in enumerate(parts):
+                part_size = sum(len(c) for _, c in p)
+                manifest_parts.append({
+                    'part': i + 1,
+                    'file_count': len(p),
+                    'size_bytes': part_size
+                })
+            return JSONResponse({
+                'multipart': True,
+                'total_parts': total_parts,
+                'folder_name': safe_name,
+                'total_size_bytes': total_bytes,
+                'parts': manifest_parts
+            })
+
+        # --- Part requested: validate and return that partition ---
+        if part < 1 or part > total_parts:
+            raise HTTPException(status_code=400, detail=f'Invalid part number. Must be between 1 and {total_parts}.')
+
+        selected_files = parts[part - 1]
+        zip_buffer = io.BytesIO()
+        try:
+            with zipfile.ZipFile(zip_buffer, mode='w', compression=zipfile.ZIP_DEFLATED, allowZip64=True) as zf:
+                for archive_path, content in selected_files:
+                    zf.writestr(archive_path, content)
+        except Exception as e:
+            logging.error(f"Error building ZIP part {part} for shared folder {root_folder_id}: {e}", exc_info=True)
+            raise HTTPException(status_code=500, detail='Failed to build ZIP archive')
+
+        zip_buffer.seek(0)
+        part_filename = f'{safe_name}_Part{part}of{total_parts}.zip'
+        content_disposition = build_content_disposition(part_filename, 'attachment')
+
+        # Log the download
+        await sharing_db.log_share_access(share_info['share_id'], viewer_email)
+        try:
+            viewer_sys_id = await get_or_create_viewer_person(viewer_email)
+            if viewer_sys_id:
+                await log_activity(int(root_folder_id), 'Download', viewer_sys_id)
+        except Exception as e:
+            logging.error(f"Failed to log folder part download activity: {e}")
+
+        return StreamingResponse(
+            iter([zip_buffer.read()]),
+            media_type='application/zip',
+            headers={'Content-Disposition': content_disposition}
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logging.error(f"Share folder ZIP download error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to download shared folder as ZIP.")
