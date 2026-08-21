@@ -44,6 +44,44 @@ def get_captions(image_data, filename):
     response.raise_for_status()
     return response.json()
 
+
+def shorten_caption(caption_text, max_length=300):
+    """
+    Calls the translator/rephraser API to shorten a caption while preserving context.
+    Used as a fallback when the original caption is too long.
+    """
+    api_url = os.getenv("TRANSLATOR_REPHRASER_API_URL")
+    payload = {
+        "text": caption_text,
+        "task": "shorten",
+        "max_length": max_length
+    }
+    
+    try:
+        response = requests.post(f"{api_url}/generate", json=payload, timeout=60, stream=True)
+        response.raise_for_status()
+        
+        result_text = ""
+        for line in response.iter_lines():
+            if line:
+                decoded_line = line.decode('utf-8')
+                if decoded_line.startswith('data: '):
+                    data = decoded_line[6:]
+                    if data.strip() == '[END_OF_STREAM]':
+                        break
+                    result_text += data
+        return result_text.strip() if result_text.strip() else caption_text[:max_length]
+    except Exception as e:
+        logging.warning(f"Failed to shorten caption via API: {e}. Using direct truncation.")
+        # Fallback to direct truncation at word boundary
+        if len(caption_text) <= max_length:
+            return caption_text
+        truncated = caption_text[:max_length]
+        last_space = truncated.rfind(' ')
+        if last_space > max_length // 2:
+            return truncated[:last_space] + "..."
+        return truncated + "..."
+
 def get_ocr_text(image_data, filename):
     """Calls the OCR service for images using a stream."""
     api_url = f"{os.getenv('OCR_API_URL')}/translate_image_stream"

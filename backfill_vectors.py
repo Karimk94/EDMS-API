@@ -109,13 +109,13 @@ def main():
 
             try:
                 # Use the main vector_client's upsert function
-                # This will call the embedding service in a batch
+                # This will call the embedding service for each document
                 logging.info(f"Indexing batch of {len(doc_ids)} documents (IDs from {doc_ids[0]} to {doc_ids[-1]})...")
-                vector_client.collection.upsert(
-                    documents=documents_content,
-                    ids=doc_ids,
-                    metadatas=[{"doc_id": did, "source": "abstract"} for did in doc_ids]
-                )
+                
+                for i, (doc_id, content) in enumerate(zip(doc_ids, documents_content)):
+                    vector_client.add_or_update_document(int(doc_id), content)
+                    if (i + 1) % 10 == 0:
+                        logging.info(f"Progress: {i + 1}/{len(doc_ids)} documents in current batch")
                 
                 total_processed += len(doc_ids)
                 logging.info(f"Successfully indexed batch. Total processed so far: {total_processed}")

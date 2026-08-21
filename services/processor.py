@@ -8,6 +8,13 @@ from utils.common import clean_repeated_words, get_session_token
 from fastapi import HTTPException, Request
 from starlette.concurrency import run_in_threadpool
 
+# Maximum character limit for the ABSTRACT column in Oracle
+MAX_ABSTRACT_LENGTH = 2000
+# Target length for caption to leave room for other content
+MAX_CAPTION_LENGTH = 500
+# Target length for OCR text
+MAX_OCR_LENGTH = 1000
+
 
 # --- Helper functions to reduce duplication ---
 
@@ -30,6 +37,109 @@ async def _translate_and_collect(tags: list) -> list:
         arabic = await run_in_threadpool(api_client.translate_text, tag)
         keywords.append({'english': tag, 'arabic': arabic})
     return keywords
+
+
+def _truncate_text_smart(text: str, max_length: int, suffix: str = "...") -> str:
+    """
+    Intelligently truncates text to fit within max_length.
+    Tries to break at sentence or word boundaries.
+    """
+    if not text or len(text) <= max_length:
+        return text
+    
+    # Try to break at sentence boundary (period, question mark, exclamation)
+    truncated = text[:max_length - len(suffix)]
+    
+    # Look for sentence boundary within last 100 characters
+    for i in range(len(truncated) - 1, max(0, len(truncated) - 100), -1):
+        if truncated[i] in '.!?':
+            return truncated[:i + 1] + suffix
+    
+    # Fall back to word boundary
+    last_space = truncated.rfind(' ')
+    if last_space > max_length // 2:
+        return truncated[:last_space] + suffix
+    
+    return truncated + suffix
+
+
+def _ensure_abstract_fits(base_abstract: str, caption: str, ocr: str, vips: str) -> tuple:
+    """
+    Ensures the final abstract fits within MAX_ABSTRACT_LENGTH.
+    Returns tuple of (caption, ocr, vips) with potentially truncated values.
+    Logs when truncation occurs.
+    """
+    # Calculate current total length
+    parts = [base_abstract]
+    if caption:
+        parts.append(f"Caption: {caption}")
+    if ocr:
+        parts.append(f"OCR: {ocr}")
+    if vips:
+        parts.append(f"VIPs: {vips}")
+    
+    current_length = len("\n\n".join(filter(None, parts)))
+    
+    if current_length <= MAX_ABSTRACT_LENGTH:
+        return caption, ocr, vips
+    
+    logging.warning(f"Abstract too long ({current_length} chars), truncating...")
+    
+    # Calculate available space for AI content
+    # Reserve space for base_abstract + separators
+    base_len = len(base_abstract) + 20 if base_abstract else 0  # 20 for separators
+    available_for_ai = MAX_ABSTRACT_LENGTH - base_len
+    
+    if available_for_ai < 100:
+        # Very limited space - just keep caption if possible
+        if caption:
+            caption = _truncate_text_smart(caption, min(MAX_CAPTION_LENGTH, available_for_ai - 10))
+        return caption or "", "", vips or ""
+    
+    # First, truncate OCR if present (OCR is usually longest)
+    if ocr and len(ocr) > MAX_OCR_LENGTH:
+        ocr = _truncate_text_smart(ocr, MAX_OCR_LENGTH)
+        logging.info(f"Truncated OCR to {len(ocr)} chars")
+    
+    # Recalculate
+    parts = [base_abstract]
+    if caption:
+        parts.append(f"Caption: {caption}")
+    if ocr:
+        parts.append(f"OCR: {ocr}")
+    if vips:
+        parts.append(f"VIPs: {vips}")
+    current_length = len("\n\n".join(filter(None, parts)))
+    
+    # If still too long, truncate caption
+    if current_length > MAX_ABSTRACT_LENGTH and caption:
+        caption_space = MAX_ABSTRACT_LENGTH - base_len - len(ocr or "") - len(vips or "") - 30  # 30 for labels/separators
+        if caption_space > 50:
+            caption = _truncate_text_smart(caption, caption_space)
+            logging.info(f"Truncated caption to {len(caption)} chars")
+        else:
+            caption = ""
+    
+    # Recalculate again
+    parts = [base_abstract]
+    if caption:
+        parts.append(f"Caption: {caption}")
+    if ocr:
+        parts.append(f"OCR: {ocr}")
+    if vips:
+        parts.append(f"VIPs: {vips}")
+    current_length = len("\n\n".join(filter(None, parts)))
+    
+    # Last resort: truncate OCR further
+    if current_length > MAX_ABSTRACT_LENGTH and ocr:
+        ocr_space = MAX_ABSTRACT_LENGTH - base_len - len(caption or "") - len(vips or "") - 30
+        if ocr_space > 50:
+            ocr = _truncate_text_smart(ocr, ocr_space)
+            logging.info(f"Further truncated OCR to {len(ocr)} chars")
+        else:
+            ocr = ""
+    
+    return caption or "", ocr or "", vips or ""
 
 
 # --- Async wrappers for blocking api_client calls ---
@@ -182,14 +292,27 @@ async def process_document(doc, dms_session_token):
                 # ASYNC DB CALL
                 await db_connector.insert_keywords_and_tags(docnumber, keywords_to_insert)
 
+        # Apply truncation to ensure abstract fits within Oracle column limit
+        caption = ai_abstract_parts.get('CAPTION', '')
+        ocr = ai_abstract_parts.get('OCR', '')
+        vips = ai_abstract_parts.get('VIPS', '')
+        
+        caption, ocr, vips = _ensure_abstract_fits(base_abstract, caption, ocr, vips)
+        
         final_abstract_parts = [base_abstract]
-        if ai_abstract_parts.get('CAPTION'): final_abstract_parts.append(f"Caption: {ai_abstract_parts['CAPTION']} ")
-        if ai_abstract_parts.get('OCR'): final_abstract_parts.append(f"OCR: {ai_abstract_parts['OCR']} ")
-        if ai_abstract_parts.get('VIPS'): final_abstract_parts.append(f"VIPs: {ai_abstract_parts['VIPS']}")
-        if len(ai_abstract_parts) > 0:
+        if caption: final_abstract_parts.append(f"Caption: {caption}")
+        if ocr: final_abstract_parts.append(f"OCR: {ocr}")
+        if vips: final_abstract_parts.append(f"VIPs: {vips}")
+        
+        if caption or ocr or vips:
             results['new_abstract'] = "\n\n".join(filter(None, final_abstract_parts)).strip()
         else:
             results['new_abstract'] = base_abstract
+        
+        # Final safety check - should never exceed now
+        if len(results['new_abstract']) > MAX_ABSTRACT_LENGTH:
+            logging.warning(f"Abstract still too long after truncation ({len(results['new_abstract'])} chars), hard truncating")
+            results['new_abstract'] = results['new_abstract'][:MAX_ABSTRACT_LENGTH - 3] + "..."
 
         if media_type == 'pdf':
             results['status'] = 3 if results['ocr'] == 1 else results['status']
