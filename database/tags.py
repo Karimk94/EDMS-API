@@ -9,14 +9,32 @@ except ImportError:
     vector_client = None
 
 async def add_person_to_lkp(person_name_english, person_name_arabic=None):
-    """Adds a new person to the LKP_PERSON lookup table."""
+    """Adds a new person to the LKP_PERSON lookup table.
+
+    If the person already exists but NAME_ARABIC is NULL and a valid Arabic
+    name is provided this time, the missing translation is backfilled so the
+    record heals itself over time.
+    """
     conn = await get_async_connection()
     if not conn: return False, "Could not connect to the database."
     try:
         async with conn.cursor() as cursor:
-            await cursor.execute("SELECT COUNT(SYSTEM_ID) FROM LKP_PERSON WHERE NAME_ENGLISH = :1", [person_name_english])
+            await cursor.execute(
+                "SELECT COUNT(SYSTEM_ID), MAX(NAME_ARABIC) FROM LKP_PERSON WHERE NAME_ENGLISH = :1",
+                [person_name_english]
+            )
             res = await cursor.fetchone()
             if res[0] > 0:
+                existing_arabic = res[1]
+                # Backfill Arabic if it was missing and we have it now
+                if existing_arabic is None and person_name_arabic:
+                    await cursor.execute(
+                        "UPDATE LKP_PERSON SET NAME_ARABIC = :1, LAST_UPDATE = SYSDATE "
+                        "WHERE NAME_ENGLISH = :2",
+                        [person_name_arabic, person_name_english]
+                    )
+                    await conn.commit()
+                    return True, f"'{person_name_english}' already existed; Arabic translation backfilled."
                 return True, f"'{person_name_english}' already exists in LKP_PERSON."
 
             insert_query = """
@@ -115,17 +133,21 @@ async def fetch_all_tags(lang='en', security_level='Editor', app_source='unknown
                 if row[0]:
                     tags.add(row[0].strip())
 
+            # NVL fallback: if Arabic translation is missing, show English name
+            # so persons are never silently excluded in Arabic mode.
+            person_display = f"NVL({person_column}, p.NAME_ENGLISH)" if lang == 'ar' else person_column
+
             person_query = f"""
-                SELECT DISTINCT {person_column} 
-                FROM LKP_PERSON p 
-                WHERE {person_column} IS NOT NULL
+                SELECT DISTINCT {person_display}
+                FROM LKP_PERSON p
+                WHERE p.NAME_ENGLISH IS NOT NULL
                 AND EXISTS (
                     SELECT 1 FROM PROFILE pr
                     WHERE pr.FORM = 2740
                     AND {doc_filter_sql.replace('p.', 'pr.')}
                     AND (
                         UPPER(pr.ABSTRACT) LIKE '%' || UPPER(p.NAME_ENGLISH) || '%'
-                        OR 
+                        OR
                         (p.NAME_ARABIC IS NOT NULL AND pr.ABSTRACT LIKE '%' || p.NAME_ARABIC || '%')
                     )
                 )
@@ -181,10 +203,15 @@ async def fetch_tags_for_document(doc_id, lang='en', security_level='Editor'):
                     })
 
             if abstract:
+                # NVL(NAME_ARABIC, NAME_ENGLISH): if Arabic translation is missing
+                # fall back to the English name so the person tag is never silently
+                # dropped when NAME_ARABIC is NULL.
+                person_display = f"NVL({person_column}, p.NAME_ENGLISH)" if lang == 'ar' else person_column
                 person_query = f"""
-                    SELECT {person_column}
+                    SELECT {person_display}
                     FROM LKP_PERSON p
-                    WHERE :abstract LIKE '%' || UPPER(NAME_ENGLISH) || '%' AND {person_column} IS NOT NULL
+                    WHERE :abstract LIKE '%' || UPPER(NAME_ENGLISH) || '%'
+                      AND NAME_ENGLISH IS NOT NULL
                 """
                 await cursor.execute(person_query, {'abstract': abstract.upper()})
                 async for row in cursor:

@@ -331,6 +331,94 @@ def migrate_chroma(chroma_path: str, dry_run: bool):
 
 
 # ---------------------------------------------------------------------------
+# Phase 3 — Backfill missing NAME_ARABIC in LKP_PERSON
+# ---------------------------------------------------------------------------
+
+def translate_to_arabic(text: str) -> str | None:
+    """Call the Translator/Rephraser API to translate English text to Arabic."""
+    if not TRANSLATOR_URL:
+        log.warning("TRANSLATOR_REPHRASER_API_URL not set — cannot translate via API.")
+        return None
+    try:
+        resp = requests.post(
+            f"{TRANSLATOR_URL}/generate",
+            json={"text": text, "task": "translate", "target_lang": "ar"},
+            timeout=60,
+            stream=True,
+        )
+        resp.raise_for_status()
+        result = ""
+        for line in resp.iter_lines():
+            if line:
+                decoded = line.decode("utf-8")
+                if decoded.startswith("data: "):
+                    chunk = decoded[6:]
+                    if chunk.strip() == "[END_OF_STREAM]":
+                        break
+                    result += chunk
+        translated = result.strip()
+        # Sanity check: result should contain Arabic characters (non-ASCII)
+        if translated and not translated.isascii():
+            return translated
+        if translated:
+            log.warning(
+                "Translation returned ASCII for Arabic request: '%s' -> '%s'", text, translated
+            )
+        return None
+    except Exception as exc:
+        log.error("Arabic translation failed for '%s': %s", text, exc)
+        return None
+
+
+def migrate_lkp_person_arabic(dry_run: bool):
+    """Backfill NAME_ARABIC for all LKP_PERSON rows where it is NULL."""
+    log.info("=" * 60)
+    log.info("PHASE 3 — LKP_PERSON NAME_ARABIC backfill")
+    log.info("=" * 60)
+
+    conn = get_oracle_connection()
+    cursor = conn.cursor()
+
+    cursor.execute(
+        "SELECT SYSTEM_ID, NAME_ENGLISH FROM LKP_PERSON "
+        "WHERE NAME_ARABIC IS NULL AND NAME_ENGLISH IS NOT NULL"
+    )
+    rows = cursor.fetchall()
+    log.info("Found %d LKP_PERSON row(s) with NULL NAME_ARABIC.", len(rows))
+
+    updated = 0
+    failed  = 0
+
+    for system_id, name_english in rows:
+        arabic = translate_to_arabic(name_english)
+        if not arabic:
+            log.warning("  [ID %s] Could not translate '%s' — skipping.", system_id, name_english)
+            failed += 1
+            continue
+
+        log.info("  [ID %s] '%s' -> '%s'", system_id, name_english, arabic)
+        if not dry_run:
+            cursor.execute(
+                "UPDATE LKP_PERSON SET NAME_ARABIC = :1, LAST_UPDATE = SYSDATE "
+                "WHERE SYSTEM_ID = :2",
+                [arabic, system_id],
+            )
+        updated += 1
+
+    if not dry_run and updated:
+        conn.commit()
+
+    log.info(
+        "LKP_PERSON: %d row(s) %s, %d could not be translated.",
+        updated,
+        "would be updated (dry-run)" if dry_run else "updated",
+        failed,
+    )
+    cursor.close()
+    conn.close()
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
@@ -356,12 +444,17 @@ def main():
     parser.add_argument(
         "--skip-oracle",
         action="store_true",
-        help="Skip the Oracle PROFILE.ABSTRACT migration.",
+        help="Skip the Oracle PROFILE.ABSTRACT migration (Phase 1).",
     )
     parser.add_argument(
         "--skip-chroma",
         action="store_true",
-        help="Skip the ChromaDB migration.",
+        help="Skip the ChromaDB migration (Phase 2).",
+    )
+    parser.add_argument(
+        "--skip-lkp",
+        action="store_true",
+        help="Skip the LKP_PERSON NAME_ARABIC backfill (Phase 3).",
     )
     args = parser.parse_args()
 
@@ -381,6 +474,12 @@ def main():
 
     if not args.skip_chroma:
         migrate_chroma(chroma_path=args.chroma_path, dry_run=args.dry_run)
+
+    if not args.skip_lkp:
+        try:
+            migrate_lkp_person_arabic(dry_run=args.dry_run)
+        except Exception as exc:
+            log.error("LKP_PERSON backfill failed: %s", exc, exc_info=True)
 
     log.info("Migration complete.")
 

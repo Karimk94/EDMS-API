@@ -263,10 +263,33 @@ async def fetch_documents_from_oracle(page=1, page_size=20, search_term=None, da
                 for i, person in enumerate(person_list):
                     key = f'person_{i}'
                     key_upper = f'person_{i}_upper'
+
+                    # The ABSTRACT always stores English names (enforced by update_abstract_with_vips).
+                    # When the UI is in Arabic mode the caller sends the Arabic display name.
+                    # We must resolve it to the English form before matching against ABSTRACT.
+                    # Strategy:  Arabic input → look up NAME_ENGLISH in LKP_PERSON.
+                    #            English input → use as-is.
+                    english_person = person  # default: assume English
+                    if not person.isascii():
+                        # Arabic name — look up the English equivalent inside this same connection
+                        try:
+                            async with conn.cursor() as _cur:
+                                await _cur.execute(
+                                    "SELECT NAME_ENGLISH FROM LKP_PERSON "
+                                    "WHERE NAME_ARABIC = :1 AND NAME_ENGLISH IS NOT NULL",
+                                    [person]
+                                )
+                                row = await _cur.fetchone()
+                                if row:
+                                    english_person = row[0]
+                        except Exception:
+                            pass  # fall back to original value
+
                     person_conditions.append(f"(p.ABSTRACT LIKE :{key} OR UPPER(p.ABSTRACT) LIKE :{key_upper})")
-                    params[key] = f"%{person}%"
-                    params[key_upper] = f"%{person.upper()}%"
+                    params[key] = f"%{english_person}%"
+                    params[key_upper] = f"%{english_person.upper()}%"
                 where_clauses.append(f"({op.join(person_conditions)})")
+
 
         if date_from:
             try:
