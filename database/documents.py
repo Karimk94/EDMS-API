@@ -591,8 +591,61 @@ async def update_document_processing_status(docnumber, new_abstract, o_detected,
         if conn:
             await conn.close()
 
+async def _resolve_vip_names_to_english(cursor, vip_names):
+    """
+    Resolve a list of VIP name strings to their English equivalents from LKP_PERSON.
+
+    When the UI is in Arabic mode the user picks an Arabic name, so we receive
+    the Arabic form here.  The tag-matching query in fetch_tags_for_document
+    always compares against UPPER(NAME_ENGLISH), so storing an Arabic name in
+    the abstract would make the person invisible to that query.
+
+    Strategy for each name:
+      1. Try to find it as an exact English match  → keep as-is.
+      2. Try to find it as an exact Arabic match   → swap in the English name.
+      3. If no match found (brand-new person)      → keep as-is (English assumed).
+    """
+    if not vip_names:
+        return []
+
+    resolved = []
+    for name in vip_names:
+        name = name.strip()
+        if not name:
+            continue
+
+        # Check English match first (case-insensitive)
+        await cursor.execute(
+            "SELECT NAME_ENGLISH FROM LKP_PERSON WHERE UPPER(NAME_ENGLISH) = UPPER(:1)",
+            [name]
+        )
+        row = await cursor.fetchone()
+        if row:
+            resolved.append(row[0])  # Use the canonical casing from DB
+            continue
+
+        # Check Arabic match
+        await cursor.execute(
+            "SELECT NAME_ENGLISH FROM LKP_PERSON WHERE NAME_ARABIC = :1",
+            [name]
+        )
+        row = await cursor.fetchone()
+        if row:
+            resolved.append(row[0])  # Swap Arabic → English
+            continue
+
+        # Unknown person — keep the original value (assumed English)
+        resolved.append(name)
+
+    return resolved
+
+
 async def update_abstract_with_vips(doc_id, vip_names):
-    """Appends or updates VIP names in a document's abstract."""
+    """Appends or updates VIP names in a document's abstract.
+
+    Names are always stored in English so that the person-tag matching query
+    (which filters on UPPER(NAME_ENGLISH)) works regardless of UI language.
+    """
     conn = await get_async_connection()
     if not conn: return False, "Could not connect to the database."
     try:
@@ -605,7 +658,10 @@ async def update_abstract_with_vips(doc_id, vip_names):
 
             base_abstract = re.sub(r'\s*\n*VIPs\s*:.*', '', current_abstract, flags=re.IGNORECASE).strip()
 
-            names_str = ", ".join(sorted(list(set(vip_names))))
+            # Resolve any Arabic names → English before writing to the abstract
+            english_names = await _resolve_vip_names_to_english(cursor, vip_names)
+
+            names_str = ", ".join(sorted(list(set(english_names))))
 
             if names_str:
                 vips_section = f"VIPs: {names_str}"
