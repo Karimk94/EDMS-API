@@ -430,10 +430,64 @@ async def list_folder_contents(dst, parent_id=None, app_source=None, scope=None,
             permission_cache[folder_id_str] = True
             return True  # On error, allow access
 
+    # --- Event-based folder search for edms-media ---
+    # When searching in folders scope with app_source='edms-media', also search LKP_PHOTO_EVENT
+    event_folder_items = []
+    if search_term and app_source == 'edms-media' and scope == 'folders':
+        try:
+            matching_events = await db_connector.search_events_by_name(search_term, app_source)
+            for event in matching_events:
+                event_id = event.get('id')
+                event_name = event.get('name', '')
+                # Get documents linked to this event
+                event_docnumbers = await db_connector.get_event_folder_docnumbers(event_id)
+                for doc_id in event_docnumbers:
+                    event_folder_items.append({
+                        'id': str(doc_id),
+                        'name': f"{event_name}",  # Use event name as the display name
+                        'type': 'file',
+                        'media_type': 'resolve',
+                        'node_type': 'N',
+                        'is_standard': False,
+                        'event_name': event_name,  # Track which event this came from
+                        'thumbnail_url': f"cache/{doc_id}.jpg"
+                    })
+        except Exception as e:
+            logging.error(f"Error searching events for folder search: {e}")
+
     if (scope == 'folders' and media_type) or search_term:
         start_node = target_id
-        return await get_recursive_doc_ids(dst, media_type_filter=media_type, search_term=search_term,
+        regular_items = await get_recursive_doc_ids(dst, media_type_filter=media_type, search_term=search_term,
                                            start_node=start_node, username=username, user_groups=user_groups)
+        
+        # Merge event-based items with regular items (only for edms-media)
+        if app_source == 'edms-media' and event_folder_items:
+            # Resolve media types for event items
+            ids_to_resolve = [item['id'] for item in event_folder_items if item.get('media_type') == 'resolve']
+            if ids_to_resolve:
+                try:
+                    resolved_types = await db_connector.resolve_media_types_from_db(ids_to_resolve)
+                    for item in event_folder_items:
+                        if item.get('media_type') == 'resolve':
+                            item['media_type'] = resolved_types.get(item['id'], 'pdf')
+                except Exception:
+                    pass
+            
+            # Filter by media_type if specified
+            if media_type:
+                filter_files_only = media_type == 'files'
+                event_folder_items = [item for item in event_folder_items if 
+                    (filter_files_only and item.get('media_type') not in IMAGE_VIDEO_TYPES) or
+                    (not filter_files_only and item.get('media_type') == media_type)]
+            
+            # Combine and deduplicate
+            existing_ids = {item['id'] for item in regular_items}
+            for event_item in event_folder_items:
+                if event_item['id'] not in existing_ids:
+                    regular_items.append(event_item)
+                    existing_ids.add(event_item['id'])
+        
+        return regular_items
 
     is_root_view = (target_id == SMART_EDMS_ROOT_ID)
     if is_root_view and not media_type and not search_term:

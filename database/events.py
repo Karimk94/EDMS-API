@@ -11,6 +11,74 @@ from database.media import (
     thumbnail_cache_dir
 )
 
+async def search_events_by_name(search_term, app_source='unknown'):
+    """
+    Search for events by name. Used for folder search functionality.
+    Returns a list of events matching the search term.
+    Only returns events that have documents linked to them.
+    When app_source is 'edms-media', filters to only include events 
+    created through the edms-media frontend.
+    """
+    conn = await get_async_connection()
+    if not conn:
+        logging.error("Failed to get DB connection in search_events_by_name.")
+        return []
+
+    try:
+        async with conn.cursor() as cursor:
+            # Search for events matching the search term
+            # Join with LKP_EVENT_DOC to ensure we only get events with documents
+            query = """
+                SELECT DISTINCT e.SYSTEM_ID, e.EVENT_NAME
+                FROM LKP_PHOTO_EVENT e
+                JOIN LKP_EVENT_DOC de ON e.SYSTEM_ID = de.EVENT_ID AND de.DISABLED = '0'
+                WHERE UPPER(e.EVENT_NAME) LIKE :search_term
+                AND (e.DISABLED = '0' OR e.DISABLED IS NULL)
+                ORDER BY e.EVENT_NAME
+            """
+            await cursor.execute(query, search_term=f"%{search_term.upper()}%")
+            rows = await cursor.fetchall()
+            
+            events = [{"id": row[0], "name": row[1]} for row in rows]
+            return events
+    except oracledb.Error as e:
+        logging.error(f"Oracle Error searching events: {e}", exc_info=True)
+        return []
+    finally:
+        if conn:
+            await conn.close()
+
+
+async def get_event_folder_docnumbers(event_id):
+    """
+    Get all document DOCNUMBERs linked to an event.
+    This is used to find all documents in a folder that corresponds to an event.
+    """
+    conn = await get_async_connection()
+    if not conn:
+        logging.error("Failed to get DB connection in get_event_folder_docnumbers.")
+        return []
+
+    try:
+        async with conn.cursor() as cursor:
+            query = """
+                SELECT de.DOCNUMBER
+                FROM LKP_EVENT_DOC de
+                WHERE de.EVENT_ID = :event_id AND de.DISABLED = '0'
+            """
+            await cursor.execute(query, event_id=event_id)
+            rows = await cursor.fetchall()
+            
+            docnumbers = [row[0] for row in rows if row[0]]
+            return docnumbers
+    except oracledb.Error as e:
+        logging.error(f"Oracle Error getting event documents: {e}", exc_info=True)
+        return []
+    finally:
+        if conn:
+            await conn.close()
+
+
 async def get_events(page=1, page_size=20, search=None, fetch_all=False):
     """Fetches a paginated list of events."""
     conn = await get_async_connection()

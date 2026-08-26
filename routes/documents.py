@@ -106,7 +106,7 @@ async def process_batch(request: Request, user=Depends(get_current_user)):
 @router.post('/api/upload_document')
 @limiter.limit("100/minute")
 async def api_upload_document(request: Request, file: UploadFile = File(...), docname: Optional[str] = Form(None),
-                              abstract: str = Form("Uploaded via EDMS Viewer"),
+                              abstract: str = Form(""),
                               event_id: Optional[str] = Form(None), parent_id: Optional[str] = Form(None),
                               date_taken: Optional[str] = Form(None),
                               x_app_source: str = Header("unknown", alias="X-App-Source"),

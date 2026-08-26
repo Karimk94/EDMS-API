@@ -38,14 +38,104 @@ async def fetch_documents_from_oracle(page=1, page_size=20, search_term=None, da
                                       memory_month=None, memory_day=None, user_id=None, lang='en',
                                       security_level='Editor', app_source='unknown', media_type=None, scope=None):
     """Fetches a paginated list of documents, applying filters including media_type."""
-    conn = await get_async_connection()
-    if not conn: return [], 0
-
+    
+    # --- Pre-fetch WSDL data BEFORE acquiring DB connection ---
+    # This is critical to avoid connection pool exhaustion from long-running WSDL calls
     dst = dms_system_login()
     if not dst:
         logging.error("Could not log into DMS. Aborting document fetch.")
-        if conn: await conn.close()
         return [], 0
+
+    offset = (page - 1) * page_size
+    documents = []
+    total_rows = 0
+
+    params = {}
+    where_clauses = []
+    shortlist_clause = ""
+
+    # --- Scope Logic - WSDL calls happen BEFORE DB connection ---
+    folder_doc_ids = None
+    root_doc_ids = None  # For edms-media recents tab
+    event_doc_ids = []  # For edms-media event-based search
+    event_folder_names = {}  # Map of doc_id -> event name for display
+    
+    if scope == 'folders':
+        # Retrieve all relevant DOCNUMBERS from WSDL first (Async call - NO DB connection held)
+        folder_doc_ids = await wsdl_client.get_recursive_doc_ids(dst, media_type)
+        if not folder_doc_ids:
+            return [], 0
+
+        # Paginate IDs *before* querying DB to handle large lists efficiently
+        total_rows = len(folder_doc_ids)
+
+        # If requested page is out of range, return empty
+        if offset >= total_rows:
+            return [], total_rows
+
+        paginated_ids = folder_doc_ids[offset: offset + page_size]
+
+        # Use these IDs in the WHERE clause
+        placeholders = ','.join([f":fid_{i}" for i in range(len(paginated_ids))])
+        where_clauses.append(f"p.DOCNUMBER IN ({placeholders})")
+        for i, doc_id in enumerate(paginated_ids):
+            params[f'fid_{i}'] = doc_id
+
+    else:
+        # For edms-media, show documents from the SMART_EDMS_ROOT_ID folder hierarchy
+        # This ensures both folders and recents tabs show content from the same root
+        if app_source == 'edms-media':
+            # Get all document IDs from the SMART_EDMS_ROOT_ID folder hierarchy (Async call - NO DB connection held)
+            from wsdl_client.config import SMART_EDMS_ROOT_ID
+            root_doc_ids = await wsdl_client.get_recursive_doc_ids(dst, media_type_filter=None, start_node=SMART_EDMS_ROOT_ID)
+            logging.info(f"[edms-media recents] Fetched {len(root_doc_ids) if root_doc_ids else 0} doc IDs from SMART_EDMS_ROOT_ID")
+            
+            if root_doc_ids and len(root_doc_ids) > 0:
+                # Limit to 10000 IDs for performance
+                limited_ids = root_doc_ids[:10000] if len(root_doc_ids) > 10000 else root_doc_ids
+                root_id_placeholders = ','.join([f":root_id_{i}" for i in range(len(limited_ids))])
+                
+                # Add the doc IDs as parameters - ensure each doc_id is an integer
+                for i, doc_id in enumerate(limited_ids):
+                    # Handle case where doc_id might be a dict or other type
+                    if isinstance(doc_id, dict):
+                        doc_id = doc_id.get('docnumber') or doc_id.get('DOCNUMBER') or doc_id.get('id')
+                    params[f'root_id_{i}'] = int(doc_id) if doc_id else 0
+                
+                # Filter to only include documents from the root folder hierarchy
+                where_clauses.append(f"p.DOCNUMBER IN ({root_id_placeholders})")
+                logging.info(f"[edms-media recents] Added {len(limited_ids)} doc IDs to query")
+            else:
+                # Fallback: just filter by RTA_TEXT1 if WSDL fetch fails or returns empty
+                logging.warning(f"[edms-media recents] WSDL returned no IDs, falling back to RTA_TEXT1 filter only")
+                where_clauses.append("p.RTA_TEXT1 = 'edms-media'")
+            # NOTE: For edms-media, we do NOT exclude documents in folders - we want to show all documents
+            # from the SMART_EDMS_ROOT_ID hierarchy, whether they are in folders or not
+        elif app_source == 'smart-edms':
+            smart_edms_floor = 19662092
+            where_clauses.append(f"p.DOCNUMBER >= {smart_edms_floor} AND (p.RTA_TEXT1 IS NULL OR p.RTA_TEXT1 != 'edms-media')")
+            # Exclude documents that are in folders for smart-edms (non-edms-media documents)
+            where_clauses.append("NOT EXISTS (SELECT 1 FROM FOLDER_ITEM fi WHERE fi.DOCNUMBER = p.DOCNUMBER AND fi.NODE_TYPE = 'D')")
+        
+        # --- Event-based search for edms-media (async DB calls, but NO main connection held yet) ---
+        if search_term and app_source == 'edms-media':
+            try:
+                from database.events import search_events_by_name, get_event_folder_docnumbers
+                matching_events = await search_events_by_name(search_term, app_source)
+                for event in matching_events:
+                    event_id = event.get('id')
+                    event_name = event.get('name', '')
+                    event_docs = await get_event_folder_docnumbers(event_id)
+                    for doc_id in event_docs:
+                        if doc_id not in event_doc_ids:
+                            event_doc_ids.append(doc_id)
+                            event_folder_names[doc_id] = event_name
+            except Exception as e:
+                logging.error(f"Error searching events for document search: {e}")
+
+    # --- NOW acquire DB connection after all WSDL calls are complete ---
+    conn = await get_async_connection()
+    if not conn: return [], 0
 
     db_user_id = None
     if user_id:
@@ -59,98 +149,51 @@ async def fetch_documents_from_oracle(page=1, page_size=20, search_term=None, da
         except oracledb.Error as e:
             logging.error(f"Could not fetch user system ID for {user_id}: {e}")
 
-    offset = (page - 1) * page_size
-    documents = []
-    total_rows = 0
+    if media_type:
+        try:
+            async with conn.cursor() as app_cursor:
+                # Step 1: Try to fetch SYSTEM_ID (Numeric) from APPS
+                id_column = "SYSTEM_ID"
+                try:
+                    await app_cursor.execute(f"SELECT {id_column}, DEFAULT_EXTENSION FROM APPS")
+                    apps_rows = await app_cursor.fetchall()
+                except oracledb.DatabaseError:
+                    # Fallback if SYSTEM_ID column doesn't exist
+                    logging.warning("SYSTEM_ID column not found in APPS, falling back to APPLICATION column.")
+                    id_column = "APPLICATION"
+                    await app_cursor.execute(f"SELECT {id_column}, DEFAULT_EXTENSION FROM APPS")
+                    apps_rows = await app_cursor.fetchall()
 
-    params = {}
-    where_clauses = []
-    shortlist_clause = ""
+            # Using the same extended lists as the working reference
+            image_exts = {'jpg', 'jpeg', 'png', 'gif', 'bmp', 'tif', 'tiff', 'webp', 'heic', 'ico', 'jfif'}
+            video_exts = {'mp4', 'mov', 'avi', 'mkv', 'wmv', 'flv', 'webm', 'm4v', '3gp', 'ts', 'mts', '3g2'}
+            pdf_exts = {'pdf', 'doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx', 'txt', 'rtf', 'csv', 'zip', 'rar', '7z'}
 
-    # --- Scope Logic ---
-    folder_doc_ids = None
-    if scope == 'folders':
-        # Retrieve all relevant DOCNUMBERS from WSDL first (Sync call)
-        folder_doc_ids = wsdl_client.get_recursive_doc_ids(dst, media_type)
-        if not folder_doc_ids:
-            if conn: await conn.close()
-            return [], 0
+            target_app_ids = []
 
-        # Paginate IDs *before* querying DB to handle large lists efficiently
-        total_rows = len(folder_doc_ids)
+            for app_id, ext in apps_rows:
+                if not ext: continue
+                clean_ext = str(ext).lower().replace('.', '').strip()
+                str_id = str(app_id).strip()
 
-        # If requested page is out of range, return empty
-        if offset >= total_rows:
-            if conn: await conn.close()
-            return [], total_rows
+                if media_type == 'image' and clean_ext in image_exts:
+                    target_app_ids.append(str_id)
+                elif media_type == 'video' and clean_ext in video_exts:
+                    target_app_ids.append(str_id)
+                elif media_type == 'pdf' and clean_ext in pdf_exts:
+                    target_app_ids.append(str_id)
 
-        paginated_ids = folder_doc_ids[offset: offset + page_size]
-
-        # Use these IDs in the WHERE clause
-        placeholders = ','.join([f":fid_{i}" for i in range(len(paginated_ids))])
-        where_clauses.append(f"p.DOCNUMBER IN ({placeholders})")
-        for i, doc_id in enumerate(paginated_ids):
-            params[f'fid_{i}'] = doc_id
-
-    else:
-        doc_filter_sql = "AND p.RTA_TEXT1 = 'edms-media'"
-
-        if app_source == 'edms-media':
-            doc_filter_sql = "AND p.RTA_TEXT1 = 'edms-media'"
-        elif app_source == 'smart-edms':
-            smart_edms_floor = 19662092
-            doc_filter_sql = f"AND p.DOCNUMBER >= {smart_edms_floor} AND (p.RTA_TEXT1 IS NULL OR p.RTA_TEXT1 != 'edms-media')"
-
-        where_clauses.append(doc_filter_sql.replace('AND ', '', 1))  # Strip first AND if adding to list
-
-        # Exclude documents that are in folders (have entries in FOLDER_ITEM with NODE_TYPE = 'D')
-        where_clauses.append("NOT EXISTS (SELECT 1 FROM FOLDER_ITEM fi WHERE fi.DOCNUMBER = p.DOCNUMBER AND fi.NODE_TYPE = 'D')")
-
-        if media_type:
-            try:
-                async with conn.cursor() as app_cursor:
-                    # Step 1: Try to fetch SYSTEM_ID (Numeric) from APPS
-                    id_column = "SYSTEM_ID"
-                    try:
-                        await app_cursor.execute(f"SELECT {id_column}, DEFAULT_EXTENSION FROM APPS")
-                        apps_rows = await app_cursor.fetchall()
-                    except oracledb.DatabaseError:
-                        # Fallback if SYSTEM_ID column doesn't exist
-                        logging.warning("SYSTEM_ID column not found in APPS, falling back to APPLICATION column.")
-                        id_column = "APPLICATION"
-                        await app_cursor.execute(f"SELECT {id_column}, DEFAULT_EXTENSION FROM APPS")
-                        apps_rows = await app_cursor.fetchall()
-
-                # Using the same extended lists as the working reference
-                image_exts = {'jpg', 'jpeg', 'png', 'gif', 'bmp', 'tif', 'tiff', 'webp', 'heic', 'ico', 'jfif'}
-                video_exts = {'mp4', 'mov', 'avi', 'mkv', 'wmv', 'flv', 'webm', 'm4v', '3gp', 'ts', 'mts', '3g2'}
-                pdf_exts = {'pdf', 'doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx', 'txt', 'rtf', 'csv', 'zip', 'rar', '7z'}
-
-                target_app_ids = []
-
-                for app_id, ext in apps_rows:
-                    if not ext: continue
-                    clean_ext = str(ext).lower().replace('.', '').strip()
-                    str_id = str(app_id).strip()
-
-                    if media_type == 'image' and clean_ext in image_exts:
-                        target_app_ids.append(str_id)
-                    elif media_type == 'video' and clean_ext in video_exts:
-                        target_app_ids.append(str_id)
-                    elif media_type == 'pdf' and clean_ext in pdf_exts:
-                        target_app_ids.append(str_id)
-
-                if target_app_ids:
-                    id_list = ",".join(f"'{x}'" for x in target_app_ids)
-                    where_clauses.append(f"TRIM(TO_CHAR(p.APPLICATION)) IN ({id_list})")
-                else:
-                    # If no apps found for this type, return nothing
-                    where_clauses.append("1=0")
-
-            except Exception as e:
-                logging.error(f"Error filtering by media_type: {e}")
-                # Fallback to failing safe if App ID lookup crashes
+            if target_app_ids:
+                id_list = ",".join(f"'{x}'" for x in target_app_ids)
+                where_clauses.append(f"TRIM(TO_CHAR(p.APPLICATION)) IN ({id_list})")
+            else:
+                # If no apps found for this type, return nothing
                 where_clauses.append("1=0")
+
+        except Exception as e:
+            logging.error(f"Error filtering by media_type: {e}")
+            # Fallback to failing safe if App ID lookup crashes
+            where_clauses.append("1=0")
 
     base_where = f"WHERE p.FORM = 2740 "
     shortlist_sql = "AND k.SHORTLISTED = '1'" if security_level == 'Viewer' else ""
@@ -236,6 +279,7 @@ async def fetch_documents_from_oracle(page=1, page_size=20, search_term=None, da
         # --- Combined Hybrid Search Logic ---
         vector_clause = None
         text_clause = None
+        event_clause = None
 
         if vector_doc_ids:
             # logging.info(f"Using {len(vector_doc_ids)} doc_ids from vector search.")
@@ -246,13 +290,20 @@ async def fetch_documents_from_oracle(page=1, page_size=20, search_term=None, da
 
         if text_search_conditions:
             text_clause = f"({' AND '.join(text_search_conditions)})"
+        
+        # Add event-based document IDs to search (for edms-media)
+        if event_doc_ids:
+            event_placeholders = ','.join([f":event_id_{i}" for i in range(len(event_doc_ids))])
+            event_clause = f"p.docnumber IN ({event_placeholders})"
+            for i, doc_id in enumerate(event_doc_ids):
+                params[f'event_id_{i}'] = doc_id
 
-        if vector_clause and text_clause:
-            where_clauses.append(f"({vector_clause} OR {text_clause})")
-        elif vector_clause:
-            where_clauses.append(vector_clause)
-        elif text_clause:
-            where_clauses.append(text_clause)
+        # Combine all search clauses with OR
+        all_clauses = [c for c in [vector_clause, text_clause, event_clause] if c]
+        if len(all_clauses) > 1:
+            where_clauses.append(f"({' OR '.join(all_clauses)})")
+        elif len(all_clauses) == 1:
+            where_clauses.append(all_clauses[0])
 
         # --- Standard Filters ---
         if persons:
@@ -449,6 +500,9 @@ async def fetch_documents_from_oracle(page=1, page_size=20, search_term=None, da
                     logging.error(f"Error processing media info for doc {doc_id}: {media_info_e}",
                                   exc_info=True)
 
+                # Check if this document was found via event search
+                event_name = event_folder_names.get(doc_id) if event_folder_names else None
+                
                 documents.append({
                     "doc_id": doc_id,
                     "title": final_abstract,
@@ -457,7 +511,8 @@ async def fetch_documents_from_oracle(page=1, page_size=20, search_term=None, da
                     "date": doc_date.strftime('%Y-%m-%d %H:%M:%S') if doc_date else "N/A",
                     "thumbnail_url": thumbnail_path or "",
                     "media_type": media_type,
-                    "is_favorite": bool(is_favorite)
+                    "is_favorite": bool(is_favorite),
+                    "event_name": event_name  # Populated when found via event/folder search
                 })
     except oracledb.Error as e:
         logging.error(f"Oracle error fetching documents: {e}", exc_info=True)

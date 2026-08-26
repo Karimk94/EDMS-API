@@ -28,7 +28,8 @@ from database.users import (
 )
 from database.events import (
     get_events, create_event, link_document_to_event,
-    get_event_for_document, get_documents_for_event
+    get_event_for_document, get_documents_for_event,
+    search_events_by_name, get_event_folder_docnumbers
 )
 from database.favorites import (
     add_favorite, remove_favorite, get_favorites

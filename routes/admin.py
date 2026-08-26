@@ -1,12 +1,15 @@
 from fastapi import APIRouter, HTTPException, Request, Query
-from typing import List
+from typing import List, Optional
 from pydantic import BaseModel
 import logging
+import oracledb
+import re
 import wsdl_client
 from database import admin as admin_db
 from database import documents as documents_db
 from database import tab_permissions as tab_perms_db
 from database import login_logs as login_logs_db
+from database.connection import get_async_connection
 from schemas.auth import EdmsUserResponse, AddEdmsUserRequest, SecurityLevelResponse, PeopleSearchResult, UpdateEdmsUserRequest
 from services.processing_queue import processing_queue, set_worker_paused, is_worker_paused, request_worker_drain, get_worker_mode, set_worker_mode
 import db_connector
@@ -444,4 +447,270 @@ async def get_group_users(request: Request, group_system_id: int, search: str = 
     
     users = await admin_db.get_group_users(group_system_id, search=search)
     return {"users": users}
+
+
+# --- SQL Query Endpoints ---
+
+# Allowed tables for SQL queries (whitelist)
+ALLOWED_TABLES = {
+    'PROFILE': 'Main document/profile table',
+    'PEOPLE': 'User accounts and information',
+    'FOLDER_ITEM': 'Folder structure and contents',
+    'KEYWORD': 'Tags/keywords for documents',
+    'LKP_PERSON': 'VIP/Person lookup table',
+    'LKP_DOCUMENT_TAGS': 'Document-tag relationships',
+    'LKP_EDMS_USR_SECUR': 'EDMS user security settings',
+    'LKP_EDMS_SECURITY': 'Security levels (Admin, Editor, Viewer)',
+    'LKP_EDMS_USR_DATA': 'User quota data',
+    'LKP_FAVORITES_DOC': 'User favorites',
+    'LKP_AS_SE': 'Login sessions and history',
+    'TAGGING_QUEUE': 'AI processing queue',
+    'APPS': 'Application/file type mappings',
+    'FORMS': 'Form definitions',
+    'GROUPS': 'User groups',
+    'PEOPLEGROUPS': 'User-group relationships',
+    'FORM_USER': 'Form permissions',
+    'SIEM_EDMS_VIEW': 'Activity/audit log view',
+    'LKP_TAB_PERMISSIONS': 'Tab permissions for users',
+}
+
+# Query templates for common operations
+QUERY_TEMPLATES = [
+    {
+        'name': 'Recent Documents',
+        'description': 'Get the 10 most recent documents',
+        'query': 'SELECT DOCNUMBER, ABSTRACT, AUTHOR, RTADOCDATE, DOCNAME FROM PROFILE WHERE FORM = 2740 ORDER BY DOCNUMBER DESC FETCH FIRST 10 ROWS ONLY'
+    },
+    {
+        'name': 'User List',
+        'description': 'Get all EDMS users with their security levels',
+        'query': "SELECT p.USER_ID, p.FULL_NAME, sl.NAME as SECURITY_LEVEL, us.LANG, us.THEME FROM LKP_EDMS_USR_SECUR us JOIN PEOPLE p ON us.USER_ID = p.SYSTEM_ID JOIN LKP_EDMS_SECURITY sl ON us.SECURITY_LEVEL_ID = sl.SYSTEM_ID ORDER BY p.USER_ID"
+    },
+    {
+        'name': 'Folder Contents',
+        'description': 'Get items in a specific folder (replace FOLDER_DOCNUMBER)',
+        'query': "SELECT DOCNUMBER, DISPLAYNAME, NODE_TYPE FROM FOLDER_ITEM WHERE PARENT = 'FOLDER_DOCNUMBER' ORDER BY NODE_TYPE, DISPLAYNAME"
+    },
+    {
+        'name': 'Document Tags',
+        'description': 'Get all tags for a specific document (replace DOCNUMBER)',
+        'query': "SELECT k.KEYWORD_ID, k.DESCRIPTION FROM LKP_DOCUMENT_TAGS ldt JOIN KEYWORD k ON ldt.TAG_ID = k.SYSTEM_ID WHERE ldt.DOCNUMBER = DOCNUMBER"
+    },
+    {
+        'name': 'Active Sessions',
+        'description': 'Get currently active user sessions',
+        'query': "SELECT l.SESSION_ID, p.USER_ID, p.FULL_NAME, l.LOGIN_DATE, l.LAST_ACTIVITY, l.APP_SOURCE, l.IP_ADDRESS FROM LKP_AS_SE l JOIN PEOPLE p ON l.PEOPLE_SYSTEM_ID = p.SYSTEM_ID WHERE l.IS_ACTIVE = 'Y' ORDER BY l.LAST_ACTIVITY DESC"
+    },
+    {
+        'name': 'Processing Queue Status',
+        'description': 'Get documents pending AI processing',
+        'query': 'SELECT DOCNUMBER, ATTEMPTS, STATUS, ERROR, LAST_UPDATE FROM TAGGING_QUEUE WHERE STATUS != 3 ORDER BY LAST_UPDATE DESC FETCH FIRST 20 ROWS ONLY'
+    },
+    {
+        'name': 'Tag Usage Count',
+        'description': 'Get most used tags/keywords',
+        'query': "SELECT k.KEYWORD_ID, k.DESCRIPTION, COUNT(ldt.DOCNUMBER) as DOC_COUNT FROM KEYWORD k JOIN LKP_DOCUMENT_TAGS ldt ON k.SYSTEM_ID = ldt.TAG_ID GROUP BY k.KEYWORD_ID, k.DESCRIPTION ORDER BY DOC_COUNT DESC FETCH FIRST 20 ROWS ONLY"
+    },
+    {
+        'name': 'VIP Person Documents',
+        'description': 'Find documents containing a specific VIP name (replace NAME)',
+        'query': "SELECT DOCNUMBER, ABSTRACT, AUTHOR FROM PROFILE WHERE FORM = 2740 AND UPPER(ABSTRACT) LIKE '%NAME%' FETCH FIRST 20 ROWS ONLY"
+    },
+]
+
+
+class SqlQueryRequest(BaseModel):
+    query: str
+
+
+def validate_sql_query(sql: str) -> tuple[bool, str]:
+    """
+    Validates that a SQL query is safe to execute.
+    Returns (is_valid, error_message).
+    """
+    if not sql or not sql.strip():
+        return False, "Query cannot be empty"
+    
+    # Remove comments
+    sql_cleaned = re.sub(r'--.*$', '', sql, flags=re.MULTILINE)
+    sql_cleaned = re.sub(r'/\*.*?\*/', '', sql_cleaned, flags=re.DOTALL)
+    sql_cleaned = sql_cleaned.strip()
+    
+    if not sql_cleaned:
+        return False, "Query cannot be empty after removing comments"
+    
+    # Check for SELECT statement
+    sql_upper = sql_cleaned.upper()
+    if not sql_upper.startswith('SELECT'):
+        return False, "Only SELECT statements are allowed"
+    
+    # Block dangerous keywords
+    blocked_keywords = [
+        'INSERT', 'UPDATE', 'DELETE', 'DROP', 'TRUNCATE', 'ALTER', 'CREATE',
+        'MERGE', 'GRANT', 'REVOKE', 'EXEC', 'EXECUTE', 'CALL', 'BEGIN', 'DECLARE',
+        'INTO', 'BULK', 'COLLECT'
+    ]
+    
+    for keyword in blocked_keywords:
+        # Use word boundary to avoid false positives
+        pattern = r'\b' + keyword + r'\b'
+        if re.search(pattern, sql_upper):
+            return False, f"Keyword '{keyword}' is not allowed. Only SELECT statements are permitted."
+    
+    # Check for allowed tables
+    # Extract table names from the query (simplified approach)
+    # Look for FROM and JOIN keywords followed by table names
+    table_pattern = r'(?:FROM|JOIN)\s+([A-Z_][A-Z0-9_]*)'
+    found_tables = re.findall(table_pattern, sql_upper)
+    
+    for table in found_tables:
+        if table not in ALLOWED_TABLES:
+            return False, f"Table '{table}' is not in the allowed list. Allowed tables: {', '.join(sorted(ALLOWED_TABLES.keys()))}"
+    
+    return True, ""
+
+
+@router.get("/api/admin/sql-query/tables")
+async def get_allowed_tables(request: Request):
+    """Get list of allowed tables and their schemas for SQL queries."""
+    if not check_admin_access(request):
+        raise HTTPException(status_code=403, detail="Access denied. Admin privileges required.")
+    
+    conn = await get_async_connection()
+    if not conn:
+        raise HTTPException(status_code=500, detail="Database connection failed")
+    
+    tables_info = []
+    try:
+        async with conn.cursor() as cursor:
+            for table_name in sorted(ALLOWED_TABLES.keys()):
+                # Get column information for each table
+                try:
+                    await cursor.execute("""
+                        SELECT COLUMN_NAME, DATA_TYPE, DATA_LENGTH, NULLABLE
+                        FROM USER_TAB_COLUMNS
+                        WHERE TABLE_NAME = :table_name
+                        ORDER BY COLUMN_ID
+                    """, table_name=table_name)
+                    
+                    columns = []
+                    async for row in cursor:
+                        columns.append({
+                            'name': row[0],
+                            'type': row[1],
+                            'length': row[2],
+                            'nullable': row[3] == 'Y'
+                        })
+                    
+                    tables_info.append({
+                        'name': table_name,
+                        'description': ALLOWED_TABLES[table_name],
+                        'columns': columns
+                    })
+                except oracledb.Error:
+                    # Table might not exist or no access
+                    tables_info.append({
+                        'name': table_name,
+                        'description': ALLOWED_TABLES[table_name],
+                        'columns': [],
+                        'error': 'Could not fetch column information'
+                    })
+    finally:
+        if conn:
+            await conn.close()
+    
+    return {"tables": tables_info}
+
+
+@router.get("/api/admin/sql-query/templates")
+async def get_query_templates(request: Request):
+    """Get predefined query templates."""
+    if not check_admin_access(request):
+        raise HTTPException(status_code=403, detail="Access denied. Admin privileges required.")
+    
+    return {"templates": QUERY_TEMPLATES}
+
+
+@router.post("/api/admin/sql-query")
+async def execute_sql_query(request: Request, body: SqlQueryRequest):
+    """Execute a read-only SQL query and return results."""
+    if not check_admin_access(request):
+        raise HTTPException(status_code=403, detail="Access denied. Admin privileges required.")
+    
+    # Validate the query
+    is_valid, error_message = validate_sql_query(body.query)
+    if not is_valid:
+        raise HTTPException(status_code=400, detail=error_message)
+    
+    conn = await get_async_connection()
+    if not conn:
+        raise HTTPException(status_code=500, detail="Database connection failed")
+    
+    MAX_ROWS = 1000
+    QUERY_TIMEOUT_SECONDS = 30
+    
+    try:
+        async with conn.cursor() as cursor:
+            # Set array size for better performance
+            cursor.arraysize = 100
+            
+            # Execute the query
+            await cursor.execute(body.query)
+            
+            # Get column names
+            if cursor.description:
+                columns = [col[0] for col in cursor.description]
+            else:
+                columns = []
+            
+            # Fetch rows with limit
+            rows = []
+            row_count = 0
+            truncated = False
+            
+            async for row in cursor:
+                if row_count >= MAX_ROWS:
+                    truncated = True
+                    break
+                
+                # Convert row to list and handle Oracle-specific types
+                processed_row = []
+                for value in row:
+                    if isinstance(value, oracledb.LOB):
+                        processed_row.append(value.read())
+                    elif hasattr(value, 'isoformat'):
+                        # Handle datetime objects
+                        processed_row.append(value.isoformat())
+                    else:
+                        processed_row.append(value)
+                
+                rows.append(processed_row)
+                row_count += 1
+            
+            return {
+                "columns": columns,
+                "rows": rows,
+                "total_rows": len(rows),
+                "truncated": truncated,
+                "max_rows": MAX_ROWS
+            }
+    
+    except oracledb.Error as e:
+        error_msg = str(e)
+        # Extract more readable error message
+        if hasattr(e, 'args') and e.args:
+            error_obj = e.args[0]
+            if hasattr(error_obj, 'message'):
+                error_msg = error_obj.message
+        
+        logging.error(f"SQL Query error: {error_msg}")
+        raise HTTPException(status_code=400, detail=f"Query error: {error_msg}")
+    
+    except Exception as e:
+        logging.error(f"Unexpected SQL query error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
+    
+    finally:
+        if conn:
+            await conn.close()
 
