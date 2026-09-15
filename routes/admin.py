@@ -536,8 +536,15 @@ def validate_sql_query(sql: str) -> tuple[bool, str]:
     sql_cleaned = re.sub(r'/\*.*?\*/', '', sql_cleaned, flags=re.DOTALL)
     sql_cleaned = sql_cleaned.strip()
     
+    # Strip trailing semicolons
+    sql_cleaned = sql_cleaned.rstrip(';').strip()
+    
     if not sql_cleaned:
         return False, "Query cannot be empty after removing comments"
+    
+    # Check for multiple statements (semicolons remaining)
+    if ';' in sql_cleaned:
+        return False, "Multiple SQL statements are not permitted"
     
     # Check for SELECT statement
     sql_upper = sql_cleaned.upper()
@@ -563,9 +570,13 @@ def validate_sql_query(sql: str) -> tuple[bool, str]:
     table_pattern = r'(?:FROM|JOIN)\s+([A-Z_][A-Z0-9_]*)'
     found_tables = re.findall(table_pattern, sql_upper)
     
+    if not found_tables:
+        return False, "Query must specify a valid table (e.g. FROM <table_name>). Click 'Show Schema' to view allowed tables."
+    
     for table in found_tables:
         if table not in ALLOWED_TABLES:
-            return False, f"Table '{table}' is not in the allowed list. Allowed tables: {', '.join(sorted(ALLOWED_TABLES.keys()))}"
+            allowed_list = ', '.join(sorted(ALLOWED_TABLES.keys()))
+            return False, f"Table '{table}' does not exist or is not permitted. Allowed tables are: {allowed_list}"
     
     return True, ""
 
@@ -637,8 +648,11 @@ async def execute_sql_query(request: Request, body: SqlQueryRequest):
     if not check_admin_access(request):
         raise HTTPException(status_code=403, detail="Access denied. Admin privileges required.")
     
+    # Strip trailing semicolon and whitespace
+    clean_query = body.query.strip().rstrip(';').strip()
+    
     # Validate the query
-    is_valid, error_message = validate_sql_query(body.query)
+    is_valid, error_message = validate_sql_query(clean_query)
     if not is_valid:
         raise HTTPException(status_code=400, detail=error_message)
     
@@ -655,7 +669,7 @@ async def execute_sql_query(request: Request, body: SqlQueryRequest):
             cursor.arraysize = 100
             
             # Execute the query
-            await cursor.execute(body.query)
+            await cursor.execute(clean_query)
             
             # Get column names
             if cursor.description:
@@ -704,7 +718,18 @@ async def execute_sql_query(request: Request, body: SqlQueryRequest):
                 error_msg = error_obj.message
         
         logging.error(f"SQL Query error: {error_msg}")
-        raise HTTPException(status_code=400, detail=f"Query error: {error_msg}")
+        
+        # Provide user-friendly messages for common Oracle errors
+        if "ORA-00942" in error_msg:
+            friendly_msg = "Table or view does not exist in the database (ORA-00942). Please check the table name."
+        elif "ORA-00904" in error_msg:
+            friendly_msg = f"Invalid column name (ORA-00904): {error_msg}. Check the table schema."
+        elif "ORA-00911" in error_msg:
+            friendly_msg = "Invalid character in query (ORA-00911). Ensure there are no special or trailing characters."
+        else:
+            friendly_msg = f"Query error: {error_msg}"
+            
+        raise HTTPException(status_code=400, detail=friendly_msg)
     
     except Exception as e:
         logging.error(f"Unexpected SQL query error: {e}", exc_info=True)
