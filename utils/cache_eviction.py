@@ -46,7 +46,7 @@ def cleanup_video_cache(cache_dir: str, max_age_days: int = DEFAULT_MAX_AGE_DAYS
                 os.remove(filepath)
                 deleted_count += 1
                 deleted_bytes += file_stat.st_size
-                logging.info(f"Cache eviction: deleted {filename} (age: {file_age / 86400:.1f} days)")
+                # logging.info(f"Cache eviction: deleted {filename} (age: {file_age / 86400:.1f} days)")
             except OSError as e:
                 logging.warning(f"Cache eviction: failed to delete {filename}: {e}")
         else:
@@ -66,7 +66,7 @@ def cleanup_video_cache(cache_dir: str, max_age_days: int = DEFAULT_MAX_AGE_DAYS
                 deleted_count += 1
                 deleted_bytes += size
                 total_remaining -= size
-                logging.info(f"Cache eviction (size limit): deleted {os.path.basename(filepath)}")
+                # logging.info(f"Cache eviction (size limit): deleted {os.path.basename(filepath)}")
             except OSError as e:
                 logging.warning(f"Cache eviction: failed to delete {os.path.basename(filepath)}: {e}")
 

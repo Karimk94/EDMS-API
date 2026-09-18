@@ -15,7 +15,7 @@ from database.documents import (
     get_specific_documents_for_processing, check_processing_status,
     update_document_processing_status, update_abstract_with_vips,
     update_document_metadata, get_folder_system_ids,
-    reset_processing_attempts
+    reset_processing_attempts, get_document_metadata
 )
 from database.tags import (
     add_person_to_lkp, fetch_lkp_persons, fetch_all_tags,

@@ -149,6 +149,15 @@ async def api_create_folder(request: Request, data: CreateFolderRequest, user=De
         logging.error(f"Error creating folder: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Failed to create folder.")
 
+@router.get('/api/folders/{folder_id}/preview-thumbnails')
+async def api_get_folder_preview_thumbnails(folder_id: str, user=Depends(get_current_user)):
+    try:
+        preview_ids = await db_folders.get_folder_preview_ids(folder_id, limit=4)
+        return {"thumbnails": preview_ids}
+    except Exception as e:
+        logging.error(f"Error fetching preview thumbnails for folder {folder_id}: {e}", exc_info=True)
+        return {"thumbnails": []}
+
 @router.put('/api/folders/{folder_id}')
 async def api_rename_folder(folder_id: str, request: Request, data: RenameFolderRequest, user=Depends(get_current_user)):
 
@@ -199,7 +208,7 @@ async def api_delete_folder(folder_id: str, request: Request, force: bool = Fals
     else:
         bytes_freed = await _get_file_size_from_dms(dst, folder_id)
 
-    logging.info(f"Delete {folder_id}: is_folder={is_folder}, edms_user_id={edms_user_id}, bytes_freed={bytes_freed}")
+    # logging.info(f"Delete {folder_id}: is_folder={is_folder}, edms_user_id={edms_user_id}, bytes_freed={bytes_freed}")
 
     try:
         # Try standard delete first
@@ -208,7 +217,7 @@ async def api_delete_folder(folder_id: str, request: Request, force: bool = Fals
         if success:
             if edms_user_id and bytes_freed > 0:
                 restore_ok, restore_msg = await user_data.restore_user_quota(edms_user_id, bytes_freed)
-                logging.info(f"Quota restore for user {edms_user_id} after deleting {folder_id}: {restore_ok}, {restore_msg}")
+                # logging.info(f"Quota restore for user {edms_user_id} after deleting {folder_id}: {restore_ok}, {restore_msg}")
             else:
                 logging.warning(f"Skipped quota restore for {folder_id}: edms_user_id={edms_user_id}, bytes_freed={bytes_freed}")
             return {"message": "Folder deleted", "id": folder_id}
@@ -475,3 +484,23 @@ async def api_download_folder_zip(
         media_type='application/zip',
         headers={'Content-Disposition': content_disposition}
     )
+
+from pydantic import BaseModel
+class ReviewStatusRequest(BaseModel):
+    status: str
+
+@router.put('/api/folders/{folder_id}/review-status')
+async def api_set_folder_review_status(folder_id: str, data: ReviewStatusRequest, user=Depends(get_current_user)):
+    """Sets the review status for all direct child files of a folder. Only Editors/Admins can do this."""
+    from utils.common import is_editor
+    
+    if not is_editor(user):
+        raise HTTPException(status_code=403, detail="Only Editors can change review status.")
+        
+    if data.status not in ['verified', 'pending']:
+        raise HTTPException(status_code=400, detail="Invalid status value.")
+        
+    from database.documents import set_folder_review_status
+    updated_count = await set_folder_review_status(folder_id, data.status)
+    
+    return {"status": "success", "message": f"Review status updated for {updated_count} items"}

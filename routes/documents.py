@@ -12,14 +12,14 @@ import uuid
 import mimetypes
 import logging
 import db_connector
-from utils.common import get_current_user, get_session_token, get_mimetype_for_media, build_content_disposition
+from utils.common import get_current_user, get_session_token, get_mimetype_for_media, build_content_disposition, is_editor
 import wsdl_client
 from services.processing_queue import processing_queue
 from utils.watermark import apply_watermark_to_image, apply_watermark_to_pdf, apply_watermark_to_video, apply_watermark_to_video_async
 from slowapi import Limiter
 from slowapi.util import get_remote_address
 from utils.sanitize import sanitize_text, sanitize_filename
-from schemas.documents import ProcessUploadRequest, UpdateMetadataRequest, UpdateAbstractRequest, LinkEventRequest, SetTrusteesRequest
+from schemas.documents import ProcessUploadRequest, UpdateMetadataRequest, UpdateAbstractRequest, LinkEventRequest, SetTrusteesRequest, ReviewStatusRequest
 from database import user_data
 from services.upload_cancel import upload_cancel_registry
 from wsdl_client.documents import UploadCancelled
@@ -193,7 +193,7 @@ async def api_upload_document(request: Request, file: UploadFile = File(...), do
     if await request.is_disconnected():
         if idempotency_key:
             idempotency_store.mark_failed(idempotency_key)
-        logging.info(f"Client disconnected before DMS upload for '{original_filename}'; aborting.")
+        # logging.info(f"Client disconnected before DMS upload for '{original_filename}'; aborting.")
         raise HTTPException(status_code=499, detail="Client disconnected; upload aborted.")
 
     dst = await run_in_threadpool(wsdl_client.dms_system_login)
@@ -321,6 +321,17 @@ async def api_upload_document(request: Request, file: UploadFile = File(...), do
                 logging.warning(f"Failed to set security on uploaded document {new_doc_number}: {message}")
         # -------------------------------------------------------
 
+        # --- Auto-enqueue for AI analysis when uploaded from edms-media ---
+        # Only edms-media triggers immediate analysis; other sources rely on
+        # the scheduled batch crawler (/process-batch).
+        if x_app_source == "edms-media":
+            try:
+                from services.processing_queue import processing_queue
+                processing_queue.enqueue_docnumbers([int(new_doc_number)], source="edms-media")
+            except Exception as eq_err:
+                logging.warning(f"Failed to enqueue doc {new_doc_number} for processing: {eq_err}")
+        # -------------------------------------------------------------------
+
         return {"success": True, "docnumber": new_doc_number, "filename": original_filename}
     else:
         if idempotency_key:
@@ -370,7 +381,14 @@ async def api_process_uploaded_documents(data: ProcessUploadRequest, user=Depend
     if not data.docnumbers:
         return {"processed": [], "failed": [], "in_progress": []}
 
-    # queue_result = processing_queue.enqueue_docnumbers(data.docnumbers, source="upload")
+    if data.source == "edms-media":
+        processing_queue.enqueue_docnumbers(data.docnumbers, source="edms-media")
+        return {
+            "processed": [],
+            "failed": [],
+            "in_progress": data.docnumbers,
+            "message": "Queued for processing.",
+        }
 
     return {
         "processed": [],
@@ -433,6 +451,14 @@ async def get_document_file(docnumber: int, request: Request, user=Depends(get_c
         logging.error(f"Error in get_document_file: {e}")
         raise HTTPException(status_code=500, detail="Internal Server Error")
 
+@router.get('/api/document/{doc_id}/metadata')
+async def api_get_document_metadata(doc_id: int, user=Depends(get_current_user)):
+    """Fetches the latest metadata (abstract, author, date, docname) for a single document."""
+    meta = await db_connector.get_document_metadata(doc_id)
+    if not meta:
+        raise HTTPException(status_code=404, detail="Document not found")
+    return meta
+
 @router.put('/api/update_metadata')
 async def api_update_metadata(data: UpdateMetadataRequest, user=Depends(get_current_user)):
     if data.abstract is None and data.date_taken is None:
@@ -463,6 +489,20 @@ async def api_update_metadata(data: UpdateMetadataRequest, user=Depends(get_curr
     )
 
     if success:
+        # Also sync to OpenText DM DEF_PROF best-effort if abstract changed
+        if data.abstract is not None:
+            try:
+                dst = await run_in_threadpool(wsdl_client.dms_system_login)
+                if dst:
+                    await run_in_threadpool(
+                        wsdl_client.update_document_profile_abstract,
+                        dst,
+                        data.doc_id,
+                        data.abstract
+                    )
+            except Exception as sync_e:
+                logging.warning(f"WSDL sync failed after manual metadata update for doc {data.doc_id}: {sync_e}")
+
         return {'message': message}
     else:
         raise HTTPException(status_code=500, detail=message)
@@ -628,3 +668,46 @@ async def set_document_security(doc_id: str, data: SetTrusteesRequest, request: 
         raise HTTPException(status_code=500, detail=message)
 
     return {"status": "success", "message": "Trustees updated successfully"}
+
+@router.post('/api/documents/{doc_id}/rerun-analysis')
+async def rerun_analysis(doc_id: int, user=Depends(get_current_user)):
+    """
+    Resets the document's TAGGING_QUEUE status to pending (1) and attempts to 0,
+    then adds it back to the AI processing queue.
+    """
+    if not is_editor(user):
+        raise HTTPException(status_code=403, detail="Not authorized to rerun analysis")
+
+    try:
+        await db_connector.reset_processing_attempts([doc_id])
+    except Exception as reset_err:
+        logging.warning(f"Could not reset TAGGING_QUEUE for doc {doc_id}: {reset_err}")
+
+    processing_queue.enqueue_docnumbers([doc_id], source="rerun-analysis")
+    
+    return {"status": "success", "message": "Document analysis restarted."}
+
+@router.get('/api/documents/review-status')
+async def get_document_review_statuses(doc_ids: str, user=Depends(get_current_user)):
+    """Fetches review statuses for a comma-separated list of document IDs."""
+    if not is_editor(user):
+        return {"statuses": {}}
+    ids = [int(i.strip()) for i in doc_ids.split(',') if i.strip().isdigit()]
+    if not ids:
+        return {"statuses": {}}
+    from database.documents import get_review_statuses
+    statuses = await get_review_statuses(ids)
+    return {"statuses": statuses}
+
+@router.put('/api/documents/{doc_id}/review-status')
+async def set_document_review_status(doc_id: int, data: ReviewStatusRequest, user=Depends(get_current_user)):
+    """Sets the review status for a single document."""
+    if not is_editor(user):
+        raise HTTPException(status_code=403, detail="Only Editors can change review status.")
+    if data.status not in ['verified', 'pending']:
+        raise HTTPException(status_code=400, detail="Invalid status value.")
+    from database.documents import set_review_status
+    success = await set_review_status(doc_id, data.status)
+    if not success:
+        raise HTTPException(status_code=500, detail="Failed to update review status.")
+    return {"status": "success", "message": "Review status updated."}

@@ -592,3 +592,24 @@ def send_share_link_email(
     except Exception as e:
         logging.error(f"Unexpected error sending share link email to {to_email}: {e}")
         raise Exception("Failed to send share link email")
+
+def is_editor(user: dict) -> bool:
+    """
+    Check if the user has global editor/admin role, or has write permissions to folders.
+    """
+    if not user:
+        return False
+    
+    role = str(user.get("role", "")).upper()
+    if role in ["ADMIN", "EDITOR"]:
+        return True
+    
+    # Check tab permissions
+    tab_perms = user.get("tab_permissions", [])
+    if isinstance(tab_perms, list):
+        for perm in tab_perms:
+            # If they can write to 'folders', treat them as an editor for document analysis/status features
+            if str(perm.get("tab_key", "")).lower() == "folders" and perm.get("can_write"):
+                return True
+    
+    return False

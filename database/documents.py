@@ -88,7 +88,7 @@ async def fetch_documents_from_oracle(page=1, page_size=20, search_term=None, da
             # Get all document IDs from the SMART_EDMS_ROOT_ID folder hierarchy (Async call - NO DB connection held)
             from wsdl_client.config import SMART_EDMS_ROOT_ID
             root_doc_ids = await wsdl_client.get_recursive_doc_ids(dst, media_type_filter=None, start_node=SMART_EDMS_ROOT_ID)
-            logging.info(f"[edms-media recents] Fetched {len(root_doc_ids) if root_doc_ids else 0} doc IDs from SMART_EDMS_ROOT_ID")
+            # logging.info(f"[edms-media recents] Fetched {len(root_doc_ids) if root_doc_ids else 0} doc IDs from SMART_EDMS_ROOT_ID")
             
             if root_doc_ids and len(root_doc_ids) > 0:
                 # Limit to 10000 IDs for performance
@@ -104,7 +104,7 @@ async def fetch_documents_from_oracle(page=1, page_size=20, search_term=None, da
                 
                 # Filter to only include documents from the root folder hierarchy
                 where_clauses.append(f"p.DOCNUMBER IN ({root_id_placeholders})")
-                logging.info(f"[edms-media recents] Added {len(limited_ids)} doc IDs to query")
+                # logging.info(f"[edms-media recents] Added {len(limited_ids)} doc IDs to query")
             else:
                 # Fallback: just filter by RTA_TEXT1 if WSDL fetch fails or returns empty
                 logging.warning(f"[edms-media recents] WSDL returned no IDs, falling back to RTA_TEXT1 filter only")
@@ -479,8 +479,6 @@ async def fetch_documents_from_oracle(page=1, page_size=20, search_term=None, da
                 media_type = 'image'
 
                 final_abstract = abstract or ""
-                if security_level == 'Viewer':
-                    final_abstract = ""
 
                 try:
                     # Async call to resolve media type/filename
@@ -506,6 +504,7 @@ async def fetch_documents_from_oracle(page=1, page_size=20, search_term=None, da
                 documents.append({
                     "doc_id": doc_id,
                     "title": final_abstract,
+                    "abstract": final_abstract,
                     "docname": docname or "",
                     "author": author or "N/A",
                     "date": doc_date.strftime('%Y-%m-%d %H:%M:%S') if doc_date else "N/A",
@@ -624,11 +623,17 @@ async def update_document_processing_status(docnumber, new_abstract, o_detected,
         return False
 
     try:
-        async with conn.cursor() as cursor:
-            # Explicit transaction start not strictly needed with Python DB-API if auto-commit off, but okay.
-            # conn.begin() is available in oracledb but async/await context manager handles it usually.
+        int_doc = int(docnumber)
+        safe_abstract = (new_abstract or "")[:2000]
+        safe_error = str(error)[:500] if error else None
+        safe_transcript = str(transcript)[:2000] if transcript else None
 
-            await cursor.execute("UPDATE PROFILE SET abstract = :1 WHERE docnumber = :2", (new_abstract, docnumber))
+        async with conn.cursor() as cursor:
+            await cursor.execute("UPDATE PROFILE SET ABSTRACT = :1 WHERE DOCNUMBER = :2", (safe_abstract, int_doc))
+            rows_affected = cursor.rowcount or 0
+            logging.info(f"Updated PROFILE.abstract for docnumber {int_doc} (rows affected: {rows_affected}, abstract_len: {len(safe_abstract)})")
+            if rows_affected == 0:
+                logging.warning(f"PROFILE row for docnumber {int_doc} was NOT found in PROFILE table (rows affected: 0)!")
 
             merge_sql = """
             MERGE INTO TAGGING_QUEUE q
@@ -641,19 +646,19 @@ async def update_document_processing_status(docnumber, new_abstract, o_detected,
                 VALUES ((SELECT NVL(MAX(SYSTEM_ID), 0) + 1 FROM TAGGING_QUEUE), :docnumber, :o_detected, :ocr, :face, :status, :error, :transcript, :attempts, SYSDATE, 0)
             """
             await cursor.execute(merge_sql, {
-                'docnumber': docnumber, 'o_detected': o_detected, 'ocr': ocr, 'face': face,
-                'status': status, 'error': error, 'transcript': transcript, 'attempts': attempts
+                'docnumber': int_doc, 'o_detected': o_detected, 'ocr': ocr, 'face': face,
+                'status': status, 'error': safe_error, 'transcript': safe_transcript, 'attempts': attempts
             })
 
             await conn.commit()
 
             # --- VECTOR INDEXING HOOK (Blocking Call) ---
             if status == 3 and vector_client:
-                # logging.info(f"Queueing vector update for doc_id {docnumber}.")
+                # logging.info(f"Queueing vector update for doc_id {int_doc}.")
                 try:
-                    vector_client.add_or_update_document(docnumber, new_abstract)
+                    vector_client.add_or_update_document(int_doc, safe_abstract)
                 except Exception as e:
-                    logging.error(f"Failed to update vector index for doc_id {docnumber}: {e}", exc_info=True)
+                    logging.error(f"Failed to update vector index for doc_id {int_doc}: {e}", exc_info=True)
 
         return True
 
@@ -848,6 +853,36 @@ async def update_document_metadata(doc_id, new_abstract=None, new_date_taken=Ell
         if conn:
             await conn.close()
 
+async def get_document_metadata(doc_id: int):
+    """Fetches the latest metadata (abstract, author, date, docname) directly from PROFILE."""
+    conn = await get_async_connection()
+    if not conn:
+        return None
+    try:
+        async with conn.cursor() as cursor:
+            await cursor.execute(
+                "SELECT DOCNUMBER, ABSTRACT, AUTHOR, RTADOCDATE, DOCNAME FROM PROFILE WHERE DOCNUMBER = :1",
+                [int(doc_id)]
+            )
+            row = await cursor.fetchone()
+            if not row:
+                return None
+            doc_id, abstract, author, doc_date, docname = row
+            return {
+                "doc_id": doc_id,
+                "title": abstract or "",
+                "abstract": abstract or "",
+                "author": author or "N/A",
+                "docname": docname or "",
+                "date": doc_date.strftime('%Y-%m-%d %H:%M:%S') if doc_date else "N/A"
+            }
+    except Exception as e:
+        logging.error(f"Error getting document metadata for {doc_id}: {e}", exc_info=True)
+        return None
+    finally:
+        if conn:
+            await conn.close()
+
 async def get_specific_documents_for_processing(docnumbers):
     """Gets details for a specific list of docnumbers that need AI processing."""
     if not docnumbers:
@@ -914,6 +949,127 @@ async def check_processing_status(docnumbers):
     except (oracledb.Error, ValueError) as e:
         logging.error(f"Error in check_processing_status: {e}", exc_info=True)
         return docnumbers
+    finally:
+        if conn:
+            await conn.close()
+
+
+async def get_review_statuses(docnumbers):
+    """
+    Returns the review statuses for a list of document IDs.
+    Status logic:
+      - If PROFILE.REVIEW_STATUS == 1 -> 'verified'
+      - Else if TAGGING_QUEUE.STATUS == 3 -> 'ready_for_review'
+      - Else -> 'pending'
+    """
+    if not docnumbers:
+        return {}
+
+    conn = await get_async_connection()
+    if not conn:
+        return {}
+
+    try:
+        int_docnumbers = [int(d) for d in docnumbers if str(d).isdigit()]
+        if not int_docnumbers:
+            return {}
+
+        async with conn.cursor() as cursor:
+            bind_names = [f':doc_{i}' for i in range(len(int_docnumbers))]
+            bind_vars = {f'doc_{i}': val for i, val in enumerate(int_docnumbers)}
+
+            sql = f"""
+            SELECT p.DOCNUMBER, NVL(q.REVIEW_STATUS, 0) as REVIEW_STATUS, NVL(q.STATUS, 0) as QUEUE_STATUS
+            FROM PROFILE p
+            LEFT JOIN TAGGING_QUEUE q ON p.DOCNUMBER = q.DOCNUMBER
+            WHERE p.DOCNUMBER IN ({','.join(bind_names)})
+            """
+            await cursor.execute(sql, bind_vars)
+            rows = await cursor.fetchall()
+            
+            result = {}
+            for row in rows:
+                doc_id, review_status, queue_status = row
+                if review_status == 1:
+                    result[str(doc_id)] = 'verified'
+                elif queue_status == 3:
+                    result[str(doc_id)] = 'ready_for_review'
+                else:
+                    result[str(doc_id)] = 'pending'
+            return result
+    except Exception as e:
+        logging.error(f"Error in get_review_statuses: {e}")
+        return {}
+    finally:
+        if conn:
+            await conn.close()
+
+
+async def set_review_status(docnumber: int, status_str: str) -> bool:
+    """Sets the REVIEW_STATUS for a single document."""
+    conn = await get_async_connection()
+    if not conn:
+        return False
+
+    status_val = 1 if status_str == 'verified' else 0
+
+    try:
+        async with conn.cursor() as cursor:
+            # We assume REVIEW_STATUS column exists in TAGGING_QUEUE table
+            # ALTER TABLE TAGGING_QUEUE ADD (REVIEW_STATUS NUMBER(1) DEFAULT 0);
+            await cursor.execute(
+                "UPDATE TAGGING_QUEUE SET REVIEW_STATUS = :status WHERE DOCNUMBER = :docnumber",
+                {'status': status_val, 'docnumber': docnumber}
+            )
+            if cursor.rowcount == 0:
+                # Insert if it doesn't exist
+                await cursor.execute(
+                    "INSERT INTO TAGGING_QUEUE (DOCNUMBER, STATUS, REVIEW_STATUS) VALUES (:docnumber, 0, :status)",
+                    {'status': status_val, 'docnumber': docnumber}
+                )
+            await conn.commit()
+            return True
+    except Exception as e:
+        logging.error(f"Error in set_review_status: {e}")
+        return False
+    finally:
+        if conn:
+            await conn.close()
+
+
+async def set_folder_review_status(folder_docnumber: str, status_str: str) -> int:
+    """Sets the REVIEW_STATUS for all direct child files of a folder."""
+    from database.folders import get_folder_files, NODE_TYPE_DOCUMENT
+    
+    conn = await get_async_connection()
+    if not conn:
+        return 0
+
+    status_val = 1 if status_str == 'verified' else 0
+
+    try:
+        async with conn.cursor() as cursor:
+            # Update all tagging queue records that have a corresponding file in this folder
+            # For records that don't exist in TAGGING_QUEUE yet, they will just miss out on the update.
+            # In a full implementation we might MERGE them, but UPDATE is safer.
+            sql = """
+            UPDATE TAGGING_QUEUE 
+            SET REVIEW_STATUS = :status 
+            WHERE DOCNUMBER IN (
+                SELECT DOCNUMBER FROM FOLDER_ITEM 
+                WHERE PARENT = :parent_docnumber AND NODE_TYPE = :node_type
+            )
+            """
+            await cursor.execute(
+                sql, 
+                {'status': status_val, 'parent_docnumber': folder_docnumber, 'node_type': NODE_TYPE_DOCUMENT}
+            )
+            rowcount = cursor.rowcount
+            await conn.commit()
+            return rowcount
+    except Exception as e:
+        logging.error(f"Error in set_folder_review_status: {e}")
+        return 0
     finally:
         if conn:
             await conn.close()

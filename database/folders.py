@@ -1,6 +1,7 @@
 from .connection import get_async_connection
 from .media import resolve_media_types_from_db
 import logging
+import oracledb
 
 NODE_TYPE_FOLDER = 'F'
 NODE_TYPE_DOCUMENT = 'D'
@@ -199,6 +200,85 @@ async def get_folder_files(folder_docnumber: str) -> list:
             return files
     except Exception as e:
         logging.error(f"Error getting folder files: {e}")
+        return []
+    finally:
+        await conn.close()
+
+async def get_folder_preview_ids(folder_docnumber: str, limit: int = 4) -> list:
+    """
+    Gets up to `limit` document IDs from the folder that are images, videos, or PDFs
+    to be used as folder thumbnail previews.
+    """
+    conn = await get_async_connection()
+    if not conn:
+        return []
+
+    try:
+        async with conn.cursor() as cursor:
+            # Query files where PARENT = folder_docnumber and have correct extensions
+            # DOSEXTENSION in PROFILE can be used, or just fetch all and resolve
+            # We fetch up to a reasonable number to check extensions
+            query_sql = """
+                SELECT fi.DOCNUMBER, a.DEFAULT_EXTENSION, p.DOCNAME
+                FROM FOLDER_ITEM fi
+                LEFT JOIN PROFILE p ON fi.DOCNUMBER = p.DOCNUMBER
+                LEFT JOIN APPS a ON p.APPLICATION = a.SYSTEM_ID
+                WHERE fi.PARENT = :parent_docnumber 
+                AND fi.NODE_TYPE = :node_type
+                ORDER BY fi.DOCNUMBER DESC
+            """
+            try:
+                await cursor.execute(
+                    query_sql,
+                    {'parent_docnumber': folder_docnumber, 'node_type': NODE_TYPE_DOCUMENT}
+                )
+            except oracledb.DatabaseError as db_err:
+                if 'ORA-00904' in str(db_err):
+                    fallback_sql = """
+                        SELECT fi.DOCNUMBER, a.DEFAULT_EXTENSION, p.DOCNAME
+                        FROM FOLDER_ITEM fi
+                        LEFT JOIN PROFILE p ON fi.DOCNUMBER = p.DOCNUMBER
+                        LEFT JOIN APPS a ON p.APPLICATION = a.APPLICATION
+                        WHERE fi.PARENT = :parent_docnumber 
+                        AND fi.NODE_TYPE = :node_type
+                        ORDER BY fi.DOCNUMBER DESC
+                    """
+                    await cursor.execute(
+                        fallback_sql,
+                        {'parent_docnumber': folder_docnumber, 'node_type': NODE_TYPE_DOCUMENT}
+                    )
+                else:
+                    raise
+            rows = await cursor.fetchall()
+
+            if not rows:
+                return []
+
+            preview_ids = []
+            
+            # Extensions that can generate a thumbnail
+            valid_exts = {'jpg', 'jpeg', 'png', 'gif', 'bmp', 'tif', 'tiff', 'webp', 
+                          'mp4', 'mov', 'avi', 'wmv', 'mkv', 'flv', 'webm', '3gp',
+                          'pdf'}
+
+            for row in rows:
+                docnumber, extension, docname = row
+                
+                # Check extension from DOSEXTENSION or DOCNAME
+                ext = None
+                if extension:
+                    ext = str(extension).lower().strip('.')
+                elif docname and '.' in docname:
+                    ext = str(docname).split('.')[-1].lower()
+                
+                if ext in valid_exts:
+                    preview_ids.append(str(docnumber))
+                    if len(preview_ids) >= limit:
+                        break
+
+            return preview_ids
+    except Exception as e:
+        logging.error(f"Error getting folder preview IDs: {e}")
         return []
     finally:
         await conn.close()

@@ -52,15 +52,15 @@ def fetch_documents_in_batches(conn, start_docnumber):
                 ORDER BY docnumber ASC
                 FETCH FIRST :batch_size ROWS ONLY
                 """
-                logging.info(f"Fetching next batch of {BATCH_SIZE} docs after doc_id {last_docnumber}...")
+                # logging.info(f"Fetching next batch of {BATCH_SIZE} docs after doc_id {last_docnumber}...")
                 cursor.execute(sql, {'last_doc': last_docnumber, 'batch_size': BATCH_SIZE})
                 rows = cursor.fetchall()
 
                 if not rows:
-                    logging.info("No more documents found to process.")
+                    # logging.info("No more documents found to process.")
                     break
                 
-                logging.info(f"Fetched batch of {len(rows)} documents. Doc IDs from {rows[0][0]} to {rows[-1][0]}.")
+                # logging.info(f"Fetched batch of {len(rows)} documents. Doc IDs from {rows[0][0]} to {rows[-1][0]}.")
                 yield rows
                 
                 # Update last_docnumber with the highest ID from this batch
@@ -70,7 +70,7 @@ def fetch_documents_in_batches(conn, start_docnumber):
             logging.error(f"Oracle error fetching batch: {e}", exc_info=True)
             # Attempt to re-establish connection if it's a connection error
             if not conn.is_healthy():
-                logging.info("DB connection may not be healthy. Attempting to reconnect...")
+                # logging.info("DB connection may not be healthy. Attempting to reconnect...")
                 conn.close()
                 conn = get_db_connection()
                 if not conn:
@@ -82,11 +82,11 @@ def fetch_documents_in_batches(conn, start_docnumber):
 
 
 def main():
-    logging.info("--- Starting Vector Backfill Process ---")
+    # logging.info("--- Starting Vector Backfill Process ---")
     
     # 19677385 is one less than the start number in your queries
     start_docnumber = 19677385 
-    logging.info(f"Starting from docnumber > {start_docnumber}")
+    # logging.info(f"Starting from docnumber > {start_docnumber}")
     
     conn = get_db_connection()
     if not conn:
@@ -104,13 +104,13 @@ def main():
                     documents_content.append(abstract)
 
             if not doc_ids:
-                logging.info(f"Skipping batch starting after {batch[0][0]}, no valid abstracts found.")
+                # logging.info(f"Skipping batch starting after {batch[0][0]}, no valid abstracts found.")
                 continue
 
             try:
                 # Use the main vector_client's upsert function
                 # This will call the embedding service for each document
-                logging.info(f"Indexing batch of {len(doc_ids)} documents (IDs from {doc_ids[0]} to {doc_ids[-1]})...")
+                # logging.info(f"Indexing batch of {len(doc_ids)} documents (IDs from {doc_ids[0]} to {doc_ids[-1]})...")
                 
                 for i, (doc_id, content) in enumerate(zip(doc_ids, documents_content)):
                     vector_client.add_or_update_document(int(doc_id), content)
@@ -118,7 +118,7 @@ def main():
                         logging.info(f"Progress: {i + 1}/{len(doc_ids)} documents in current batch")
                 
                 total_processed += len(doc_ids)
-                logging.info(f"Successfully indexed batch. Total processed so far: {total_processed}")
+                # logging.info(f"Successfully indexed batch. Total processed so far: {total_processed}")
                 
             except Exception as e:
                 logging.error(f"Failed to index batch (IDs from {doc_ids[0]} to {doc_ids[-1]}). Error: {e}", exc_info=True)
@@ -126,9 +126,9 @@ def main():
     finally:
         if conn:
             conn.close()
-            logging.info("Closed Oracle DB connection.")
+            # logging.info("Closed Oracle DB connection.")
 
-    logging.info(f"--- Vector Backfill Process Finished. Total documents indexed: {total_processed} ---")
+    # logging.info(f"--- Vector Backfill Process Finished. Total documents indexed: {total_processed} ---")
 
 if __name__ == "__main__":
     main()

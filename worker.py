@@ -9,7 +9,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 
 async def main():
     stop_event = asyncio.Event()
-    logging.info("Starting EDMS processing queue worker.")
+    # logging.info("Starting EDMS processing queue worker.")
     try:
         await processing_worker_loop(stop_event)
     except asyncio.CancelledError:

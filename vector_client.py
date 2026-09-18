@@ -25,7 +25,7 @@ class ExternalEmbeddingFunction(embedding_functions.EmbeddingFunction):
         embeddings = []
         for text in input_texts:
             try:
-                logging.info(f"ExternalEmbeddingFunction: Calling embedding service for text: {text[:70]}...")
+                # logging.info(f"ExternalEmbeddingFunction: Calling embedding service for text: {text[:70]}...")
                 embedding = api_client.get_embedding_from_service(text)
                 if embedding:
                     embeddings.append(embedding)
@@ -58,7 +58,7 @@ def _get_collection():
     """Lazily initializes and returns the ChromaDB collection. Thread-safe via GIL."""
     global _client, _collection
     if _collection is None:
-        logging.info(f"Lazily initializing ChromaDB PersistentClient at path: {CHROMA_DB_PATH}")
+        # logging.info(f"Lazily initializing ChromaDB PersistentClient at path: {CHROMA_DB_PATH}")
         _client = chromadb.PersistentClient(path=CHROMA_DB_PATH, settings=Settings(anonymized_telemetry=False))
         
         # Check if collection exists and get its dimension
@@ -76,20 +76,20 @@ def _get_collection():
                     f"Recreating collection (existing vectors will be lost - run backfill_vectors.py to re-index)."
                 )
                 _client.delete_collection(name=COLLECTION_NAME)
-                logging.info(f"Deleted collection '{COLLECTION_NAME}' due to dimension mismatch.")
+                # logging.info(f"Deleted collection '{COLLECTION_NAME}' due to dimension mismatch.")
         
         _collection = _client.get_or_create_collection(
             name=COLLECTION_NAME,
             embedding_function=external_embed_fn
         )
-        logging.info(f"ChromaDB collection '{COLLECTION_NAME}' ready.")
+        # logging.info(f"ChromaDB collection '{COLLECTION_NAME}' ready.")
     return _collection
 
 def add_or_update_document(doc_id: int, text_content: str):
     """
     Adds or updates a document in the ChromaDB vector store.
     """
-    logging.info(f"VectorClient: Attempting to add/update doc_id {doc_id}...")
+    # logging.info(f"VectorClient: Attempting to add/update doc_id {doc_id}...")
     if not text_content:
         logging.warning(f"VectorClient: Skipping vector update for doc_id {doc_id}: no text content provided.")
         return
@@ -99,13 +99,13 @@ def add_or_update_document(doc_id: int, text_content: str):
         # We don't need to provide the embedding here.
         # ChromaDB will use the collection's embedding_function (ExternalEmbeddingFunction)
         # to call our service and get the embedding for the document.
-        logging.info(f"VectorClient: Calling collection.upsert for doc_id {doc_id_str}...")
+        # logging.info(f"VectorClient: Calling collection.upsert for doc_id {doc_id_str}...")
         _get_collection().upsert(
             documents=[text_content],
             metadatas=[{"doc_id": doc_id_str, "source": "abstract"}],
             ids=[doc_id_str]
         )
-        logging.info(f"VectorClient: Successfully upserted vector for doc_id {doc_id}.")
+        # logging.info(f"VectorClient: Successfully upserted vector for doc_id {doc_id}.")
     except Exception as e:
         logging.error(f"VectorClient: Failed to upsert vector for doc_id {doc_id}: {e}", exc_info=True)
 
@@ -114,7 +114,7 @@ def _reset_collection():
     """Reset the global collection reference to force re-initialization."""
     global _client, _collection
     _collection = None
-    logging.info("Reset collection reference to force re-initialization.")
+    # logging.info("Reset collection reference to force re-initialization.")
 
 
 def query_documents(search_term: str, n_results: int = 40) -> list[int] | None:
@@ -149,9 +149,9 @@ def query_documents(search_term: str, n_results: int = 40) -> list[int] | None:
             if dist <= DISTANCE_THRESHOLD:
                 valid_doc_ids.append(int(doc_id))
                 # logging.info(f"   [KEEP] Match #{i + 1}: DocID {doc_id} | Distance: {dist}")
-            else:
+            # else:
                 # Log what we are dropping so you can tune the threshold
-                logging.info(f"   [DROP] Match #{i + 1}: DocID {doc_id} | Distance: {dist} (Too far)")
+                # logging.info(f"   [DROP] Match #{i + 1}: DocID {doc_id} | Distance: {dist} (Too far)")
 
         # logging.info(f"-----------------------------------------------")
 
@@ -170,7 +170,7 @@ def query_documents(search_term: str, n_results: int = 40) -> list[int] | None:
                 # Delete and recreate the collection
                 if _client:
                     _client.delete_collection(name=COLLECTION_NAME)
-                    logging.info(f"Deleted collection '{COLLECTION_NAME}' due to dimension mismatch.")
+                    # logging.info(f"Deleted collection '{COLLECTION_NAME}' due to dimension mismatch.")
                 _reset_collection()
                 # Return empty results this time - next query will work with new collection
                 return []
@@ -184,10 +184,10 @@ def delete_document(doc_id: int):
     """
     Deletes a document from the vector store.
     """
-    logging.info(f"VectorClient: Attempting to delete doc_id {doc_id}...")
+    # logging.info(f"VectorClient: Attempting to delete doc_id {doc_id}...")
     doc_id_str = str(doc_id)
     try:
         _get_collection().delete(ids=[doc_id_str])
-        logging.info(f"VectorClient: Successfully deleted vector for doc_id {doc_id}.")
+        # logging.info(f"VectorClient: Successfully deleted vector for doc_id {doc_id}.")
     except Exception as e:
         logging.error(f"VectorClient: Failed to delete vector for doc_id {doc_id}: {e}", exc_info=True)

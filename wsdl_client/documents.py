@@ -144,7 +144,7 @@ async def upload_document_to_dms(dst, file_stream, metadata, parent_id=None, can
             # then check whether this upload has been cancelled.
             await asyncio.sleep(0)
             if cancel_check is not None and cancel_check():
-                logging.info(f"Upload cancelled for document {created_doc_number}")
+                # logging.info(f"Upload cancelled for document {created_doc_number}")
                 raise UploadCancelled(
                     f"Upload cancelled for document {created_doc_number}",
                     doc_number=created_doc_number
@@ -670,6 +670,55 @@ def rename_document(dst, doc_id, new_name):
         return False
     except Exception as e:
         logging.error(f"Error in rename_document: {e}", exc_info=True)
+        return False
+
+def update_document_profile_abstract(dst, doc_id, abstract):
+    """
+    Updates the ABSTRACT property on a document's Profile (DEF_PROF) via WSDL UpdateObject.
+    This ensures OpenText DM Desktop/eDocs immediately reflects the updated abstract.
+    """
+    try:
+        svc_client = get_soap_client('BasicHttpBinding_IDMSvc')
+        if not svc_client:
+            return False
+
+        string_type = svc_client.get_type('{http://www.w3.org/2001/XMLSchema}string')
+        int_type = svc_client.get_type('{http://www.w3.org/2001/XMLSchema}int')
+        string_array_type = svc_client.get_type(
+            '{http://schemas.microsoft.com/2003/10/Serialization/Arrays}ArrayOfstring')
+
+        prop_names = string_array_type([
+            '%TARGET_LIBRARY',
+            '%OBJECT_IDENTIFIER',
+            'ABSTRACT'
+        ])
+
+        prop_values = {'anyType': [
+            xsd.AnyObject(string_type, 'RTA_MAIN'),
+            xsd.AnyObject(int_type, int(doc_id)),
+            xsd.AnyObject(string_type, str(abstract or ''))
+        ]}
+
+        call_data = {
+            'dstIn': dst,
+            'objectType': 'DEF_PROF',
+            'properties': {
+                'propertyCount': 3,
+                'propertyNames': prop_names,
+                'propertyValues': prop_values
+            }
+        }
+
+        response = svc_client.service.UpdateObject(call=call_data)
+        if response and response.resultCode == 0:
+            logging.info(f"WSDL UpdateObject: Successfully updated DEF_PROF ABSTRACT for doc {doc_id}")
+            return True
+        else:
+            error_msg = getattr(response, 'errorDoc', 'Unknown error')
+            logging.warning(f"WSDL UpdateObject for ABSTRACT on doc {doc_id} returned code {getattr(response, 'resultCode', 'N/A')}: {error_msg}")
+            return False
+    except Exception as e:
+        logging.warning(f"WSDL UpdateObject for ABSTRACT on doc {doc_id} failed: {e}")
         return False
 
 def rename_folder_display(dst, content_item_system_id, new_name):

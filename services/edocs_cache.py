@@ -45,12 +45,12 @@ def get_server_edocs_cache_root(appdata_override: str | Path | None = None) -> P
 
 def run_server_edocs_cache_clear(requested_by: str, user_id: str | None = None) -> dict[str, Any]:
     result = passive_clear_edocs_dm_cache()
-    logging.info(
-        "Server eDOCS cache clear completed: requested_by=%s user_id=%s result=%s",
-        requested_by,
-        user_id or "",
-        result,
-    )
+    # logging.info(
+    #     "Server eDOCS cache clear completed: requested_by=%s user_id=%s result=%s",
+    #     requested_by,
+    #     user_id or "",
+    #     result,
+    # )
     return result
 
 

@@ -122,7 +122,7 @@ def ensure_performance_indexes():
 
                     cursor.execute(ddl)
                     created.append(index_name)
-                    logging.info(f"Created performance index: {index_name}")
+                    # logging.info(f"Created performance index: {index_name}")
                 except oracledb.Error as ex:
                     error, = ex.args
                     # 955: name is already used by an existing object

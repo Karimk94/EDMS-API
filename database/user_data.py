@@ -184,7 +184,7 @@ async def restore_user_quota(edms_user_id, amount_bytes):
             )
 
             await conn.commit()
-            logging.info(f"Restored {amount_bytes} bytes for user {edms_user_id}. New remaining: {new_remaining}")
+            # logging.info(f"Restored {amount_bytes} bytes for user {edms_user_id}. New remaining: {new_remaining}")
             return True, "Quota restored"
 
     except oracledb.Error as e:

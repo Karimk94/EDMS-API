@@ -334,21 +334,21 @@ async def add_edms_person(
 
         with connection.cursor() as cursor:
             # Check if USER_ID already exists
-            logging.info(f"[add_edms_person] Checking if user {user_id} exists")
+            # logging.info(f"[add_edms_person] Checking if user {user_id} exists")
             await cursor.execute("SELECT 1 FROM PEOPLE WHERE UPPER(USER_ID) = :1", [user_id])
             if await cursor.fetchone():
                 return False, f"Username {user_id} already exists in EDMS."
 
             # Pre-fetch sequence value
-            logging.info(f"[add_edms_person] Fetching next SYSTEM_ID from sequence")
+            # logging.info(f"[add_edms_person] Fetching next SYSTEM_ID from sequence")
             await cursor.execute("SELECT SEQSYSTEMKEY.NEXTVAL FROM dual")
             row = await cursor.fetchone()
             new_sys_id = row[0]
-            logging.info(f"[add_edms_person] Got new_sys_id={new_sys_id}")
+            # logging.info(f"[add_edms_person] Got new_sys_id={new_sys_id}")
 
             # Insert PEOPLE row using positional bind variables
             profile_defaults = f"0;4;AUTHOR.USER_ID;DOCSADM.PEOPLE.SYSTEM_ID='{user_id}'"
-            logging.info(f"[add_edms_person] Inserting into PEOPLE")
+            # logging.info(f"[add_edms_person] Inserting into PEOPLE")
             await cursor.execute("""
                 INSERT INTO PEOPLE (
                     SYSTEM_ID, USER_ID, FULL_NAME, EMAIL_ADDRESS, USER_PASSWORD,
@@ -368,7 +368,7 @@ async def add_edms_person(
             if primary_group:
                 all_groups.add(primary_group)
             
-            logging.info(f"[add_edms_person] Inserting groups: {all_groups}")
+            # logging.info(f"[add_edms_person] Inserting groups: {all_groups}")
             for gid in all_groups:
                 await cursor.execute("""
                     INSERT INTO PEOPLEGROUPS (PEOPLE_SYSTEM_ID, GROUPS_SYSTEM_ID, LAST_UPDATE)
@@ -379,7 +379,7 @@ async def add_edms_person(
             await _ensure_docs_users_group(cursor, new_sys_id)
                 
             # Add Network Aliases
-            logging.info(f"[add_edms_person] Inserting network aliases: {network_aliases}")
+            # logging.info(f"[add_edms_person] Inserting network aliases: {network_aliases}")
             for net_alias in network_aliases:
                 if net_alias.strip():
                     await cursor.execute("""
@@ -394,7 +394,7 @@ async def add_edms_person(
                     
             # Update HR record
             if hr_login:
-                logging.info(f"[add_edms_person] Marking HR employee as EDMS user: {hr_login}")
+                # logging.info(f"[add_edms_person] Marking HR employee as EDMS user: {hr_login}")
                 await cursor.execute("""
                     UPDATE LKP_HR_EMPLOYEES SET IS_EDMS_USR = 'Y'
                     WHERE UPPER(LOGIN) = UPPER(:1)
@@ -540,7 +540,7 @@ async def get_edms_people_export(search: str = "") -> List[Dict[str, Any]]:
         
         params = {"search": search if search else ''}
         
-        logging.info(f"Executing export query with params: {params}")
+        # logging.info(f"Executing export query with params: {params}")
         
         with connection.cursor() as cursor:
             # Fetch basic user data
@@ -548,7 +548,7 @@ async def get_edms_people_export(search: str = "") -> List[Dict[str, Any]]:
             columns = [col[0].lower() for col in cursor.description]
             rows = await cursor.fetchall()
             
-            logging.info(f"Export query returned {len(rows)} rows")
+            # logging.info(f"Export query returned {len(rows)} rows")
             
             if not rows:
                 return []

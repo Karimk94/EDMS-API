@@ -3,6 +3,7 @@ from typing import List, Optional, Any
 
 class ProcessUploadRequest(BaseModel):
     docnumbers: List[int]
+    source: Optional[str] = None
 
 class UpdateMetadataRequest(BaseModel):
     doc_id: int
@@ -12,6 +13,9 @@ class UpdateMetadataRequest(BaseModel):
 class UpdateAbstractRequest(BaseModel):
     doc_id: int
     names: List[str]
+
+class ReviewStatusRequest(BaseModel):
+    status: str
 
 class LinkEventRequest(BaseModel):
     event_id: Optional[int]

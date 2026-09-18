@@ -79,7 +79,7 @@ async def lifespan(app: FastAPI):
     from services.processing_queue import processing_worker_loop
     worker_stop_event = asyncio.Event()
     worker_task = asyncio.create_task(processing_worker_loop(worker_stop_event))
-    logging.info("Started background processing worker loop.")
+    # logging.info("Started background processing worker loop.")
 
     try:
         yield
@@ -222,7 +222,7 @@ class RequestMetricsMiddleware(BaseHTTPMiddleware):
                 "duration_ms": duration_ms,
                 "user": user,
             }
-            logging.info(json.dumps(payload, ensure_ascii=True))
+            # logging.info(json.dumps(payload, ensure_ascii=True))
 
 # --- Register Routes ---
 app.include_router(auth.router)
