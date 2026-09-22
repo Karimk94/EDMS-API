@@ -5,7 +5,12 @@ import logging
 import oracledb
 import re
 import wsdl_client
+from wsdl_client.auth import dms_system_login
+from wsdl_client.documents import force_checkin_document_soap
+from wsdl_client.base import get_soap_client, find_client_with_operation
+from zeep import xsd
 from database import admin as admin_db
+from schemas.admin import BulkCheckinRequest
 from database import documents as documents_db
 from database import tab_permissions as tab_perms_db
 from database import login_logs as login_logs_db
@@ -739,3 +744,72 @@ async def execute_sql_query(request: Request, body: SqlQueryRequest):
         if conn:
             await conn.close()
 
+
+# ---------------------------------------------------------------------------
+# Checked-Out Documents Endpoints
+# ---------------------------------------------------------------------------
+
+@router.get("/api/admin/checked-out")
+async def get_checked_out_documents(
+    request: Request,
+    days: int = Query(1, ge=1, le=365, description="How many days back to look"),
+    date_from: Optional[str] = Query(None, description="Start date (YYYY-MM-DD)"),
+    date_to: Optional[str] = Query(None, description="End date (YYYY-MM-DD)"),
+):
+    """
+    Return all documents currently checked out (CHECKIN_DATE IS NULL).
+    Filters by `date_from` and `date_to` if provided, otherwise by the last `days`.
+    """
+    if not check_admin_access(request):
+        raise HTTPException(status_code=403, detail="Access denied. Admin privileges required.")
+
+    try:
+        docs = await admin_db.fetch_checked_out_docs(days=days, date_from=date_from, date_to=date_to)
+        return {"documents": docs, "total": len(docs), "days": days, "date_from": date_from, "date_to": date_to}
+    except Exception as exc:
+        logging.error(f"Error fetching checked-out documents: {exc}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Error fetching checked-out documents: {str(exc)}")
+
+
+@router.post("/api/admin/checked-out/checkin")
+async def force_checkin_documents(
+    request: Request,
+    body: BulkCheckinRequest,
+):
+    """
+    Force-check-in the provided list of document numbers via DMS SOAP (UpdateObject %UNLOCK).
+    Returns per-document success/failure results.
+    """
+    if not check_admin_access(request):
+        raise HTTPException(status_code=403, detail="Access denied. Admin privileges required.")
+
+    if not body.docnumbers:
+        raise HTTPException(status_code=400, detail="No document numbers provided.")
+
+    # Login to DMS using cached system token
+    dst = dms_system_login(force_refresh=True)
+    if not dst:
+        raise HTTPException(status_code=503, detail="Could not authenticate with DMS service.")
+
+    results = []
+    for doc_number in body.docnumbers:
+        success, result_code = force_checkin_document_soap(dst, doc_number)
+        results.append({
+            "docnumber": doc_number,
+            "success": success,
+            "result_code": result_code,
+        })
+        if success:
+            logging.info(f"[Admin CheckIn] Force checked-in doc {doc_number}")
+        else:
+            logging.warning(f"[Admin CheckIn] Failed for doc {doc_number}, resultCode={result_code}")
+
+    checked_in = sum(1 for r in results if r["success"])
+    failed = sum(1 for r in results if not r["success"])
+
+    return {
+        "results": results,
+        "checked_in": checked_in,
+        "failed": failed,
+        "total": len(results),
+    }

@@ -867,3 +867,44 @@ def stream_document_content(dst, doc_number):
     except Exception as e:
         logging.error(f"Error preparing stream for document {doc_number}: {e}")
         return None, None
+
+
+def force_checkin_document_soap(dst: str, doc_number: int) -> tuple:
+    """
+    Call DMS UpdateObject with %STATUS = %UNLOCK to check in a document.
+    Returns (success, result_code).
+    """
+    try:
+        client = get_soap_client()
+        if not hasattr(client.service, 'UpdateObject'):
+            client = find_client_with_operation('UpdateObject')
+        if not client:
+            return False, None
+
+        string_type = client.get_type('{http://www.w3.org/2001/XMLSchema}string')
+
+        call_payload = {
+            'dstIn': dst,
+            'objectType': 'v_defprof',
+            'properties': {
+                'propertyCount': 3,
+                'propertyNames': {
+                    'string': ['%TARGET_LIBRARY', '%OBJECT_IDENTIFIER', '%STATUS']
+                },
+                'propertyValues': {
+                    'anyType': [
+                        xsd.AnyObject(string_type, "RTA_MAIN"),
+                        xsd.AnyObject(string_type, str(doc_number)),
+                        xsd.AnyObject(string_type, '%UNLOCK'),
+                    ]
+                },
+            },
+        }
+
+        response = client.service.UpdateObject(call=call_payload)
+        result_code = getattr(response, 'resultCode', -1)
+        return result_code == 0, result_code
+
+    except Exception as exc:
+        logging.error(f"UpdateObject error for doc {doc_number}: {exc}", exc_info=True)
+        return False, None

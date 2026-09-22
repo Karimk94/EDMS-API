@@ -1,6 +1,10 @@
 import oracledb
 import logging
+from datetime import datetime, timezone, timedelta
 from database.connection import get_async_connection
+
+# UTC+4 timezone (Gulf Standard Time, e.g. Dubai)
+UTC_PLUS_4 = timezone(timedelta(hours=4))
 
 
 async def get_all_edms_users(search: str = "", page: int = 1, limit: int = 20):
@@ -717,3 +721,71 @@ async def get_group_users(group_system_id: int, search: str = ""):
             
     return users
 
+async def fetch_checked_out_docs(days: int = 1, date_from: str = None, date_to: str = None) -> list:
+    """
+    Async query: returns documents checked out where CHECKIN_DATE is NULL.
+    Joins PROFILE for DOCNAME.
+
+    Date handling (all interpreted/returned in UTC+4):
+      - By default, fetches values as of today (start of today in UTC+4) and
+        ignores anything checked out before today.
+      - If date_from and/or date_to are provided (YYYY-MM-DD, treated as UTC+4
+        dates), the filter uses that range instead.
+
+    The `days` parameter is retained for backwards compatibility of the
+    signature but is no longer used as a look-back window.
+    """
+    conn = None
+    try:
+        conn = await get_async_connection()
+        async with conn.cursor() as cursor:
+            params = {}
+            if date_from and date_to:
+                date_filter = ("c.CHECKOUT_DATE >= TO_TIMESTAMP_TZ(:date_from || ' 00:00:00 +04:00', 'YYYY-MM-DD HH24:MI:SS TZH:TZM') "
+                               "AND c.CHECKOUT_DATE < TO_TIMESTAMP_TZ(:date_to || ' 00:00:00 +04:00', 'YYYY-MM-DD HH24:MI:SS TZH:TZM') + 1")
+                params["date_from"] = date_from
+                params["date_to"] = date_to
+            elif date_from:
+                date_filter = "c.CHECKOUT_DATE >= TO_TIMESTAMP_TZ(:date_from || ' 00:00:00 +04:00', 'YYYY-MM-DD HH24:MI:SS TZH:TZM')"
+                params["date_from"] = date_from
+            elif date_to:
+                date_filter = "c.CHECKOUT_DATE < TO_TIMESTAMP_TZ(:date_to || ' 00:00:00 +04:00', 'YYYY-MM-DD HH24:MI:SS TZH:TZM') + 1"
+                params["date_to"] = date_to
+            else:
+                # Default: fetch rows from the hardcoded start date 22/09/2026 (UTC+4) onward.
+                # Discards anything checked out before 22/09/2026 00:00:00 +04:00.
+                date_filter = ("c.CHECKOUT_DATE >= TO_TIMESTAMP_TZ('2026-09-22 00:00:00 +04:00', "
+                                "'YYYY-MM-DD HH24:MI:SS TZH:TZM')")
+
+            sql = f"""
+                SELECT
+                    c.DOCNUMBER,
+                    c.SYSTEM_ID,
+                    c.CHECKOUT_DATE,
+                    c.TYPIST,
+                    NVL(p.DOCNAME, '(unknown)') AS DOCNAME
+                FROM CHECKOUT c
+                LEFT JOIN PROFILE p
+                    ON c.DOCNUMBER = p.DOCNUMBER
+                WHERE {date_filter}
+                ORDER BY c.CHECKOUT_DATE DESC
+            """
+            await cursor.execute(sql, params)
+            rows = await cursor.fetchall()
+            columns = [col[0].lower() for col in cursor.description]
+            result = []
+            for row in rows:
+                doc = dict(zip(columns, row))
+                # Serialize Oracle Date/timestamp to ISO string in UTC+4
+                for k, v in doc.items():
+                    if hasattr(v, 'isoformat'):
+                        if hasattr(v, 'tzinfo') and v.tzinfo is None:
+                            # Naive value coming from DB -> assume it is already
+                            # in UTC+4 server time and attach the offset.
+                            v = v.replace(tzinfo=UTC_PLUS_4)
+                        doc[k] = v.isoformat()
+                result.append(doc)
+            return result
+    finally:
+        if conn:
+            await conn.close()
