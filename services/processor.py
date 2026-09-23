@@ -86,7 +86,7 @@ def _ensure_abstract_fits(base_abstract: str, caption: str, ocr: str, vips: str)
     # Calculate current total length
     parts = [base_abstract]
     if caption:
-        parts.append(f"Caption: {caption}")
+        parts.append(f"{caption}")
     if ocr:
         parts.append(f"OCR: {ocr}")
     if vips:
@@ -106,7 +106,7 @@ def _ensure_abstract_fits(base_abstract: str, caption: str, ocr: str, vips: str)
     # --- Step 2: Recalculate ---
     parts = [base_abstract]
     if caption:
-        parts.append(f"Caption: {caption}")
+        parts.append(f"{caption}")
     if ocr:
         parts.append(f"OCR: {ocr}")
     if vips:
@@ -164,6 +164,8 @@ def _build_final_abstract(base_abstract: str, ai_abstract_parts: dict) -> str:
     caption = (ai_abstract_parts.get('CAPTION') or '').strip()
     if caption == "No caption generated.":
         caption = ""
+    if ocr == "The image contains no text.":
+        ocr = ""
     ocr = (ai_abstract_parts.get('OCR') or '').strip()
     vips = (ai_abstract_parts.get('VIPS') or '').strip()
 
@@ -174,7 +176,7 @@ def _build_final_abstract(base_abstract: str, ai_abstract_parts: dict) -> str:
 
     parts = [base_abstract]
     if caption:
-        parts.append(f" {caption}")
+        parts.append(f"{caption}")
     if ocr:
         parts.append(f"OCR: {ocr}")
     if vips:

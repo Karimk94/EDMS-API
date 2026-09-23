@@ -69,6 +69,8 @@ async def api_list_folders(
         media_type: Optional[str] = None,
         search: Optional[str] = None,
         parent_id: Optional[str] = None,
+        page: int = 1,
+        page_size: int = 60,
         user=Depends(get_current_user)
 ):
     if parent_id in ['null', 'undefined', '']:
@@ -76,6 +78,14 @@ async def api_list_folders(
 
     # Get the current logged-in user's username for permission filtering
     username = user.get('username')
+
+    # Clamp pagination parameters to sane bounds
+    if page < 1:
+        page = 1
+    if page_size < 1:
+        page_size = 60
+    if page_size > 200:
+        page_size = 200
 
     dst = await run_in_threadpool(wsdl_client.dms_system_login)
     if not dst:
@@ -85,10 +95,86 @@ async def api_list_folders(
         contents = await wsdl_client.list_folder_contents(
             dst, parent_id, x_app_source, scope=scope, media_type=media_type, search_term=search, username=username
         )
-        return {"contents": contents}
+
+        # --- Server-side pagination ---
+        # Standard folders (Images/Videos/Files) are navigational containers and
+        # must always be returned in full so the UI can render them. Only the
+        # regular user files/folders are paginated.
+        standard_items = [c for c in contents if c.get('is_standard')]
+        regular_items = [c for c in contents if not c.get('is_standard')]
+
+        total_items = len(regular_items)
+        total_pages = (total_items + page_size - 1) // page_size if total_items > 0 else 1
+
+        offset = (page - 1) * page_size
+        if offset >= total_items and total_items > 0:
+            # Requested page is out of range — return the last available page
+            page = total_pages
+            offset = (page - 1) * page_size
+
+        paginated_regular = regular_items[offset: offset + page_size]
+        paged_contents = standard_items + paginated_regular
+
+        return {
+            "contents": paged_contents,
+            "page": page,
+            "page_size": page_size,
+            "total_items": total_items,
+            "total_pages": total_pages
+        }
     except Exception as e:
         logging.error(f"Error listing folders: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Failed to list folder contents.")
+
+
+@router.get('/api/folders/processing-status')
+async def api_get_folders_processing_status(
+        folder_ids: Optional[str] = None,
+        user=Depends(get_current_user)
+):
+    """
+    Batch endpoint: returns processing summaries for multiple folders.
+    Query param: folder_ids=1234,5678,9012 (comma-separated folder DOCNUMBERs)
+
+    Returns:
+        { "folders": { "1234": { total, processing, done, is_complete, processing_doc_ids }, ... } }
+    """
+    if not folder_ids:
+        return {"folders": {}}
+
+    try:
+        folder_id_list = [fid.strip() for fid in folder_ids.split(',') if fid.strip()]
+        if not folder_id_list:
+            return {"folders": {}}
+
+        summaries = await db_folders.get_folders_processing_summary_batch(folder_id_list)
+        return {"folders": summaries}
+    except Exception as e:
+        logging.error(f"Error getting batch folder processing status: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to get folder processing status.")
+
+
+@router.get('/api/folders/{folder_id}/processing-status')
+async def api_get_folder_processing_status(
+        folder_id: str,
+        user=Depends(get_current_user)
+):
+    """
+    Returns the processing summary for a single folder's direct file children.
+
+    Returns:
+        { folder_id, total, processing, done, is_complete, processing_doc_ids }
+    """
+    if not folder_id:
+        raise HTTPException(status_code=400, detail="folder_id is required.")
+
+    try:
+        summary = await db_folders.get_folder_processing_summary(folder_id)
+        return summary
+    except Exception as e:
+        logging.error(f"Error getting folder processing status for {folder_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to get folder processing status.")
+
 
 @router.post('/api/folders')
 async def api_create_folder(request: Request, data: CreateFolderRequest, user=Depends(get_current_user)):

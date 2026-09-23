@@ -204,6 +204,167 @@ async def get_folder_files(folder_docnumber: str) -> list:
     finally:
         await conn.close()
 
+async def get_folder_processing_summary(folder_docnumber: str) -> dict:
+    """
+    Returns a processing summary for all direct file children of a folder.
+
+    Counts how many documents are still being processed (queued or in-progress)
+    versus how many are done (TAGGING_QUEUE.STATUS = 3).
+
+    Returns:
+        {
+            'folder_id': str,
+            'total': int,        # total direct file children
+            'processing': int,   # children still being processed
+            'done': int,         # children with STATUS = 3
+            'is_complete': bool, # True when processing == 0 and total > 0
+            'processing_doc_ids': [str, ...]  # doc IDs still processing
+        }
+    """
+    result = {
+        'folder_id': str(folder_docnumber),
+        'total': 0,
+        'processing': 0,
+        'done': 0,
+        'is_complete': False,
+        'processing_doc_ids': []
+    }
+
+    conn = await get_async_connection()
+    if not conn:
+        return result
+
+    try:
+        async with conn.cursor() as cursor:
+            # LEFT JOIN TAGGING_QUEUE so that documents with no queue row
+            # (just uploaded, not yet picked up) are counted as "processing".
+            await cursor.execute(
+                """SELECT fi.DOCNUMBER, NVL(q.STATUS, 0) AS QUEUE_STATUS
+                   FROM FOLDER_ITEM fi
+                   LEFT JOIN TAGGING_QUEUE q ON fi.DOCNUMBER = q.DOCNUMBER
+                   WHERE fi.PARENT = :parent_docnumber
+                   AND fi.NODE_TYPE = :node_type""",
+                {'parent_docnumber': folder_docnumber, 'node_type': NODE_TYPE_DOCUMENT}
+            )
+            rows = await cursor.fetchall()
+
+            if not rows:
+                return result
+
+            total = len(rows)
+            done = 0
+            processing_doc_ids = []
+
+            for row in rows:
+                docnumber, queue_status = row
+                if queue_status == 3:
+                    done += 1
+                else:
+                    processing_doc_ids.append(str(docnumber))
+
+            processing = total - done
+            result = {
+                'folder_id': str(folder_docnumber),
+                'total': total,
+                'processing': processing,
+                'done': done,
+                'is_complete': processing == 0 and total > 0,
+                'processing_doc_ids': processing_doc_ids
+            }
+            return result
+    except Exception as e:
+        logging.error(f"Error getting folder processing summary: {e}")
+        return result
+    finally:
+        await conn.close()
+
+
+async def get_folders_processing_summary_batch(folder_docnumbers: list) -> dict:
+    """
+    Returns a processing summary for multiple folders in a single DB round-trip.
+
+    Args:
+        folder_docnumbers: list of folder DOCNUMBERs (strings or ints)
+
+    Returns:
+        { folder_id: { total, processing, done, is_complete, processing_doc_ids }, ... }
+    """
+    result = {}
+    if not folder_docnumbers:
+        return result
+
+    # Normalize to strings
+    folder_ids_str = [str(f) for f in folder_docnumbers]
+    for fid in folder_ids_str:
+        result[fid] = {
+            'folder_id': fid,
+            'total': 0,
+            'processing': 0,
+            'done': 0,
+            'is_complete': False,
+            'processing_doc_ids': []
+        }
+
+    conn = await get_async_connection()
+    if not conn:
+        return result
+
+    try:
+        async with conn.cursor() as cursor:
+            int_folder_ids = [int(f) for f in folder_ids_str if str(f).isdigit()]
+            if not int_folder_ids:
+                return result
+
+            bind_names = [f':f{i}' for i in range(len(int_folder_ids))]
+            bind_vars = {f'f{i}': val for i, val in enumerate(int_folder_ids)}
+
+            # Get all direct file children of the requested folders with their
+            # TAGGING_QUEUE status. LEFT JOIN so docs without a queue row count
+            # as "processing" (not yet picked up by the worker).
+            sql = f"""
+                SELECT fi.PARENT AS FOLDER_ID, fi.DOCNUMBER, NVL(q.STATUS, 0) AS QUEUE_STATUS
+                FROM FOLDER_ITEM fi
+                LEFT JOIN TAGGING_QUEUE q ON fi.DOCNUMBER = q.DOCNUMBER
+                WHERE fi.PARENT IN ({','.join(bind_names)})
+                AND fi.NODE_TYPE = :node_type
+            """
+            bind_vars['node_type'] = NODE_TYPE_DOCUMENT
+            await cursor.execute(sql, bind_vars)
+            rows = await cursor.fetchall()
+
+            # Aggregate per folder
+            for row in rows:
+                folder_id_raw, docnumber, queue_status = row
+                fid = str(folder_id_raw)
+                if fid not in result:
+                    result[fid] = {
+                        'folder_id': fid,
+                        'total': 0,
+                        'processing': 0,
+                        'done': 0,
+                        'is_complete': False,
+                        'processing_doc_ids': []
+                    }
+                entry = result[fid]
+                entry['total'] += 1
+                if queue_status == 3:
+                    entry['done'] += 1
+                else:
+                    entry['processing'] += 1
+                    entry['processing_doc_ids'].append(str(docnumber))
+
+            # Set is_complete flags
+            for fid, entry in result.items():
+                entry['is_complete'] = entry['processing'] == 0 and entry['total'] > 0
+
+            return result
+    except Exception as e:
+        logging.error(f"Error in get_folders_processing_summary_batch: {e}")
+        return result
+    finally:
+        await conn.close()
+
+
 async def get_folder_preview_ids(folder_docnumber: str, limit: int = 4) -> list:
     """
     Gets up to `limit` document IDs from the folder that are images, videos, or PDFs

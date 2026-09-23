@@ -60,6 +60,7 @@ async def get_all_edms_users(search: str = "", page: int = 1, limit: int = 20):
                         us.SECURITY_LEVEL_ID,
                         us.LANG,
                         us.THEME,
+                        COALESCE(ud.REMAINING_QUOTA, 1073741824) as REMAINING_QUOTA,
                         COALESCE(ud.QUOTA, 1073741824) as QUOTA,
                         us.LARGE_DOWNLOADS,
                         ROW_NUMBER() OVER (ORDER BY p.USER_ID) as rn

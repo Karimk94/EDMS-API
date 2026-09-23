@@ -689,9 +689,16 @@ async def rerun_analysis(doc_id: int, user=Depends(get_current_user)):
 
 @router.get('/api/documents/review-status')
 async def get_document_review_statuses(doc_ids: str, user=Depends(get_current_user)):
-    """Fetches review statuses for a comma-separated list of document IDs."""
-    if not is_editor(user):
-        return {"statuses": {}}
+    """Fetches review statuses for a comma-separated list of document IDs.
+
+    Read access is granted to ALL authenticated users (including Viewers).
+    Viewers rely on these statuses client-side to filter the document grid so
+    only "Completed" (verified) documents are visible. The write endpoints
+    (set review status) remain editor-only. Gating this read on is_editor
+    previously caused viewers to receive an empty statuses map, which left the
+    Recent/Favorites/Folders tabs stuck on a loading skeleton and showed no
+    documents — even when every document was marked Completed.
+    """
     ids = [int(i.strip()) for i in doc_ids.split(',') if i.strip().isdigit()]
     if not ids:
         return {"statuses": {}}
