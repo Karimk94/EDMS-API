@@ -61,25 +61,35 @@ async def fetch_documents_from_oracle(page=1, page_size=20, search_term=None, da
     event_folder_names = {}  # Map of doc_id -> event name for display
     
     if scope == 'folders':
-        # Retrieve all relevant DOCNUMBERS from WSDL first (Async call - NO DB connection held)
+        # Retrieve all relevant DOCNUMBERS from WSDL first (Async call - NO DB connection held).
+        # NOTE: We deliberately do NOT paginate the ID list here. The full set of folder
+        # document IDs is passed into the WHERE clause (p.DOCNUMBER IN (...)) so that the
+        # hybrid vector + SQL text + event search below can match across the ENTIRE folder
+        # hierarchy — exactly like the Recents tab does. The final SQL query performs the
+        # COUNT + OFFSET/FETCH pagination, yielding correct total_pages and real search
+        # results. (Previously the IDs were sliced to a single page BEFORE the search clauses
+        # were applied, which made both the embedding and text search effectively useless
+        # because they could only ever inspect the ~40 IDs on the current page.)
         folder_doc_ids = await wsdl_client.get_recursive_doc_ids(dst, media_type)
         if not folder_doc_ids:
             return [], 0
 
-        # Paginate IDs *before* querying DB to handle large lists efficiently
-        total_rows = len(folder_doc_ids)
+        # Cap the IN-list at 10000 IDs for performance (mirrors the Recents/root path).
+        if len(folder_doc_ids) > 10000:
+            folder_doc_ids = folder_doc_ids[:10000]
 
-        # If requested page is out of range, return empty
-        if offset >= total_rows:
-            return [], total_rows
-
-        paginated_ids = folder_doc_ids[offset: offset + page_size]
-
-        # Use these IDs in the WHERE clause
-        placeholders = ','.join([f":fid_{i}" for i in range(len(paginated_ids))])
+        placeholders = ','.join([f":fid_{i}" for i in range(len(folder_doc_ids))])
         where_clauses.append(f"p.DOCNUMBER IN ({placeholders})")
-        for i, doc_id in enumerate(paginated_ids):
-            params[f'fid_{i}'] = doc_id
+        for i, doc_id in enumerate(folder_doc_ids):
+            # get_recursive_doc_ids returns a list of dicts
+            # (e.g. {'id': '12345', 'name': '...', ...}), NOT plain integers.
+            # We must extract the integer docnumber — exactly like the
+            # edms-media / Recents path does — otherwise Oracle receives dict
+            # objects as bind parameters and the IN-list matches nothing,
+            # making every content/embedding/tag/person search return empty.
+            if isinstance(doc_id, dict):
+                doc_id = doc_id.get('docnumber') or doc_id.get('DOCNUMBER') or doc_id.get('id')
+            params[f'fid_{i}'] = int(doc_id) if doc_id else 0
 
     else:
         # For edms-media, show documents from the SMART_EDMS_ROOT_ID folder hierarchy
@@ -445,12 +455,16 @@ async def fetch_documents_from_oracle(page=1, page_size=20, search_term=None, da
 
     try:
         async with conn.cursor() as cursor:
-            # If scope is folders, we already know the total rows from the recursive fetch
-            if scope != 'folders':
-                count_query = f"SELECT COUNT(p.DOCNUMBER) FROM PROFILE p {final_where_clause}"
-                await cursor.execute(count_query, params)
-                count_result = await cursor.fetchone()
-                total_rows = count_result[0]
+            # Compute total rows via COUNT(*) for ALL scopes (including folders).
+            # Previously the folders branch pre-paginated the WSDL ID list and set
+            # total_rows = len(folder_doc_ids), but now that we pass the full ID set
+            # into the WHERE clause the COUNT must be computed against the final
+            # filtered query (which includes the hybrid search clauses) so total_pages
+            # reflects actual search matches, not the raw folder ID count.
+            count_query = f"SELECT COUNT(p.DOCNUMBER) FROM PROFILE p {final_where_clause}"
+            await cursor.execute(count_query, params)
+            count_result = await cursor.fetchone()
+            total_rows = count_result[0]
 
             date_column = "p.RTADOCDATE"
             fetch_query = f"""
@@ -462,11 +476,12 @@ async def fetch_documents_from_oracle(page=1, page_size=20, search_term=None, da
             {order_by_clause}
             """
 
-            # Add offset/fetch logic only if NOT folder scope
-            if scope != 'folders':
-                fetch_query += " OFFSET :offset ROWS FETCH NEXT :page_size ROWS ONLY"
-                params['offset'] = offset
-                params['page_size'] = page_size
+            # Apply OFFSET/FETCH pagination for ALL scopes (including folders). The
+            # folders branch no longer pre-slices the ID list, so server-side
+            # pagination of the final filtered query is required.
+            fetch_query += " OFFSET :offset ROWS FETCH NEXT :page_size ROWS ONLY"
+            params['offset'] = offset
+            params['page_size'] = page_size
 
             params['db_user_id'] = db_user_id
 
