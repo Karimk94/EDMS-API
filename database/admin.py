@@ -777,14 +777,17 @@ async def fetch_checked_out_docs(days: int = 1, date_from: str = None, date_to: 
             result = []
             for row in rows:
                 doc = dict(zip(columns, row))
-                # Serialize Oracle Date/timestamp to ISO string in UTC+4
+                # Serialize Oracle Date/timestamp fields to ISO string.
+                # checkout_date: shift +4 hours (naive, no tz suffix).
+                # All other date/timestamp fields: serialize directly as-is.
                 for k, v in doc.items():
                     if hasattr(v, 'isoformat'):
-                        if hasattr(v, 'tzinfo') and v.tzinfo is None:
-                            # Naive value coming from DB -> assume it is already
-                            # in UTC+4 server time and attach the offset.
-                            v = v.replace(tzinfo=UTC_PLUS_4)
-                        doc[k] = v.isoformat()
+                        if k == 'checkout_date':
+                            # Strip any existing tzinfo, then add 4 hours.
+                            naive = v.replace(tzinfo=None)
+                            doc[k] = (naive + timedelta(hours=4)).isoformat()
+                        else:
+                            doc[k] = v.isoformat()
                 result.append(doc)
             return result
     finally:
