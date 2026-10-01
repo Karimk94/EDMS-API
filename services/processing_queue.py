@@ -410,7 +410,14 @@ class LocalProcessingQueue:
         return int(updated or 0)
 
 
-_queue_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "database", "processing_queue.sqlite3")
+# The processing queue is a SQLite database. In a multi-node (load-balanced)
+# deployment this path MUST point at a shared network location (NAS / SMB share)
+# so that a job enqueued on one node is visible to the worker on the other node.
+# Set PROCESSING_QUEUE_DB_PATH in the environment to override the default local path.
+_queue_path = os.getenv(
+    'PROCESSING_QUEUE_DB_PATH',
+    os.path.join(os.path.dirname(os.path.dirname(__file__)), "database", "processing_queue.sqlite3"),
+)
 processing_queue = LocalProcessingQueue(_queue_path)
 
 _worker_state_lock = Lock()
@@ -517,6 +524,20 @@ async def processing_worker_loop(stop_event: asyncio.Event):
     while not stop_event.is_set():
         try:
             mode = get_worker_mode()
+
+            # --- Multi-node guard: only the leader node claims/ processes jobs ---
+            # In a load-balanced deployment, follower nodes must NOT pull jobs
+            # from the shared queue, otherwise the same document would be
+            # processed by multiple nodes simultaneously.
+            try:
+                from utils.leader_election import leader_election
+                if not leader_election.is_leader():
+                    await asyncio.sleep(2)
+                    continue
+            except Exception:
+                # If leader election cannot be imported/evaluated, do NOT block
+                # processing (single-node deployments must keep working).
+                pass
 
             # Periodic safety sweep: requeue any job stuck in_progress longer than
             # the task timeout (guards against hard crashes while running).

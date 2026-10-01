@@ -155,6 +155,12 @@ class IdempotencyStore:
 import db_connector
 
 import os
-# Put the database file alongside the other database files
-db_path = os.path.join(os.path.dirname(os.path.dirname(db_connector.__file__)), 'database', 'idempotency.sqlite3')
+# Put the database file alongside the other database files.
+# In a multi-node (load-balanced) deployment this path MUST point at a shared
+# network location (NAS / SMB share) so that idempotency keys are visible across
+# all nodes. Set IDEMPOTENCY_DB_PATH in the environment to override the default.
+db_path = os.getenv(
+    'IDEMPOTENCY_DB_PATH',
+    os.path.join(os.path.dirname(os.path.dirname(db_connector.__file__)), 'database', 'idempotency.sqlite3'),
+)
 idempotency_store = IdempotencyStore(db_path)

@@ -5,6 +5,7 @@ import time
 import logging
 
 EMBEDDING_API_URL = os.getenv("EMBEDDING_API_URL")
+SMART_SEARCH_API_URL = os.getenv("SMART_SEARCH_API_URL")
 
 def get_embedding_from_service(text):
     """Calls the external embedding service."""
@@ -22,6 +23,35 @@ def get_embedding_from_service(text):
         return response.json().get('embedding')
     except requests.exceptions.RequestException as e:
         logging.error(f"Failed to get embedding from service: {e}", exc_info=True)
+        return None
+
+def get_search_tokens(text):
+    """Calls the external Smart Search service to extract search tokens from free text.
+
+    Returns a list of token strings, or None if the service is unavailable / errors out
+    (callers should fall back to the raw search term in that case).
+    """
+    if not SMART_SEARCH_API_URL:
+        logging.error("SMART_SEARCH_API_URL is not set.")
+        return None
+
+    try:
+        response = requests.post(
+            f"{SMART_SEARCH_API_URL.rstrip('/')}/tokenize",
+            json={"text": text},
+            timeout=30
+        )
+        response.raise_for_status()
+        data = response.json()
+        tokens = data.get('tokens')
+        if isinstance(tokens, list) and tokens:
+            return tokens
+        return None
+    except requests.exceptions.RequestException as e:
+        logging.error(f"Failed to get search tokens from service: {e}", exc_info=True)
+        return None
+    except (ValueError, KeyError) as e:
+        logging.error(f"Failed to parse search tokens response: {e}", exc_info=True)
         return None
 
 def data_chunk_generator(data, chunk_size=262144):

@@ -33,6 +33,26 @@ except ImportError:
     logging.warning("vector_client.py not found. Vector search capabilities will be disabled.")
     vector_client = None
 
+def build_in_clause(column_name, id_list, prefix, params):
+    """Safely builds an IN clause chunked into groups of <= 1000 to respect Oracle ORA-01795 limit."""
+    if not id_list:
+        return "1=0"
+    chunk_size = 999
+    chunks = [id_list[i:i + chunk_size] for i in range(0, len(id_list), chunk_size)]
+    clause_parts = []
+    for c_idx, chunk in enumerate(chunks):
+        ph_list = []
+        for j, item in enumerate(chunk):
+            param_key = f"{prefix}_{c_idx}_{j}"
+            ph_list.append(f":{param_key}")
+            if isinstance(item, dict):
+                item = item.get('docnumber') or item.get('DOCNUMBER') or item.get('id')
+            params[param_key] = int(item) if item else 0
+        clause_parts.append(f"{column_name} IN ({','.join(ph_list)})")
+    if len(clause_parts) == 1:
+        return clause_parts[0]
+    return f"({' OR '.join(clause_parts)})"
+
 async def fetch_documents_from_oracle(page=1, page_size=20, search_term=None, date_from=None, date_to=None,
                                       persons=None, person_condition='any', tags=None, years=None, sort=None,
                                       memory_month=None, memory_day=None, user_id=None, lang='en',
@@ -62,14 +82,8 @@ async def fetch_documents_from_oracle(page=1, page_size=20, search_term=None, da
     
     if scope == 'folders':
         # Retrieve all relevant DOCNUMBERS from WSDL first (Async call - NO DB connection held).
-        # NOTE: We deliberately do NOT paginate the ID list here. The full set of folder
-        # document IDs is passed into the WHERE clause (p.DOCNUMBER IN (...)) so that the
-        # hybrid vector + SQL text + event search below can match across the ENTIRE folder
-        # hierarchy — exactly like the Recents tab does. The final SQL query performs the
-        # COUNT + OFFSET/FETCH pagination, yielding correct total_pages and real search
-        # results. (Previously the IDs were sliced to a single page BEFORE the search clauses
-        # were applied, which made both the embedding and text search effectively useless
-        # because they could only ever inspect the ~40 IDs on the current page.)
+        # The full set of folder document IDs is passed into the WHERE clause (p.DOCNUMBER IN (...))
+        # so hybrid search matches across the ENTIRE folder hierarchy with proper server-side pagination.
         folder_doc_ids = await wsdl_client.get_recursive_doc_ids(dst, media_type)
         if not folder_doc_ids:
             return [], 0
@@ -78,18 +92,8 @@ async def fetch_documents_from_oracle(page=1, page_size=20, search_term=None, da
         if len(folder_doc_ids) > 10000:
             folder_doc_ids = folder_doc_ids[:10000]
 
-        placeholders = ','.join([f":fid_{i}" for i in range(len(folder_doc_ids))])
-        where_clauses.append(f"p.DOCNUMBER IN ({placeholders})")
-        for i, doc_id in enumerate(folder_doc_ids):
-            # get_recursive_doc_ids returns a list of dicts
-            # (e.g. {'id': '12345', 'name': '...', ...}), NOT plain integers.
-            # We must extract the integer docnumber — exactly like the
-            # edms-media / Recents path does — otherwise Oracle receives dict
-            # objects as bind parameters and the IN-list matches nothing,
-            # making every content/embedding/tag/person search return empty.
-            if isinstance(doc_id, dict):
-                doc_id = doc_id.get('docnumber') or doc_id.get('DOCNUMBER') or doc_id.get('id')
-            params[f'fid_{i}'] = int(doc_id) if doc_id else 0
+        in_clause = build_in_clause("p.DOCNUMBER", folder_doc_ids, "fid", params)
+        where_clauses.append(in_clause)
 
     else:
         # For edms-media, show documents from the SMART_EDMS_ROOT_ID folder hierarchy
@@ -103,18 +107,8 @@ async def fetch_documents_from_oracle(page=1, page_size=20, search_term=None, da
             if root_doc_ids and len(root_doc_ids) > 0:
                 # Limit to 10000 IDs for performance
                 limited_ids = root_doc_ids[:10000] if len(root_doc_ids) > 10000 else root_doc_ids
-                root_id_placeholders = ','.join([f":root_id_{i}" for i in range(len(limited_ids))])
-                
-                # Add the doc IDs as parameters - ensure each doc_id is an integer
-                for i, doc_id in enumerate(limited_ids):
-                    # Handle case where doc_id might be a dict or other type
-                    if isinstance(doc_id, dict):
-                        doc_id = doc_id.get('docnumber') or doc_id.get('DOCNUMBER') or doc_id.get('id')
-                    params[f'root_id_{i}'] = int(doc_id) if doc_id else 0
-                
-                # Filter to only include documents from the root folder hierarchy
-                where_clauses.append(f"p.DOCNUMBER IN ({root_id_placeholders})")
-                # logging.info(f"[edms-media recents] Added {len(limited_ids)} doc IDs to query")
+                in_clause = build_in_clause("p.DOCNUMBER", limited_ids, "root_id", params)
+                where_clauses.append(in_clause)
             else:
                 # Fallback: just filter by RTA_TEXT1 if WSDL fetch fails or returns empty
                 logging.warning(f"[edms-media recents] WSDL returned no IDs, falling back to RTA_TEXT1 filter only")
@@ -215,10 +209,38 @@ async def fetch_documents_from_oracle(page=1, page_size=20, search_term=None, da
             not memory_month
     )
 
+    # --- Smart Search: extract logical tokens from the free-text query ---
+    # Calls the Smart Search Service (LLM) to turn a sentence into key nouns /
+    # entities / concepts. These tokens enrich BOTH the SQL LIKE keyword search
+    # (each token becomes a match condition) and the vector query (so the
+    # embedding captures the extracted concepts as well as the raw sentence).
+    # If the service is unavailable, we gracefully fall back to the original
+    # whitespace-split search term — search is never broken.
+    smart_tokens = None
+    if search_term and not memory_month:
+        try:
+            import api_client
+            smart_tokens = api_client.get_search_tokens(search_term)
+        except Exception as e:
+            logging.warning(f"Smart search tokenization failed, falling back to raw term: {e}")
+            smart_tokens = None
+
     # --- Prepare Keyword Search Conditions (Always generate these for Hybrid search) ---
     text_search_conditions = []
     if search_term and not memory_month:
+        # Start with the raw whitespace-split words from the original query
         search_words = [word.strip() for word in search_term.split(' ') if word.strip()]
+
+        # Merge in the smart tokens (de-duplicated, case-insensitive) so the SQL
+        # LIKE search also matches the LLM-extracted concepts/entities.
+        if smart_tokens:
+            existing_lower = {w.lower() for w in search_words}
+            for token in smart_tokens:
+                token_str = str(token).strip()
+                if token_str and token_str.lower() not in existing_lower:
+                    existing_lower.add(token_str.lower())
+                    search_words.append(token_str)
+
         if search_words:
             for i, word in enumerate(search_words):
                 key = f"search_word_{i}"
@@ -254,7 +276,14 @@ async def fetch_documents_from_oracle(page=1, page_size=20, search_term=None, da
     # --- Perform Vector Search (Blocking Call) ---
     if use_vector_search:
         try:
-            vector_doc_ids = vector_client.query_documents(search_term, n_results=page * page_size)
+            has_other_filters = bool(tags or persons or years or date_from or date_to or media_type)
+            vector_n_results = max(300, page * page_size * 5) if has_other_filters else (page * page_size)
+            # Expand the vector query with the smart tokens so the embedding
+            # captures both the original sentence and the LLM-extracted concepts.
+            vector_query_text = search_term
+            if smart_tokens:
+                vector_query_text = f"{search_term} {' '.join(smart_tokens)}"
+            vector_doc_ids = vector_client.query_documents(vector_query_text, n_results=vector_n_results)
         except Exception as e:
             logging.error(f"Vector search failed: {e}")
             vector_doc_ids = None
@@ -292,11 +321,7 @@ async def fetch_documents_from_oracle(page=1, page_size=20, search_term=None, da
         event_clause = None
 
         if vector_doc_ids:
-            # logging.info(f"Using {len(vector_doc_ids)} doc_ids from vector search.")
-            vector_placeholders = ','.join([f":vec_id_{i}" for i in range(len(vector_doc_ids))])
-            vector_clause = f"p.docnumber IN ({vector_placeholders})"
-            for i, doc_id in enumerate(vector_doc_ids):
-                params[f'vec_id_{i}'] = doc_id
+            vector_clause = build_in_clause("p.docnumber", vector_doc_ids, "vec_id", params)
 
         if text_search_conditions:
             text_clause = f"({' AND '.join(text_search_conditions)})"
@@ -322,35 +347,37 @@ async def fetch_documents_from_oracle(page=1, page_size=20, search_term=None, da
                 op = " OR " if person_condition == 'any' else " AND "
                 person_conditions = []
                 for i, person in enumerate(person_list):
-                    key = f'person_{i}'
-                    key_upper = f'person_{i}_upper'
+                    names_to_match = {person}
+                    try:
+                        async with conn.cursor() as _cur:
+                            await _cur.execute(
+                                "SELECT NAME_ENGLISH, NAME_ARABIC FROM LKP_PERSON "
+                                "WHERE TRIM(NAME_ARABIC) = TRIM(:1) OR UPPER(TRIM(NAME_ENGLISH)) = UPPER(TRIM(:2))",
+                                [person, person]
+                            )
+                            row = await _cur.fetchone()
+                            if row:
+                                if row[0] and row[0].strip():
+                                    names_to_match.add(row[0].strip())
+                                if row[1] and row[1].strip():
+                                    names_to_match.add(row[1].strip())
+                    except Exception as e:
+                        logging.warning(f"Error resolving person in LKP_PERSON for '{person}': {e}")
 
-                    # The ABSTRACT always stores English names (enforced by update_abstract_with_vips).
-                    # When the UI is in Arabic mode the caller sends the Arabic display name.
-                    # We must resolve it to the English form before matching against ABSTRACT.
-                    # Strategy:  Arabic input → look up NAME_ENGLISH in LKP_PERSON.
-                    #            English input → use as-is.
-                    english_person = person  # default: assume English
-                    if not person.isascii():
-                        # Arabic name — look up the English equivalent inside this same connection
-                        try:
-                            async with conn.cursor() as _cur:
-                                await _cur.execute(
-                                    "SELECT NAME_ENGLISH FROM LKP_PERSON "
-                                    "WHERE NAME_ARABIC = :1 AND NAME_ENGLISH IS NOT NULL",
-                                    [person]
-                                )
-                                row = await _cur.fetchone()
-                                if row:
-                                    english_person = row[0]
-                        except Exception:
-                            pass  # fall back to original value
+                    # For each name variant (English and/or Arabic), match against ABSTRACT
+                    name_subclauses = []
+                    for n_idx, name_str in enumerate(names_to_match):
+                        k_name = f"person_{i}_{n_idx}"
+                        k_name_upper = f"person_{i}_{n_idx}_upper"
+                        params[k_name] = f"%{name_str}%"
+                        params[k_name_upper] = f"%{name_str.upper()}%"
+                        name_subclauses.append(f"(p.ABSTRACT LIKE :{k_name} OR UPPER(p.ABSTRACT) LIKE :{k_name_upper})")
 
-                    person_conditions.append(f"(p.ABSTRACT LIKE :{key} OR UPPER(p.ABSTRACT) LIKE :{key_upper})")
-                    params[key] = f"%{english_person}%"
-                    params[key_upper] = f"%{english_person.upper()}%"
-                where_clauses.append(f"({op.join(person_conditions)})")
+                    if name_subclauses:
+                        person_conditions.append(f"({' OR '.join(name_subclauses)})")
 
+                if person_conditions:
+                    where_clauses.append(f"({op.join(person_conditions)})")
 
         if date_from:
             try:
@@ -393,37 +420,39 @@ async def fetch_documents_from_oracle(page=1, page_size=20, search_term=None, da
             tag_list = [t.strip() for t in tags.split(',') if t.strip()]
             if tag_list:
                 tag_conditions = []
-                keyword_column = "DESCRIPTION" if lang == 'ar' else "KEYWORD_ID"
-                person_filter_column = "NAME_ARABIC" if lang == 'ar' else "NAME_ENGLISH"
 
                 for i, tag in enumerate(tag_list):
                     key = f'tag_{i}'
                     key_upper = f'tag_{i}_upper'
+                    params[key] = tag
+                    params[key_upper] = tag.upper()
 
-                    if lang == 'ar':
-                        params[key] = tag
-                        keyword_compare = f"TRIM(k.{keyword_column}) = :{key}"
-                        person_compare = f"TRIM(p_filter.{person_filter_column}) = :{key}"
-                    else:
-                        params[key_upper] = tag.upper()
-                        keyword_compare = f"UPPER(TRIM(k.{keyword_column})) = :{key_upper}"
-                        person_compare = f"UPPER(TRIM(p_filter.{person_filter_column})) = :{key_upper}"
-
+                    # Match keyword tags across both DESCRIPTION (Arabic) and KEYWORD_ID (English)
                     keyword_subquery = f"""
                     EXISTS (
                         SELECT 1 FROM LKP_DOCUMENT_TAGS ldt
                         JOIN KEYWORD k ON ldt.TAG_ID = k.SYSTEM_ID
                         WHERE ldt.DOCNUMBER = p.DOCNUMBER 
-                        AND {keyword_compare} 
+                        AND (
+                            TRIM(k.DESCRIPTION) = :{key}
+                            OR UPPER(TRIM(k.DESCRIPTION)) = :{key_upper}
+                            OR UPPER(TRIM(k.KEYWORD_ID)) = :{key_upper}
+                            OR TRIM(k.KEYWORD_ID) = :{key}
+                        )
                         AND ldt.DISABLED = '0'
-                        {shortlist_clause}
+                        {shortlist_sql}
                     )
                     """
 
+                    # Match person tags across both NAME_ARABIC and NAME_ENGLISH
                     person_subquery = f"""
                     EXISTS (
                         SELECT 1 FROM LKP_PERSON p_filter
-                        WHERE {person_compare}
+                        WHERE (
+                            TRIM(p_filter.NAME_ARABIC) = :{key}
+                            OR UPPER(TRIM(p_filter.NAME_ENGLISH)) = :{key_upper}
+                            OR TRIM(p_filter.NAME_ENGLISH) = :{key}
+                        )
                         AND (
                              UPPER(p.ABSTRACT) LIKE '%' || UPPER(p_filter.NAME_ENGLISH) || '%'
                              OR (p_filter.NAME_ARABIC IS NOT NULL AND p.ABSTRACT LIKE '%' || p_filter.NAME_ARABIC || '%')
@@ -431,7 +460,12 @@ async def fetch_documents_from_oracle(page=1, page_size=20, search_term=None, da
                     )
                     """
 
-                    tag_conditions.append(f"({keyword_subquery} OR {person_subquery})")
+                    # Also allow direct match in ABSTRACT in case tag is a phrase or person mentioned in abstract
+                    abstract_direct_match = f"""
+                    (UPPER(p.ABSTRACT) LIKE '%' || :{key_upper} || '%' OR p.ABSTRACT LIKE '%' || :{key} || '%')
+                    """
+
+                    tag_conditions.append(f"({keyword_subquery} OR {person_subquery} OR {abstract_direct_match})")
 
                 where_clauses.append(" AND ".join(tag_conditions))
 
@@ -441,8 +475,12 @@ async def fetch_documents_from_oracle(page=1, page_size=20, search_term=None, da
 
     # --- Ordering Logic for Hybrid Search ---
     if vector_doc_ids and len(vector_doc_ids) > 0:
-        order_case_sql = " ".join([f"WHEN :vec_id_{i} THEN {i + 1}" for i in range(len(vector_doc_ids))])
-        order_by_clause = f"ORDER BY CASE p.docnumber {order_case_sql} ELSE {len(vector_doc_ids) + 1} END ASC, p.RTADOCDATE DESC"
+        top_vec_ids = vector_doc_ids[:100]
+        order_case_sql = " ".join([f"WHEN {int(doc_id)} THEN {idx + 1}" for idx, doc_id in enumerate(top_vec_ids) if str(doc_id).isdigit()])
+        if order_case_sql:
+            order_by_clause = f"ORDER BY CASE p.docnumber {order_case_sql} ELSE {len(top_vec_ids) + 1} END ASC, p.RTADOCDATE DESC"
+        else:
+            order_by_clause = "ORDER BY p.RTADOCDATE DESC, p.DOCNUMBER DESC"
     elif memory_month is not None:
         order_by_clause = "ORDER BY p.RTADOCDATE DESC, p.DOCNUMBER DESC"
         if sort == 'rtadocdate_asc':
@@ -1053,9 +1091,16 @@ async def set_review_status(docnumber: int, status_str: str) -> bool:
 
 
 async def set_folder_review_status(folder_docnumber: str, status_str: str) -> int:
-    """Sets the REVIEW_STATUS for all direct child files of a folder."""
-    from database.folders import get_folder_files, NODE_TYPE_DOCUMENT
-    
+    """Sets the REVIEW_STATUS for all direct child files of a folder.
+
+    Uses a two-step UPSERT so that documents without an existing TAGGING_QUEUE
+    row (e.g. photos uploaded but never queued for AI analysis) are also marked.
+    Previously a bare UPDATE was used, which silently skipped those documents
+    and left them as 'pending', making them invisible to Viewer-role users even
+    after an editor marked the folder as completed.
+    """
+    from database.folders import NODE_TYPE_DOCUMENT
+
     conn = await get_async_connection()
     if not conn:
         return 0
@@ -1064,24 +1109,45 @@ async def set_folder_review_status(folder_docnumber: str, status_str: str) -> in
 
     try:
         async with conn.cursor() as cursor:
-            # Update all tagging queue records that have a corresponding file in this folder
-            # For records that don't exist in TAGGING_QUEUE yet, they will just miss out on the update.
-            # In a full implementation we might MERGE them, but UPDATE is safer.
-            sql = """
-            UPDATE TAGGING_QUEUE 
-            SET REVIEW_STATUS = :status 
+            # Step 1: Update TAGGING_QUEUE rows that already exist for direct
+            # children of this folder.
+            update_sql = """
+            UPDATE TAGGING_QUEUE
+            SET REVIEW_STATUS = :status
             WHERE DOCNUMBER IN (
-                SELECT DOCNUMBER FROM FOLDER_ITEM 
+                SELECT DOCNUMBER FROM FOLDER_ITEM
                 WHERE PARENT = :parent_docnumber AND NODE_TYPE = :node_type
             )
             """
             await cursor.execute(
-                sql, 
+                update_sql,
                 {'status': status_val, 'parent_docnumber': folder_docnumber, 'node_type': NODE_TYPE_DOCUMENT}
             )
-            rowcount = cursor.rowcount
+            updated_count = cursor.rowcount
+
+            # Step 2: Insert rows for folder children that have no TAGGING_QUEUE
+            # entry yet (e.g. photos uploaded but never processed by the AI
+            # pipeline). Without this step those documents stay 'pending' and
+            # remain invisible to Viewer-role users even after an editor marks
+            # the folder as completed.
+            insert_sql = """
+            INSERT INTO TAGGING_QUEUE (DOCNUMBER, STATUS, REVIEW_STATUS)
+            SELECT fi.DOCNUMBER, 0, :status
+            FROM FOLDER_ITEM fi
+            WHERE fi.PARENT = :parent_docnumber
+              AND fi.NODE_TYPE = :node_type
+              AND NOT EXISTS (
+                  SELECT 1 FROM TAGGING_QUEUE tq WHERE tq.DOCNUMBER = fi.DOCNUMBER
+              )
+            """
+            await cursor.execute(
+                insert_sql,
+                {'status': status_val, 'parent_docnumber': folder_docnumber, 'node_type': NODE_TYPE_DOCUMENT}
+            )
+            inserted_count = cursor.rowcount
+
             await conn.commit()
-            return rowcount
+            return updated_count + inserted_count
     except Exception as e:
         logging.error(f"Error in set_folder_review_status: {e}")
         return 0

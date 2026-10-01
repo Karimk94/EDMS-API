@@ -113,17 +113,17 @@ async def fetch_all_tags(lang='en', security_level='Editor', app_source='unknown
     tags = set()
     try:
         async with conn.cursor() as cursor:
-            keyword_column = "k.DESCRIPTION" if lang == 'ar' else "k.KEYWORD_ID"
+            keyword_display = "NVL(k.DESCRIPTION, k.KEYWORD_ID)" if lang == 'ar' else "NVL(k.KEYWORD_ID, k.DESCRIPTION)"
             person_column = "p.NAME_ARABIC" if lang == 'ar' else "p.NAME_ENGLISH"
 
             shortlist_clause = "AND k.SHORTLISTED = '1'" if security_level == 'Viewer' else ""
 
             keyword_query = f"""
-                SELECT DISTINCT {keyword_column} 
+                SELECT DISTINCT {keyword_display} 
                 FROM KEYWORD k 
                 JOIN LKP_DOCUMENT_TAGS ldt ON ldt.TAG_ID = k.SYSTEM_ID 
                 JOIN PROFILE p ON ldt.DOCNUMBER = p.DOCNUMBER
-                WHERE {keyword_column} IS NOT NULL 
+                WHERE {keyword_display} IS NOT NULL 
                 {shortlist_clause}
                 AND p.FORM = 2740
                 AND {doc_filter_sql}
@@ -133,20 +133,20 @@ async def fetch_all_tags(lang='en', security_level='Editor', app_source='unknown
                 if row[0]:
                     tags.add(row[0].strip())
 
-            # NVL fallback: if Arabic translation is missing, show English name
-            # so persons are never silently excluded in Arabic mode.
-            person_display = f"NVL({person_column}, p.NAME_ENGLISH)" if lang == 'ar' else person_column
+            # NVL fallback: if preferred language translation is missing, show other language
+            # so persons are never silently excluded in either mode.
+            person_display = f"NVL({person_column}, p.NAME_ENGLISH)" if lang == 'ar' else f"NVL({person_column}, p.NAME_ARABIC)"
 
             person_query = f"""
                 SELECT DISTINCT {person_display}
                 FROM LKP_PERSON p
-                WHERE p.NAME_ENGLISH IS NOT NULL
+                WHERE (p.NAME_ENGLISH IS NOT NULL OR p.NAME_ARABIC IS NOT NULL)
                 AND EXISTS (
                     SELECT 1 FROM PROFILE pr
                     WHERE pr.FORM = 2740
                     AND {doc_filter_sql.replace('p.', 'pr.')}
                     AND (
-                        UPPER(pr.ABSTRACT) LIKE '%' || UPPER(p.NAME_ENGLISH) || '%'
+                        (p.NAME_ENGLISH IS NOT NULL AND UPPER(pr.ABSTRACT) LIKE '%' || UPPER(p.NAME_ENGLISH) || '%')
                         OR
                         (p.NAME_ARABIC IS NOT NULL AND pr.ABSTRACT LIKE '%' || p.NAME_ARABIC || '%')
                     )
@@ -178,16 +178,16 @@ async def fetch_tags_for_document(doc_id, lang='en', security_level='Editor'):
             result = await cursor.fetchone()
             abstract = result[0] if result else None
 
-            keyword_column = "k.DESCRIPTION" if lang == 'ar' else "k.KEYWORD_ID"
+            keyword_display = "NVL(k.DESCRIPTION, k.KEYWORD_ID)" if lang == 'ar' else "NVL(k.KEYWORD_ID, k.DESCRIPTION)"
             person_column = "p.NAME_ARABIC" if lang == 'ar' else "p.NAME_ENGLISH"
 
             shortlist_clause = "AND k.SHORTLISTED = '1'" if security_level == 'Viewer' else ""
 
             tag_query = f"""
-                SELECT {keyword_column}, k.SHORTLISTED
+                SELECT {keyword_display}, k.SHORTLISTED
                 FROM LKP_DOCUMENT_TAGS ldt
                 JOIN KEYWORD k ON ldt.TAG_ID = k.SYSTEM_ID
-                WHERE ldt.DOCNUMBER = :doc_id AND {keyword_column} IS NOT NULL {shortlist_clause}
+                WHERE ldt.DOCNUMBER = :doc_id AND {keyword_display} IS NOT NULL {shortlist_clause}
             """
             await cursor.execute(tag_query, {'doc_id': doc_id})
             async for row in cursor:
@@ -203,17 +203,17 @@ async def fetch_tags_for_document(doc_id, lang='en', security_level='Editor'):
                     })
 
             if abstract:
-                # NVL(NAME_ARABIC, NAME_ENGLISH): if Arabic translation is missing
-                # fall back to the English name so the person tag is never silently
-                # dropped when NAME_ARABIC is NULL.
-                person_display = f"NVL({person_column}, p.NAME_ENGLISH)" if lang == 'ar' else person_column
+                person_display = f"NVL({person_column}, p.NAME_ENGLISH)" if lang == 'ar' else f"NVL({person_column}, p.NAME_ARABIC)"
                 person_query = f"""
                     SELECT {person_display}
                     FROM LKP_PERSON p
-                    WHERE :abstract LIKE '%' || UPPER(NAME_ENGLISH) || '%'
-                      AND NAME_ENGLISH IS NOT NULL
+                    WHERE (
+                        (NAME_ENGLISH IS NOT NULL AND :abstract LIKE '%' || UPPER(NAME_ENGLISH) || '%')
+                        OR
+                        (NAME_ARABIC IS NOT NULL AND :abstract_orig LIKE '%' || NAME_ARABIC || '%')
+                    )
                 """
-                await cursor.execute(person_query, {'abstract': abstract.upper()})
+                await cursor.execute(person_query, {'abstract': abstract.upper(), 'abstract_orig': abstract})
                 async for row in cursor:
                     person_name = row[0].strip() if row[0] else ""
                     if person_name and person_name not in seen_tags:
@@ -245,7 +245,7 @@ async def fetch_tags_for_documents_batch(doc_ids, lang='en', security_level='Edi
 
     try:
         async with conn.cursor() as cursor:
-            keyword_column = "k.DESCRIPTION" if lang == 'ar' else "k.KEYWORD_ID"
+            keyword_display = "NVL(k.DESCRIPTION, k.KEYWORD_ID)" if lang == 'ar' else "NVL(k.KEYWORD_ID, k.DESCRIPTION)"
             shortlist_clause = "AND k.SHORTLISTED = '1'" if security_level == 'Viewer' else ""
 
             # Build bind variables for the IN clause
@@ -254,10 +254,10 @@ async def fetch_tags_for_documents_batch(doc_ids, lang='en', security_level='Edi
             bind_params = {f"id{i}": doc_id for i, doc_id in enumerate(doc_ids)}
 
             tag_query = f"""
-                SELECT ldt.DOCNUMBER, {keyword_column}, k.SHORTLISTED
+                SELECT ldt.DOCNUMBER, {keyword_display}, k.SHORTLISTED
                 FROM LKP_DOCUMENT_TAGS ldt
                 JOIN KEYWORD k ON ldt.TAG_ID = k.SYSTEM_ID
-                WHERE ldt.DOCNUMBER IN ({bind_clause}) AND {keyword_column} IS NOT NULL {shortlist_clause}
+                WHERE ldt.DOCNUMBER IN ({bind_clause}) AND {keyword_display} IS NOT NULL {shortlist_clause}
             """
             await cursor.execute(tag_query, bind_params)
             async for row in cursor:

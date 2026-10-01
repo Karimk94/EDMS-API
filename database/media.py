@@ -86,15 +86,21 @@ def _get_cached_app_buckets(cursor):
     return image_app_ids, video_app_ids, pdf_app_ids
 
 # --- Cache Directory Setup ---
+# Each cache directory is configurable via an environment variable so that, in a
+# multi-node (load-balanced) deployment, all nodes can point at the SAME shared
+# network mount (NAS / SMB share). This guarantees a thumbnail/video generated on
+# node A is immediately visible to node B.
+#
+# Defaults remain local to the project root for single-node development.
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-thumbnail_cache_dir = os.path.join(BASE_DIR, 'thumbnail_cache')
-video_cache_dir = os.path.join(BASE_DIR, 'video_cache')
-temp_thumbnail_cache_dir = os.path.join(BASE_DIR, 'temp_thumbnail_cache')
-download_cache_dir = os.path.join(BASE_DIR, 'download_cache')
-if not os.path.exists(thumbnail_cache_dir): os.makedirs(thumbnail_cache_dir)
-if not os.path.exists(video_cache_dir): os.makedirs(video_cache_dir)
-if not os.path.exists(temp_thumbnail_cache_dir): os.makedirs(temp_thumbnail_cache_dir)
-if not os.path.exists(download_cache_dir): os.makedirs(download_cache_dir)
+thumbnail_cache_dir = os.getenv('THUMBNAIL_CACHE_DIR', os.path.join(BASE_DIR, 'thumbnail_cache'))
+video_cache_dir = os.getenv('VIDEO_CACHE_DIR', os.path.join(BASE_DIR, 'video_cache'))
+temp_thumbnail_cache_dir = os.getenv('TEMP_THUMBNAIL_CACHE_DIR', os.path.join(BASE_DIR, 'temp_thumbnail_cache'))
+download_cache_dir = os.getenv('DOWNLOAD_CACHE_DIR', os.path.join(BASE_DIR, 'download_cache'))
+if not os.path.exists(thumbnail_cache_dir): os.makedirs(thumbnail_cache_dir, exist_ok=True)
+if not os.path.exists(video_cache_dir): os.makedirs(video_cache_dir, exist_ok=True)
+if not os.path.exists(temp_thumbnail_cache_dir): os.makedirs(temp_thumbnail_cache_dir, exist_ok=True)
+if not os.path.exists(download_cache_dir): os.makedirs(download_cache_dir, exist_ok=True)
 
 def dms_system_login():
     """Logs into the DMS SOAP service using system credentials."""

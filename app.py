@@ -25,33 +25,39 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # --- Log Filtering ---
-# Enable uvicorn access logs to see all requests (including 500 errors)
-logging.getLogger("uvicorn.access").setLevel(logging.INFO)
+# Suppress noisy uvicorn access logs (per-request "GET ... 200 OK" lines) in
+# deployment. Setting the level to WARNING keeps 4xx/5xx access lines visible
+# (useful for debugging errors) while silencing the high-volume 2xx/3xx GET logs.
+# To re-enable full access logging, set this back to logging.INFO.
+logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
 
 # --- Background Cache Eviction ---
 from utils.cache_eviction import cleanup_video_cache
 from utils.log_cleanup import cleanup_old_logs
+from utils.leader_election import leader_election
 
 async def periodic_cache_cleanup():
-    """Runs video cache cleanup every 6 hours."""
+    """Runs video cache cleanup every 6 hours — ONLY on the leader node."""
     video_cache_path = os.path.join(os.getcwd(), 'video_cache')
     while True:
         try:
-            result = cleanup_video_cache(video_cache_path)
-            if result.get('deleted_count', 0) > 0:
-                logging.info(f"Cache cleanup: {result}")
+            if leader_election.is_leader():
+                result = cleanup_video_cache(video_cache_path)
+                if result.get('deleted_count', 0) > 0:
+                    logging.info(f"Cache cleanup: {result}")
         except Exception as e:
             logging.error(f"Cache cleanup error: {e}")
         await asyncio.sleep(6 * 3600)  # Every 6 hours
 
 async def periodic_log_cleanup():
-    """Runs log cleanup daily to delete IIS/app logs older than 14 days."""
+    """Runs log cleanup daily — ONLY on the leader node."""
     logs_path = os.path.join(os.getcwd(), 'logs')
     while True:
         try:
-            result = cleanup_old_logs(logs_path, max_age_days=14)
-            if result.get('deleted_count', 0) > 0:
-                logging.info(f"Log cleanup: {result}")
+            if leader_election.is_leader():
+                result = cleanup_old_logs(logs_path, max_age_days=14)
+                if result.get('deleted_count', 0) > 0:
+                    logging.info(f"Log cleanup: {result}")
         except Exception as e:
             logging.error(f"Log cleanup error: {e}")
         await asyncio.sleep(24 * 3600)  # Every 24 hours
@@ -59,6 +65,11 @@ async def periodic_log_cleanup():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Modern lifespan handler replacing deprecated @app.on_event."""
+    # --- Leader election for multi-node deployments ---
+    # Starts the background lease-renewal thread. In 'auto' mode only ONE node
+    # will be the leader at any time; only the leader runs background work.
+    leader_election.start()
+
     # --- Best-effort DB index creation (non-blocking, with timeout) ---
     try:
         index_result = await asyncio.wait_for(
@@ -75,7 +86,9 @@ async def lifespan(app: FastAPI):
     cache_cleanup_task = asyncio.create_task(periodic_cache_cleanup())
     log_cleanup_task = asyncio.create_task(periodic_log_cleanup())
     
-    # Import and run the background processing worker
+    # Import and run the background processing worker — ONLY on the leader node.
+    # Follower nodes serve API requests but do not pull jobs from the queue,
+    # preventing duplicate processing across the load-balanced nodes.
     from services.processing_queue import processing_worker_loop
     worker_stop_event = asyncio.Event()
     worker_task = asyncio.create_task(processing_worker_loop(worker_stop_event))
@@ -89,6 +102,8 @@ async def lifespan(app: FastAPI):
         log_cleanup_task.cancel()
         # Give worker a moment to shut down gracefully, then gather all
         await asyncio.gather(worker_task, cache_cleanup_task, log_cleanup_task, return_exceptions=True)
+        # Release the leader lease so the other node can take over immediately.
+        leader_election.stop()
 
 app = FastAPI(title="EDMS Middleware API", lifespan=lifespan)
 

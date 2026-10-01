@@ -268,6 +268,37 @@ The `.env` file configures all external connections, secrets, and tuning paramet
 | `CHROMA_DB_PATH` | Path to the ChromaDB persistent storage directory | `./chroma_db` |
 | `CHROMA_COLLECTION_NAME` | Name of the ChromaDB collection | `edms_documents` |
 
+### Multi-Node / Load-Balanced Deployment
+When running the API behind a load balancer with 2+ nodes, all stateful file-based
+resources **must** point at a single shared network mount (NAS / SMB share) so that
+both nodes read and write the same data. The following environment variables control
+those paths — set them identically on **every** node:
+
+| Variable | Description | Default (single-node) |
+|---|---|---|
+| `CHROMA_DB_PATH` | ChromaDB vector store directory (shared) | `./chroma_db` |
+| `PROCESSING_QUEUE_DB_PATH` | SQLite processing-queue file (shared) | `database/processing_queue.sqlite3` |
+| `IDEMPOTENCY_DB_PATH` | SQLite idempotency-key file (shared) | `database/idempotency.sqlite3` |
+| `THUMBNAIL_CACHE_DIR` | Thumbnail image cache directory (shared) | `./thumbnail_cache` |
+| `VIDEO_CACHE_DIR` | Video cache directory (shared) | `./video_cache` |
+| `TEMP_THUMBNAIL_CACHE_DIR` | Ephemeral thumbnail cache (shared) | `./temp_thumbnail_cache` |
+| `DOWNLOAD_CACHE_DIR` | Download cache directory (shared) | `./download_cache` |
+
+To prevent duplicate background work (document processing, cache cleanup, log
+cleanup) across nodes, a lightweight leader-election mechanism ensures only **one**
+node at a time runs these tasks:
+
+| Variable | Description | Default |
+|---|---|---|
+| `WORKER_ROLE` | `leader` (always run background work), `follower` (never run it), or `auto` (negotiate via shared lease file) | `auto` |
+| `WORKER_LEASE_DIR` | Directory for the lease file (must be on the shared mount) | value of `CHROMA_DB_PATH` |
+| `WORKER_LEASE_FILE` | Full path to the lease JSON file | `<WORKER_LEASE_DIR>/worker_lease.json` |
+| `WORKER_LEASE_TTL` | Seconds before a lease is considered stale (triggers failover) | `30` |
+| `WORKER_LEASE_RENEW_INTERVAL` | How often (seconds) the leader renews its lease | `10` |
+
+> **Note on sessions:** `FLASK_SECRET_KEY` must be **identical** on all nodes so
+> that a session cookie signed by one node is accepted by the other.
+
 ---
 
 ## Setup & Installation
@@ -823,6 +854,54 @@ The `web2.config` file configures deployment on Windows IIS:
 - Enables stdout logging to `./logs/python-stdout.log`
 - 300-second startup timeout, 20-minute request timeout
 - 4 processes per application
+
+### Multi-Node (Load-Balanced) Deployment
+When running behind a 2+ node load balancer, follow these steps:
+
+> **Local dev / single-node:** The shared folder is at `d:\edms-shared` (already
+> configured in `.env`). For production multi-node, replace it with a NAS/SMB
+> share accessible from both nodes.
+
+1. **Create shared storage outside the project** — all file-based state lives in
+   a single folder **outside** the project directory so that code deployments
+   never wipe the data and both nodes see the same files:
+   - Local dev: `d:\edms-shared`
+   - Production: a NAS/SMB share mounted identically on both nodes (e.g.
+     `\\nas-server\edms-shared` UNC or `Z:\edms-shared` mapped drive)
+
+2. **Point all file-based state at the shared folder** — set these env vars
+   identically on every node (see the *Multi-Node / Load-Balanced Deployment*
+   table in [Environment Variables](#multi-node--load-balanced-deployment)):
+   ```
+   CHROMA_DB_PATH=\\nas-server\edms-shared\chroma_db
+   PROCESSING_QUEUE_DB_PATH=\\nas-server\edms-shared\processing_queue.sqlite3
+   IDEMPOTENCY_DB_PATH=\\nas-server\edms-shared\idempotency.sqlite3
+   THUMBNAIL_CACHE_DIR=\\nas-server\edms-shared\thumbnail_cache
+   VIDEO_CACHE_DIR=\\nas-server\edms-shared\video_cache
+   TEMP_THUMBNAIL_CACHE_DIR=\\nas-server\edms-shared\temp_thumbnail_cache
+   DOWNLOAD_CACHE_DIR=\\nas-server\edms-shared\download_cache
+   WORKER_LEASE_DIR=\\nas-server\edms-shared
+   ```
+   > **Tip:** The shared folder contains: `chroma_db/`, `processing_queue.sqlite3`,
+   > `idempotency.sqlite3`, `thumbnail_cache/`, `video_cache/`,
+   > `temp_thumbnail_cache/`, `download_cache/`, and the auto-created
+   > `worker_lease.json`.
+
+3. **Configure leader election** — leave `WORKER_ROLE=auto` (default) on both
+   nodes. The nodes negotiate via the lease file on the shared mount; only one
+   will run background processing and cleanup. If leadership fails, the other
+   node takes over within `WORKER_LEASE_TTL` seconds (default 30s).
+
+   Alternatively, set `WORKER_ROLE=leader` on the primary node and
+   `WORKER_ROLE=follower` on the secondary for explicit control.
+
+4. **Share the session secret** — `FLASK_SECRET_KEY` must be identical on all
+   nodes so session cookies work across them.
+
+5. **Start both nodes** — each node runs the API normally (`run_api.bat` /
+   `uvicorn`). The background worker loop is built into the API process and is
+   gated by the leader election; you do **not** need to run `worker.py`
+   separately in this mode.
 
 ### Background Worker
 The processing worker must be started separately:
