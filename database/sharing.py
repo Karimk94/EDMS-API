@@ -21,11 +21,15 @@ import logging
 #     share_type_id NUMBER DEFAULT 1 REFERENCES lkp_share_type(system_id), -- FK to lkp_share_type
 #     created_by NUMBER NOT NULL, -- system_id from PEOPLE table
 #     target_email VARCHAR2(255) NULL, -- If set, only this email can access (must be @rta.ae)
+#     note VARCHAR2(4000) NULL, -- Optional note/message attached by the sharer
 #     create_date DATE DEFAULT SYSDATE,
 #     expiry DATE NULL,
 #     is_active NUMBER(1) DEFAULT 1,
 #     disabled NUMBER(1) DEFAULT 0
 # );
+#
+# --- Migration script to add the note column to an existing table ---
+# ALTER TABLE lkp_document_share ADD (note VARCHAR2(4000) NULL);
 
 # Share type constants (matching lkp_share_type.system_id)
 # CREATE TABLE lkp_share_logs (
@@ -48,7 +52,7 @@ ALLOWED_DOMAIN = "@rta.ae"
 SHARE_TYPE_FILE = 1
 SHARE_TYPE_FOLDER = 2
 
-async def create_share_link(document_id=None, folder_id=None, created_by=None, expiry_date=None, target_email=None, share_type='file'):
+async def create_share_link(document_id=None, folder_id=None, created_by=None, expiry_date=None, target_email=None, share_type='file', note=None):
     """
     Creates a new share token for a document or folder (Async).
 
@@ -59,6 +63,7 @@ async def create_share_link(document_id=None, folder_id=None, created_by=None, e
         expiry_date: Optional expiry date for the link
         target_email: Optional specific email that can access (must be @rta.ae domain)
         share_type: 'file' or 'folder'
+        note: Optional note/message attached to the share link
     """
     conn = await get_async_connection()
     if not conn:
@@ -83,8 +88,8 @@ async def create_share_link(document_id=None, folder_id=None, created_by=None, e
 
     # Oracle uses :placeholder syntax
     query = """
-        INSERT INTO lkp_document_share (system_id, token, docnumber, folder_id, share_type_id, created_by, target_email, expiry, create_date, is_active, disabled)
-        VALUES ((SELECT NVL(MAX(SYSTEM_ID), 0) + 1 FROM lkp_document_share), :token, :doc_id, :folder_id, :share_type_id, :created_by, :target_email, :expiry, SYSDATE, 1, 0)
+        INSERT INTO lkp_document_share (system_id, token, docnumber, folder_id, share_type_id, created_by, target_email, note, expiry, create_date, is_active, disabled)
+        VALUES ((SELECT NVL(MAX(SYSTEM_ID), 0) + 1 FROM lkp_document_share), :token, :doc_id, :folder_id, :share_type_id, :created_by, :target_email, :note, :expiry, SYSDATE, 1, 0)
     """
 
     try:
@@ -96,6 +101,7 @@ async def create_share_link(document_id=None, folder_id=None, created_by=None, e
                 'share_type_id': share_type_id,
                 'created_by': created_by,
                 'target_email': target_email,
+                'note': note,
                 'expiry': expiry_date
             })
             await conn.commit()
@@ -115,7 +121,7 @@ async def get_share_details(token):
 
     query = """
         SELECT ds.system_id, ds.docnumber, ds.folder_id, st.name as share_type, 
-               ds.created_by, ds.target_email, ds.expiry, ds.is_active, us.LARGE_DOWNLOADS
+               ds.created_by, ds.target_email, ds.note, ds.expiry, ds.is_active, us.LARGE_DOWNLOADS
         FROM lkp_document_share ds
         LEFT JOIN lkp_share_type st ON ds.share_type_id = st.system_id
         LEFT JOIN lkp_edms_usr_secur us ON ds.created_by = us.USER_ID
@@ -128,7 +134,7 @@ async def get_share_details(token):
             row = await cursor.fetchone()
 
             if row:
-                share_id, doc_id, folder_id, share_type, created_by, target_email, expiry, is_active, allow_large = row
+                share_id, doc_id, folder_id, share_type, created_by, target_email, note, expiry, is_active, allow_large = row
 
                 # Check expiration
                 if expiry and expiry < datetime.now():
@@ -144,6 +150,7 @@ async def get_share_details(token):
                     "share_type": share_type or 'file',
                     "created_by": created_by,
                     "target_email": target_email,
+                    "note": note,
                     "expiry_date": expiry,
                     "LARGE_DOWNLOADS": allow_large == '1' if allow_large is not None else False
                 }

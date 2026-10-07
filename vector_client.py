@@ -12,7 +12,13 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 # --- ChromaDB Setup (Lazy Initialization) ---
 CHROMA_DB_PATH = os.getenv('CHROMA_DB_PATH', './chroma_db')
 COLLECTION_NAME = os.getenv('CHROMA_COLLECTION_NAME', 'edms_documents')
-DISTANCE_THRESHOLD = 1.3
+DISTANCE_THRESHOLD = None
+distance_threshold_env = os.getenv('VECTOR_DISTANCE_THRESHOLD')
+if distance_threshold_env:
+    try:
+        DISTANCE_THRESHOLD = float(distance_threshold_env)
+    except ValueError:
+        logging.warning("Ignoring invalid VECTOR_DISTANCE_THRESHOLD=%r", distance_threshold_env)
 
 # Expected embedding dimension from the embedding service
 # qwen3-embedding-8b produces 4096-dimensional embeddings
@@ -21,18 +27,24 @@ EXPECTED_EMBEDDING_DIM = 4096
 # Use your separate embedding service
 # We create a wrapper class that matches what ChromaDB expects
 class ExternalEmbeddingFunction(embedding_functions.EmbeddingFunction):
+    def __init__(self):
+        super().__init__()
+
     def __call__(self, input_texts: chromadb.Documents) -> chromadb.Embeddings:
         embeddings = []
         for text in input_texts:
             try:
                 # logging.info(f"ExternalEmbeddingFunction: Calling embedding service for text: {text[:70]}...")
                 embedding = api_client.get_embedding_from_service(text)
-                if embedding:
-                    embeddings.append(embedding)
-                else:
-                    embeddings.append([0.0] * EXPECTED_EMBEDDING_DIM) 
+                if len(embedding) != EXPECTED_EMBEDDING_DIM:
+                    raise ValueError(
+                        f"Embedding service returned {len(embedding)} dimensions; "
+                        f"expected {EXPECTED_EMBEDDING_DIM}."
+                    )
+                embeddings.append([float(value) for value in embedding])
             except Exception as e:
-                embeddings.append([0.0] * EXPECTED_EMBEDDING_DIM)
+                logging.error("External embedding failed: %s", e, exc_info=True)
+                raise RuntimeError("External embedding failed; refusing to index invalid vectors.") from e
         return embeddings
 
 # --- Lazy ChromaDB client & collection (initialized on first use, not at import time) ---
@@ -70,13 +82,11 @@ def _get_collection():
             existing_dim = _get_collection_dimension(temp_collection)
             
             if existing_dim is not None and existing_dim != EXPECTED_EMBEDDING_DIM:
-                logging.warning(
+                raise RuntimeError(
                     f"Dimension mismatch detected: Collection '{COLLECTION_NAME}' has {existing_dim}-dim embeddings, "
-                    f"but embedding service returns {EXPECTED_EMBEDDING_DIM}-dim embeddings. "
-                    f"Recreating collection (existing vectors will be lost - run backfill_vectors.py to re-index)."
+                    f"but embedding service is configured for {EXPECTED_EMBEDDING_DIM} dimensions. "
+                    "The collection was not modified; back it up and re-index it deliberately."
                 )
-                _client.delete_collection(name=COLLECTION_NAME)
-                # logging.info(f"Deleted collection '{COLLECTION_NAME}' due to dimension mismatch.")
         
         _collection = _client.get_or_create_collection(
             name=COLLECTION_NAME,
@@ -110,13 +120,6 @@ def add_or_update_document(doc_id: int, text_content: str):
         logging.error(f"VectorClient: Failed to upsert vector for doc_id {doc_id}: {e}", exc_info=True)
 
 
-def _reset_collection():
-    """Reset the global collection reference to force re-initialization."""
-    global _client, _collection
-    _collection = None
-    # logging.info("Reset collection reference to force re-initialization.")
-
-
 def query_documents(search_term: str, n_results: int = 40) -> list[int] | None:
     """
     Queries the vector store for a search term.
@@ -145,8 +148,8 @@ def query_documents(search_term: str, n_results: int = 40) -> list[int] | None:
             doc_id = doc_ids[i]
             dist = distances[i]
 
-            # Only keep results that are "close enough"
-            if dist <= DISTANCE_THRESHOLD:
+            # Apply a cutoff only when it has been calibrated for this model/index.
+            if DISTANCE_THRESHOLD is None or dist <= DISTANCE_THRESHOLD:
                 valid_doc_ids.append(int(doc_id))
                 # logging.info(f"   [KEEP] Match #{i + 1}: DocID {doc_id} | Distance: {dist}")
             # else:
@@ -159,24 +162,6 @@ def query_documents(search_term: str, n_results: int = 40) -> list[int] | None:
         return valid_doc_ids
 
     except Exception as e:
-        error_msg = str(e)
-        # Check for dimension mismatch error and attempt recovery
-        if "dimension" in error_msg.lower() and ("384" in error_msg or "4096" in error_msg):
-            logging.warning(
-                f"Dimension mismatch detected during query: {e}. "
-                f"Attempting to recreate collection..."
-            )
-            try:
-                # Delete and recreate the collection
-                if _client:
-                    _client.delete_collection(name=COLLECTION_NAME)
-                    # logging.info(f"Deleted collection '{COLLECTION_NAME}' due to dimension mismatch.")
-                _reset_collection()
-                # Return empty results this time - next query will work with new collection
-                return []
-            except Exception as delete_error:
-                logging.error(f"Failed to recreate collection: {delete_error}", exc_info=True)
-        
         logging.error(f"VectorClient: Vector search query failed for term '{search_term}': {e}", exc_info=True)
         return None
 

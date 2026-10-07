@@ -209,38 +209,51 @@ async def fetch_documents_from_oracle(page=1, page_size=20, search_term=None, da
             not memory_month
     )
 
-    # --- Smart Search: extract logical tokens from the free-text query ---
-    # Calls the Smart Search Service (LLM) to turn a sentence into key nouns /
-    # entities / concepts. These tokens enrich BOTH the SQL LIKE keyword search
-    # (each token becomes a match condition) and the vector query (so the
-    # embedding captures the extracted concepts as well as the raw sentence).
-    # If the service is unavailable, we gracefully fall back to the original
-    # whitespace-split search term — search is never broken.
+    # --- Smart Search: extract search tokens and explicit must-match concepts ---
     smart_tokens = None
+    required_concepts = []
     if search_term and not memory_month:
         try:
             import api_client
-            smart_tokens = api_client.get_search_tokens(search_term)
+            search_intent = api_client.get_search_intent(search_term)
+            if search_intent:
+                smart_tokens = search_intent.get("tokens")
+                required_concepts = search_intent.get("required_concepts", [])
         except Exception as e:
             logging.warning(f"Smart search tokenization failed, falling back to raw term: {e}")
             smart_tokens = None
+            required_concepts = []
 
     # --- Prepare Keyword Search Conditions (Always generate these for Hybrid search) ---
     text_search_conditions = []
+    required_search_conditions = []
     if search_term and not memory_month:
-        # Start with the raw whitespace-split words from the original query
-        search_words = [word.strip() for word in search_term.split(' ') if word.strip()]
-
-        # Merge in the smart tokens (de-duplicated, case-insensitive) so the SQL
-        # LIKE search also matches the LLM-extracted concepts/entities.
-        if smart_tokens:
-            existing_lower = {w.lower() for w in search_words}
-            for token in smart_tokens:
-                token_str = str(token).strip()
-                if token_str and token_str.lower() not in existing_lower:
-                    existing_lower.add(token_str.lower())
-                    search_words.append(token_str)
-
+        fallback_stop_words = {
+            "a", "an", "and", "all", "are", "find", "for", "from", "in", "me",
+            "of", "on", "or", "please", "show", "that", "the", "to", "with",
+            "contain", "contains", "picture", "pictures", "photo", "photos", "image", "images",
+        }
+        fallback_words = [
+            re.sub(r"[^\w'-]", "", word).strip()
+            for word in search_term.split()
+        ]
+        fallback_words = [
+            word for word in fallback_words
+            if word and word.lower() not in fallback_stop_words
+        ]
+        if not fallback_words:
+            fallback_words = [search_term.strip()]
+        search_words = list(required_concepts[:6]) + (
+            smart_tokens[:12] if smart_tokens else fallback_words[:12]
+        )
+        search_words = list(dict.fromkeys(
+            str(word).strip() for word in search_words if str(word).strip()
+        ))[:12]
+        required_concepts_lower = {
+            str(concept).strip().casefold()
+            for concept in required_concepts
+            if str(concept).strip()
+        }
         if search_words:
             for i, word in enumerate(search_words):
                 key = f"search_word_{i}"
@@ -272,18 +285,14 @@ async def fetch_documents_from_oracle(page=1, page_size=20, search_term=None, da
                                         )
                                         """
                 text_search_conditions.append(word_condition)
+                if word.casefold() in required_concepts_lower:
+                    required_search_conditions.append(word_condition)
 
     # --- Perform Vector Search (Blocking Call) ---
     if use_vector_search:
         try:
-            has_other_filters = bool(tags or persons or years or date_from or date_to or media_type)
-            vector_n_results = max(300, page * page_size * 5) if has_other_filters else (page * page_size)
-            # Expand the vector query with the smart tokens so the embedding
-            # captures both the original sentence and the LLM-extracted concepts.
-            vector_query_text = search_term
-            if smart_tokens:
-                vector_query_text = f"{search_term} {' '.join(smart_tokens)}"
-            vector_doc_ids = vector_client.query_documents(vector_query_text, n_results=vector_n_results)
+            vector_n_results = max(300, min(page * page_size * 5, 1000))
+            vector_doc_ids = vector_client.query_documents(search_term, n_results=vector_n_results)
         except Exception as e:
             logging.error(f"Vector search failed: {e}")
             vector_doc_ids = None
@@ -324,7 +333,7 @@ async def fetch_documents_from_oracle(page=1, page_size=20, search_term=None, da
             vector_clause = build_in_clause("p.docnumber", vector_doc_ids, "vec_id", params)
 
         if text_search_conditions:
-            text_clause = f"({' AND '.join(text_search_conditions)})"
+            text_clause = f"({' OR '.join(text_search_conditions)})"
         
         # Add event-based document IDs to search (for edms-media)
         if event_doc_ids:
@@ -339,6 +348,9 @@ async def fetch_documents_from_oracle(page=1, page_size=20, search_term=None, da
             where_clauses.append(f"({' OR '.join(all_clauses)})")
         elif len(all_clauses) == 1:
             where_clauses.append(all_clauses[0])
+
+        if required_search_conditions:
+            where_clauses.append(f"({' AND '.join(required_search_conditions)})")
 
         # --- Standard Filters ---
         if persons:
@@ -472,16 +484,7 @@ async def fetch_documents_from_oracle(page=1, page_size=20, search_term=None, da
     final_where_clause = base_where + ("AND " + " AND ".join(where_clauses) if where_clauses else "")
 
     order_by_clause = "ORDER BY p.DOCNUMBER DESC"
-
-    # --- Ordering Logic for Hybrid Search ---
-    if vector_doc_ids and len(vector_doc_ids) > 0:
-        top_vec_ids = vector_doc_ids[:100]
-        order_case_sql = " ".join([f"WHEN {int(doc_id)} THEN {idx + 1}" for idx, doc_id in enumerate(top_vec_ids) if str(doc_id).isdigit()])
-        if order_case_sql:
-            order_by_clause = f"ORDER BY CASE p.docnumber {order_case_sql} ELSE {len(top_vec_ids) + 1} END ASC, p.RTADOCDATE DESC"
-        else:
-            order_by_clause = "ORDER BY p.RTADOCDATE DESC, p.DOCNUMBER DESC"
-    elif memory_month is not None:
+    if memory_month is not None:
         order_by_clause = "ORDER BY p.RTADOCDATE DESC, p.DOCNUMBER DESC"
         if sort == 'rtadocdate_asc':
             order_by_clause = "ORDER BY p.RTADOCDATE ASC, p.DOCNUMBER ASC"
@@ -505,14 +508,56 @@ async def fetch_documents_from_oracle(page=1, page_size=20, search_term=None, da
             total_rows = count_result[0]
 
             date_column = "p.RTADOCDATE"
-            fetch_query = f"""
-            SELECT p.DOCNUMBER, p.ABSTRACT, p.AUTHOR, {date_column} as DOC_DATE, p.DOCNAME,
-                   CASE WHEN f.DOCNUMBER IS NOT NULL THEN 1 ELSE 0 END as IS_FAVORITE
-            FROM PROFILE p
-            LEFT JOIN LKP_FAVORITES_DOC f ON p.DOCNUMBER = f.DOCNUMBER AND f.USER_ID = :db_user_id
-            {final_where_clause}
-            {order_by_clause}
-            """
+            if search_term and memory_month is None:
+                vector_rank_ids = vector_doc_ids or []
+                vector_rank_case = (
+                    "CASE p.DOCNUMBER " + " ".join(
+                        f"WHEN {int(doc_id)} THEN {rank}"
+                        for rank, doc_id in enumerate(vector_rank_ids, start=1)
+                    ) + " ELSE NULL END"
+                    if vector_rank_ids else "CAST(NULL AS NUMBER)"
+                )
+                keyword_score_terms = [
+                    f"CASE WHEN {condition} THEN 1 ELSE 0 END"
+                    for condition in text_search_conditions
+                ]
+                keyword_score = " + ".join(keyword_score_terms) if keyword_score_terms else "0"
+                fetch_query = f"""
+                WITH scored AS (
+                    SELECT p.DOCNUMBER AS DOCNUMBER, p.ABSTRACT AS ABSTRACT,
+                           p.AUTHOR AS AUTHOR, {date_column} AS DOC_DATE, p.DOCNAME AS DOCNAME,
+                           CASE WHEN f.DOCNUMBER IS NOT NULL THEN 1 ELSE 0 END AS IS_FAVORITE,
+                           {vector_rank_case} AS VECTOR_RANK,
+                           ({keyword_score}) AS KEYWORD_SCORE
+                    FROM PROFILE p
+                    LEFT JOIN LKP_FAVORITES_DOC f
+                        ON p.DOCNUMBER = f.DOCNUMBER AND f.USER_ID = :db_user_id
+                    {final_where_clause}
+                ), ranked AS (
+                    SELECT scored.*,
+                           CASE WHEN KEYWORD_SCORE > 0 THEN
+                               ROW_NUMBER() OVER (
+                                   ORDER BY KEYWORD_SCORE DESC, DOC_DATE DESC, DOCNUMBER DESC
+                               )
+                           END AS KEYWORD_RANK
+                    FROM scored
+                )
+                SELECT DOCNUMBER, ABSTRACT, AUTHOR, DOC_DATE, DOCNAME, IS_FAVORITE
+                FROM ranked
+                ORDER BY (
+                    CASE WHEN VECTOR_RANK IS NULL THEN 0 ELSE 1.0 / (60 + VECTOR_RANK) END +
+                    CASE WHEN KEYWORD_RANK IS NULL THEN 0 ELSE 1.0 / (60 + KEYWORD_RANK) END
+                ) DESC, DOC_DATE DESC, DOCNUMBER DESC
+                """
+            else:
+                fetch_query = f"""
+                SELECT p.DOCNUMBER, p.ABSTRACT, p.AUTHOR, {date_column} as DOC_DATE, p.DOCNAME,
+                       CASE WHEN f.DOCNUMBER IS NOT NULL THEN 1 ELSE 0 END as IS_FAVORITE
+                FROM PROFILE p
+                LEFT JOIN LKP_FAVORITES_DOC f ON p.DOCNUMBER = f.DOCNUMBER AND f.USER_ID = :db_user_id
+                {final_where_clause}
+                {order_by_clause}
+                """
 
             # Apply OFFSET/FETCH pagination for ALL scopes (including folders). The
             # folders branch no longer pre-slices the ID list, so server-side

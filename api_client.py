@@ -3,6 +3,7 @@ import os
 import io
 import time
 import logging
+import math
 
 EMBEDDING_API_URL = os.getenv("EMBEDDING_API_URL")
 SMART_SEARCH_API_URL = os.getenv("SMART_SEARCH_API_URL")
@@ -10,8 +11,7 @@ SMART_SEARCH_API_URL = os.getenv("SMART_SEARCH_API_URL")
 def get_embedding_from_service(text):
     """Calls the external embedding service."""
     if not EMBEDDING_API_URL:
-        logging.error("EMBEDDING_API_URL is not set.")
-        return None
+        raise RuntimeError("EMBEDDING_API_URL is not set.")
 
     try:
         response = requests.post(
@@ -20,17 +20,22 @@ def get_embedding_from_service(text):
             timeout=60
         )
         response.raise_for_status()
-        return response.json().get('embedding')
+        embedding = response.json().get('embedding')
     except requests.exceptions.RequestException as e:
         logging.error(f"Failed to get embedding from service: {e}", exc_info=True)
-        return None
+        raise RuntimeError("Failed to get embedding from service.") from e
 
-def get_search_tokens(text):
-    """Calls the external Smart Search service to extract search tokens from free text.
+    if not isinstance(embedding, list) or not embedding:
+        raise ValueError("Embedding service returned an empty or invalid embedding.")
+    if any(
+        isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value)
+        for value in embedding
+    ):
+        raise ValueError("Embedding service returned non-numeric or non-finite values.")
+    return embedding
 
-    Returns a list of token strings, or None if the service is unavailable / errors out
-    (callers should fall back to the raw search term in that case).
-    """
+def get_search_intent(text):
+    """Calls Smart Search for broad tokens and explicitly required concepts."""
     if not SMART_SEARCH_API_URL:
         logging.error("SMART_SEARCH_API_URL is not set.")
         return None
@@ -44,8 +49,13 @@ def get_search_tokens(text):
         response.raise_for_status()
         data = response.json()
         tokens = data.get('tokens')
-        if isinstance(tokens, list) and tokens:
-            return tokens
+        required_concepts = data.get('required_concepts', [])
+        if not isinstance(required_concepts, list):
+            required_concepts = []
+        if (isinstance(tokens, list) and tokens) or required_concepts:
+            if not isinstance(tokens, list):
+                tokens = []
+            return {"tokens": tokens, "required_concepts": required_concepts}
         return None
     except requests.exceptions.RequestException as e:
         logging.error(f"Failed to get search tokens from service: {e}", exc_info=True)
@@ -53,6 +63,11 @@ def get_search_tokens(text):
     except (ValueError, KeyError) as e:
         logging.error(f"Failed to parse search tokens response: {e}", exc_info=True)
         return None
+
+def get_search_tokens(text):
+    """Backwards-compatible helper returning only Smart Search tokens."""
+    intent = get_search_intent(text)
+    return intent.get("tokens") if intent else None
 
 def data_chunk_generator(data, chunk_size=262144):
     """Yields chunks of binary data from a BytesIO object."""

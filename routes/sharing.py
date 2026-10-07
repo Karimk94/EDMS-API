@@ -123,7 +123,8 @@ async def generate_share_link(request: Request, req: ShareLinkCreateRequest, use
                 created_by=user_id,
                 expiry_date=req.expiry_date,
                 target_email=None, # Open share
-                share_type=share_type
+                share_type=share_type,
+                note=req.note
             )
             link = f"{base_url}/shared/{token}"
             
@@ -134,6 +135,7 @@ async def generate_share_link(request: Request, req: ShareLinkCreateRequest, use
                 "target_email": None,
                 "share_mode": "open",
                 "share_type": share_type,
+                "note": req.note,
                 "links": []
             }
         
@@ -145,7 +147,8 @@ async def generate_share_link(request: Request, req: ShareLinkCreateRequest, use
                 created_by=user_id,
                 expiry_date=req.expiry_date,
                 target_email=email,
-                share_type=share_type
+                share_type=share_type,
+                note=req.note
             )
             link = f"{base_url}/shared/{token}"
             
@@ -174,7 +177,8 @@ async def generate_share_link(request: Request, req: ShareLinkCreateRequest, use
                     share_link=link,
                     document_name=document_name,
                     sharer_name=sharer_name,
-                    expiry_date=req.expiry_date
+                    expiry_date=req.expiry_date,
+                    note=req.note
                 )
             except Exception as email_error:
                 logging.error(f"Failed to send share link email to {email}: {email_error}")
@@ -190,6 +194,7 @@ async def generate_share_link(request: Request, req: ShareLinkCreateRequest, use
             "target_email": first_link.get("email"), # Legacy support
             "share_mode": "restricted",
             "share_type": share_type,
+            "note": req.note,
             "links": generated_links # New field containing all links
         }
 
@@ -227,7 +232,8 @@ async def get_share_info(token: str):
                 target_email.index('@'):] if target_email else None,
             "expiry_date": share_info.get('expiry_date'),
             "share_type": share_type,
-            "skip_otp": is_restricted  # Skip OTP for restricted shares
+            "skip_otp": is_restricted,  # Skip OTP for restricted shares
+            "note": share_info.get('note')  # Optional note/message from the sharer
         }
 
     except HTTPException:

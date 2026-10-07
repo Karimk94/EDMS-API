@@ -15,6 +15,7 @@ class ShareLinkCreateRequest(BaseModel):
     expiry_date: Optional[datetime] = None
     target_email: Optional[str] = None # For backward compatibility
     target_emails: Optional[List[str]] = None
+    note: Optional[str] = None  # Optional note/message attached to the share link
 
     @field_validator('target_email')
     @classmethod
@@ -71,6 +72,7 @@ class ShareInfoResponse(BaseModel):
     expiry_date: Optional[datetime] = None
     share_type: str = "file"
     skip_otp: bool = False  # True for restricted shares, False for open shares
+    note: Optional[str] = None  # Optional note/message attached by the sharer
 
 class ShareAccessRequest(BaseModel):
     """Request model for requesting OTP access to a shared document."""

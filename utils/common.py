@@ -349,7 +349,8 @@ def get_share_link_email_template(
         document_name: str,
         sharer_name: str,
         recipient_email: str,
-        expiry_date: datetime = None
+        expiry_date: datetime = None,
+        note: str = None
 ) -> str:
     """
     Generates an HTML email template for share link notification.
@@ -395,6 +396,22 @@ def get_share_link_email_template(
                     </p>
                 </div>
             '''
+
+    # Optional note/message from the sharer
+    note_section = ""
+    if note and note.strip():
+        import html as _html
+        safe_note = _html.escape(note.strip())
+        note_section = f'''
+            <div style="background-color: #eef6ff; border-left: 4px solid {primary_color}; border-radius: 4px; padding: 10px 14px; margin-bottom: 15px;">
+                <p style="color: #336699; font-size: 11px; font-weight: 700; margin: 0 0 4px 0; text-transform: uppercase; letter-spacing: 0.5px;">
+                    Note from {sharer_name}
+                </p>
+                <p style="color: #444444; font-size: 13px; margin: 0; white-space: pre-wrap; line-height: 1.5;">
+                    {safe_note}
+                </p>
+            </div>
+        '''
 
     html_template = f'''
 <!DOCTYPE html>
@@ -444,6 +461,8 @@ def get_share_link_email_template(
 
                             {expiry_section}
 
+                            {note_section}
+
                             <!-- Access Button -->
                             <div style="text-align: center; margin: 25px 0;">
                                 <a href="{share_link}" style="display: inline-block; background-color: {primary_color}; color: #ffffff; text-decoration: none; padding: 14px 35px; border-radius: 6px; font-size: 14px; font-weight: 600; box-shadow: 0 2px 4px rgba(0, 102, 204, 0.3);">
@@ -484,7 +503,8 @@ def get_share_link_plain_text(
         document_name: str,
         sharer_name: str,
         recipient_email: str,
-        expiry_date: datetime = None
+        expiry_date: datetime = None,
+        note: str = None
 ) -> str:
     """
     Generates a plain text fallback for share link email.
@@ -503,6 +523,10 @@ def get_share_link_plain_text(
         if isinstance(expiry_date, datetime):
             expiry_text = f"\n⏰ This link expires on: {expiry_date.strftime('%B %d, %Y')}\n"
 
+    note_text = ""
+    if note and note.strip():
+        note_text = f"\n📝 Note from {sharer_name}:\n{note.strip()}\n"
+
     plain_text = f"""
 {company_name} - Document Shared With You
 {'=' * 50}
@@ -513,7 +537,7 @@ Hello,
 
 DOCUMENT: {document_name}
 SHARED ON: {current_datetime}
-{expiry_text}
+{expiry_text}{note_text}
 ACCESS LINK:
 {share_link}
 
@@ -532,7 +556,8 @@ def send_share_link_email(
         share_link: str,
         document_name: str,
         sharer_name: str,
-        expiry_date: datetime = None
+        expiry_date: datetime = None,
+        note: str = None
 ):
     """
     Sends a share link notification email to the target recipient.
@@ -560,10 +585,10 @@ def send_share_link_email(
 
     # Generate email content
     plain_text_content = get_share_link_plain_text(
-        share_link, document_name, sharer_name, to_email, expiry_date
+        share_link, document_name, sharer_name, to_email, expiry_date, note
     )
     html_content = get_share_link_email_template(
-        share_link, document_name, sharer_name, to_email, expiry_date
+        share_link, document_name, sharer_name, to_email, expiry_date, note
     )
 
     # Attach both versions

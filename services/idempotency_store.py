@@ -6,18 +6,49 @@ from datetime import datetime, timedelta
 class IdempotencyStore:
     def __init__(self, db_path: str):
         self.db_path = db_path
+        # Detect network paths (UNC \\server\share) — WAL mode is unreliable
+        # over SMB/NAS because it relies on shared-memory that doesn't work
+        # across network filesystems.  Fall back to DELETE (rollback) journal
+        # mode for network databases.
+        self._is_network = self.db_path.startswith("\\\\") or self.db_path.startswith("//")
+        self._journal_mode = "DELETE" if self._is_network else "WAL"
         self._initialize()
 
     def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.db_path)
+        # timeout=30 lets SQLite wait up to 30 s for a lock instead of failing
+        # immediately with "database is locked" when multiple workers contend.
+        conn = sqlite3.connect(self.db_path, timeout=30)
         conn.row_factory = sqlite3.Row
-        # Use WAL mode for better concurrency across workers
-        conn.execute("PRAGMA journal_mode=WAL;")
-        conn.execute("PRAGMA busy_timeout=5000;")
+        # busy_timeout tells SQLite how long to retry when another connection
+        # holds a lock.  30 000 ms = 30 s.
+        conn.execute("PRAGMA busy_timeout=30000;")
+        # Journal mode is set once during _initialize(); we don't re-set it on
+        # every connection because changing journal mode requires an exclusive
+        # lock and causes "database is locked" errors under concurrent access
+        # (especially over SMB).  Reading the current mode is lock-free.
+        try:
+            current = conn.execute("PRAGMA journal_mode;").fetchone()[0]
+            if str(current).upper() != self._journal_mode:
+                conn.execute(f"PRAGMA journal_mode={self._journal_mode};")
+        except sqlite3.OperationalError:
+            # If we can't change the journal mode (e.g. another process holds
+            # the lock), that's fine — _initialize() already set it at startup.
+            pass
         return conn
 
     def _initialize(self) -> None:
         os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
+        # Set the journal mode ONCE here with an exclusive connection, then
+        # never change it again from _connect().
+        try:
+            init_conn = sqlite3.connect(self.db_path, timeout=30)
+            init_conn.execute("PRAGMA busy_timeout=30000;")
+            init_conn.execute(f"PRAGMA journal_mode={self._journal_mode};")
+            init_conn.close()
+        except sqlite3.OperationalError:
+            # Database might be locked by another process during startup;
+            # the mode will be set by whichever process wins the race.
+            pass
         with self._connect() as conn:
             conn.execute(
                 """
