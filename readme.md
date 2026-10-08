@@ -663,9 +663,33 @@ The API maintains a **ChromaDB** persistent vector store for semantic document s
 - **Lazy Initialization**: ChromaDB client is created on first use, not at import time (thread-safe via GIL)
 - **Telemetry Disabled**: ChromaDB's anonymized telemetry is explicitly disabled
 - **Backfill Script**: `backfill_vectors.py` bulk-indexes existing Oracle documents into ChromaDB in batches of 100, with automatic reconnection on database errors
-- **CRUD**: Supports `add_or_update_document()`, `query_documents()`, and `delete_document()`
+## Semantic Search & AI Architecture
 
-When users search, the API queries both the traditional Oracle full-text search AND the ChromaDB vector search, merging results for hybrid semantic+keyword search.
+The Smart EDMS system orchestrates a powerful microservices architecture consisting of two primary flows: the **Ingestion/Upload Pipeline** and the **Search Pipeline**.
+
+![Vector Embedding Lifecycle](/C:/Users/okool_kaabdulwahed/.gemini/antigravity-ide/brain/8edb940e-6cde-418b-b965-647bcaa92fc4/vector_search_lifecycle_1791373975305.jpg)
+
+### 1. Ingestion / Upload Pipeline
+When a user uploads a new document, image, or video, the system performs an asynchronous deep analysis to extract structured metadata:
+1. **Initial Upload & Storage**: The EDMS API acts as the orchestrator. It receives the file, stores the physical binary file in **OpenText eDOCS**, and records the primary row metadata (indicating file location and basic properties) in **Oracle DB**.
+2. **AI Processing Trigger**: The system triggers a parallel background pipeline utilizing several standalone AI microservices (which leverage **GOV AI LLM and Vision Models**):
+   - **OCR Service**: Extracts raw text from documents and images.
+   - **Image Captioning Service**: Uses vision models to describe the visual contents of images.
+   - **Face Recognition Service**: Detects and identifies registered personnel.
+   - **Video Summarizer**: Transcribes and summarizes video content.
+3. **Metadata Storage**: The rich metadata and tags extracted by these AI services are saved back down into **Oracle DB** to enrich the document's record.
+4. **Embedding Generation**: The extracted text, captions, and tags are aggregated into a rich "abstract" and sent to the **Embedding Service**, which generates a 4096-dimensional dense mathematical vector representing the file's conceptual meaning.
+5. **Vector Storage**: This vector is stored persistently in **ChromaDB**, explicitly linked to the document's ID.
+
+### 2. Search Pipeline
+When a user searches (whether in Recents, Favorites, or Folders), the system executes a hybrid semantic and keyword search:
+1. **Smart Search & LLM Query Expansion**: The raw search query is sent to the **Smart Search Service**. This service uses an LLM (GovAI) to analyze the query intent, extract explicitly required concepts, and dynamically generate **synonyms and related concepts** in both Arabic and English (e.g., searching for "sea" will append "water", "ocean").
+2. **Parallel Execution**: The system utilizes `asyncio.gather()` to simultaneously execute:
+   - **Vector Search**: The expanded query (raw text + generated tokens) is sent to the **Embedding Service** to generate a query vector. This vector is queried against **ChromaDB** for semantic similarity (comparing it to the vectors generated during ingestion).
+   - **Oracle Keyword Search**: Traditional SQL `LIKE` and text-matching queries execute on Oracle DB for exact metadata matches.
+   - **Event Database Search**: Searches linked events mapping to documents.
+   - **WSDL Folder Scope (If applicable)**: Gathers document IDs constrained to specific hierarchies.
+3. **Smart Insights**: The generated semantic tokens and required concepts are returned in the API payload under `search_meta`, allowing the frontend to visualize the AI's understanding of the query to the user.
 
 ---
 

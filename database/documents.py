@@ -1,5 +1,6 @@
 import oracledb
 import logging
+import asyncio
 from datetime import datetime
 import re
 import wsdl_client
@@ -59,6 +60,90 @@ async def fetch_documents_from_oracle(page=1, page_size=20, search_term=None, da
                                       security_level='Editor', app_source='unknown', media_type=None, scope=None):
     """Fetches a paginated list of documents, applying filters including media_type."""
     
+    # --- Smart Search (Run first so tokens can enrich Vector Search) ---
+    smart_tokens = None
+    required_concepts = []
+    if search_term and not memory_month:
+        try:
+            import api_client
+            # Run blocking API call in a separate thread
+            search_intent = await asyncio.to_thread(api_client.get_search_intent, search_term)
+            if search_intent:
+                smart_tokens = search_intent.get("tokens")
+                required_concepts = search_intent.get("required_concepts", [])
+        except Exception as e:
+            logging.warning(f"Smart search tokenization failed, falling back to raw term: {e}")
+
+    # --- Pre-fetch Data in Parallel (WSDL, Event DB, Vector DB) ---
+    dst = dms_system_login()
+    if not dst:
+        logging.error("Could not log into DMS. Aborting document fetch.")
+        return [], 0, {}
+
+    async def fetch_folder_doc_ids():
+        if scope == 'folders':
+            return await wsdl_client.get_recursive_doc_ids(dst, media_type)
+        return None
+
+    async def fetch_root_doc_ids():
+        if scope != 'folders' and app_source == 'edms-media':
+            from wsdl_client.config import SMART_EDMS_ROOT_ID
+            return await wsdl_client.get_recursive_doc_ids(dst, media_type_filter=None, start_node=SMART_EDMS_ROOT_ID)
+        return None
+
+    async def fetch_event_data():
+        evt_doc_ids = []
+        evt_folder_names = {}
+        if search_term and app_source == 'edms-media' and scope != 'folders':
+            try:
+                from database.events import search_events_by_name, get_event_folder_docnumbers
+                matching_events = await search_events_by_name(search_term, app_source)
+                for event in matching_events:
+                    event_id = event.get('id')
+                    event_name = event.get('name', '')
+                    event_docs = await get_event_folder_docnumbers(event_id)
+                    for doc_id in event_docs:
+                        if doc_id not in evt_doc_ids:
+                            evt_doc_ids.append(doc_id)
+                            evt_folder_names[doc_id] = event_name
+            except Exception as e:
+                logging.error(f"Error searching events for document search: {e}")
+        return evt_doc_ids, evt_folder_names
+
+    async def fetch_vector_doc_ids():
+        use_vector_search = (vector_client is not None and search_term and not memory_month)
+        if use_vector_search:
+            try:
+                vector_n_results = max(300, min(page * page_size * 5, 1000))
+                # Enrich embedding query with smart tokens
+                vector_query = search_term
+                if smart_tokens:
+                    search_term_lower = search_term.lower()
+                    additional_tokens = [t for t in smart_tokens if t.lower() not in search_term_lower]
+                    if additional_tokens:
+                        vector_query = f"{search_term} {' '.join(additional_tokens)}"
+                # Run blocking API call in a separate thread
+                return await asyncio.to_thread(vector_client.query_documents, vector_query, n_results=vector_n_results)
+            except Exception as e:
+                logging.error(f"Vector search failed: {e}")
+        return None
+
+    # Execute all independent data fetches concurrently
+    parallel_results = await asyncio.gather(
+        fetch_folder_doc_ids(),
+        fetch_root_doc_ids(),
+        fetch_event_data(),
+        fetch_vector_doc_ids(),
+        return_exceptions=True
+    )
+    
+    # Safely unpack results, ignoring errors that were caught and logged
+    folder_doc_ids = parallel_results[0] if not isinstance(parallel_results[0], Exception) else None
+    root_doc_ids = parallel_results[1] if not isinstance(parallel_results[1], Exception) else None
+    event_data = parallel_results[2] if not isinstance(parallel_results[2], Exception) else ([], {})
+    event_doc_ids, event_folder_names = event_data
+    vector_doc_ids = parallel_results[3] if not isinstance(parallel_results[3], Exception) else None
+    
     # --- Pre-fetch WSDL data BEFORE acquiring DB connection ---
     # This is critical to avoid connection pool exhaustion from long-running WSDL calls
     dst = dms_system_login()
@@ -74,72 +159,31 @@ async def fetch_documents_from_oracle(page=1, page_size=20, search_term=None, da
     where_clauses = []
     shortlist_clause = ""
 
-    # --- Scope Logic - WSDL calls happen BEFORE DB connection ---
-    folder_doc_ids = None
-    root_doc_ids = None  # For edms-media recents tab
-    event_doc_ids = []  # For edms-media event-based search
-    event_folder_names = {}  # Map of doc_id -> event name for display
-    
+    # --- Process Parallel Fetch Results ---
     if scope == 'folders':
-        # Retrieve all relevant DOCNUMBERS from WSDL first (Async call - NO DB connection held).
-        # The full set of folder document IDs is passed into the WHERE clause (p.DOCNUMBER IN (...))
-        # so hybrid search matches across the ENTIRE folder hierarchy with proper server-side pagination.
-        folder_doc_ids = await wsdl_client.get_recursive_doc_ids(dst, media_type)
         if not folder_doc_ids:
-            return [], 0
-
-        # Cap the IN-list at 10000 IDs for performance (mirrors the Recents/root path).
+            return [], 0, {}
         if len(folder_doc_ids) > 10000:
             folder_doc_ids = folder_doc_ids[:10000]
-
         in_clause = build_in_clause("p.DOCNUMBER", folder_doc_ids, "fid", params)
         where_clauses.append(in_clause)
-
     else:
-        # For edms-media, show documents from the SMART_EDMS_ROOT_ID folder hierarchy
-        # This ensures both folders and recents tabs show content from the same root
         if app_source == 'edms-media':
-            # Get all document IDs from the SMART_EDMS_ROOT_ID folder hierarchy (Async call - NO DB connection held)
-            from wsdl_client.config import SMART_EDMS_ROOT_ID
-            root_doc_ids = await wsdl_client.get_recursive_doc_ids(dst, media_type_filter=None, start_node=SMART_EDMS_ROOT_ID)
-            # logging.info(f"[edms-media recents] Fetched {len(root_doc_ids) if root_doc_ids else 0} doc IDs from SMART_EDMS_ROOT_ID")
-            
             if root_doc_ids and len(root_doc_ids) > 0:
-                # Limit to 10000 IDs for performance
                 limited_ids = root_doc_ids[:10000] if len(root_doc_ids) > 10000 else root_doc_ids
                 in_clause = build_in_clause("p.DOCNUMBER", limited_ids, "root_id", params)
                 where_clauses.append(in_clause)
             else:
-                # Fallback: just filter by RTA_TEXT1 if WSDL fetch fails or returns empty
                 logging.warning(f"[edms-media recents] WSDL returned no IDs, falling back to RTA_TEXT1 filter only")
                 where_clauses.append("p.RTA_TEXT1 = 'edms-media'")
-            # NOTE: For edms-media, we do NOT exclude documents in folders - we want to show all documents
-            # from the SMART_EDMS_ROOT_ID hierarchy, whether they are in folders or not
         elif app_source == 'smart-edms':
             smart_edms_floor = 19662092
             where_clauses.append(f"p.DOCNUMBER >= {smart_edms_floor} AND (p.RTA_TEXT1 IS NULL OR p.RTA_TEXT1 != 'edms-media')")
-            # Exclude documents that are in folders for smart-edms (non-edms-media documents)
             where_clauses.append("NOT EXISTS (SELECT 1 FROM FOLDER_ITEM fi WHERE fi.DOCNUMBER = p.DOCNUMBER AND fi.NODE_TYPE = 'D')")
-        
-        # --- Event-based search for edms-media (async DB calls, but NO main connection held yet) ---
-        if search_term and app_source == 'edms-media':
-            try:
-                from database.events import search_events_by_name, get_event_folder_docnumbers
-                matching_events = await search_events_by_name(search_term, app_source)
-                for event in matching_events:
-                    event_id = event.get('id')
-                    event_name = event.get('name', '')
-                    event_docs = await get_event_folder_docnumbers(event_id)
-                    for doc_id in event_docs:
-                        if doc_id not in event_doc_ids:
-                            event_doc_ids.append(doc_id)
-                            event_folder_names[doc_id] = event_name
-            except Exception as e:
-                logging.error(f"Error searching events for document search: {e}")
 
-    # --- NOW acquire DB connection after all WSDL calls are complete ---
+    # --- NOW acquire DB connection after all WSDL/API calls are complete ---
     conn = await get_async_connection()
-    if not conn: return [], 0
+    if not conn: return [], 0, {}
 
     db_user_id = None
     if user_id:
@@ -201,28 +245,11 @@ async def fetch_documents_from_oracle(page=1, page_size=20, search_term=None, da
 
     base_where = f"WHERE p.FORM = 2740 "
     shortlist_sql = "AND k.SHORTLISTED = '1'" if security_level == 'Viewer' else ""
-    vector_doc_ids = None
-
     use_vector_search = (
             vector_client is not None and
             search_term and
             not memory_month
     )
-
-    # --- Smart Search: extract search tokens and explicit must-match concepts ---
-    smart_tokens = None
-    required_concepts = []
-    if search_term and not memory_month:
-        try:
-            import api_client
-            search_intent = api_client.get_search_intent(search_term)
-            if search_intent:
-                smart_tokens = search_intent.get("tokens")
-                required_concepts = search_intent.get("required_concepts", [])
-        except Exception as e:
-            logging.warning(f"Smart search tokenization failed, falling back to raw term: {e}")
-            smart_tokens = None
-            required_concepts = []
 
     # --- Prepare Keyword Search Conditions (Always generate these for Hybrid search) ---
     text_search_conditions = []
@@ -272,7 +299,7 @@ async def fetch_documents_from_oracle(page=1, page_size=20, search_term=None, da
                                                 WHERE ldt.DOCNUMBER = p.DOCNUMBER 
                                                 AND (k.DESCRIPTION LIKE :{key} OR UPPER(k.KEYWORD_ID) LIKE :{key_upper}) 
                                                 AND ldt.DISABLED = '0'
-                                                {shortlist_sql}
+                                                {shortlist_clause}
                                             ) OR
                                             EXISTS (
                                                 SELECT 1 FROM LKP_PERSON p_filter
@@ -287,15 +314,6 @@ async def fetch_documents_from_oracle(page=1, page_size=20, search_term=None, da
                 text_search_conditions.append(word_condition)
                 if word.casefold() in required_concepts_lower:
                     required_search_conditions.append(word_condition)
-
-    # --- Perform Vector Search (Blocking Call) ---
-    if use_vector_search:
-        try:
-            vector_n_results = max(300, min(page * page_size * 5, 1000))
-            vector_doc_ids = vector_client.query_documents(search_term, n_results=vector_n_results)
-        except Exception as e:
-            logging.error(f"Vector search failed: {e}")
-            vector_doc_ids = None
 
     if memory_month is not None:
         try:
@@ -613,11 +631,16 @@ async def fetch_documents_from_oracle(page=1, page_size=20, search_term=None, da
                 })
     except oracledb.Error as e:
         logging.error(f"Oracle error fetching documents: {e}", exc_info=True)
-        return [], 0
+        return [], 0, {}
     finally:
         if conn:
             await conn.close()
-    return documents, total_rows
+            
+    search_meta = {
+        "tokens": smart_tokens if smart_tokens else [],
+        "required_concepts": required_concepts if required_concepts else []
+    }
+    return documents, total_rows, search_meta
 
 def _process_candidates_sql(join_column: str, select_clause: str, extra_clause: str = "") -> str:
     """Builds the processing-candidates SQL restricted to AI-supported file types.

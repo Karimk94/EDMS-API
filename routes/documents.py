@@ -65,7 +65,7 @@ async def api_get_documents(
         if pageSize < 1: pageSize = 20
         if pageSize > 100: pageSize = 100
 
-        documents, total_rows = await db_connector.fetch_documents_from_oracle(
+        documents, total_rows, search_meta = await db_connector.fetch_documents_from_oracle(
             page=page, page_size=pageSize, search_term=search, date_from=date_from,
             date_to=date_to, persons=persons, person_condition=person_condition, tags=tags,
             years=years, sort=sort, memory_month=memoryMonth, memory_day=memoryDay,
@@ -79,7 +79,8 @@ async def api_get_documents(
             "documents": documents,
             "page": page,
             "total_pages": total_pages,
-            "total_documents": total_rows
+            "total_documents": total_rows,
+            "search_meta": search_meta
         }
     except Exception as e:
         logging.error(f"Error in /api/documents endpoint: {e}", exc_info=True)
