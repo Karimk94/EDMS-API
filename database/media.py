@@ -579,7 +579,9 @@ async def get_metadata_for_docs(doc_ids):
                 bind_params = {name: value for name, value in zip(bind_names, chunk)}
 
                 sql = f"""
-                    SELECT p.DOCNUMBER, TO_CHAR(p.CREATION_DATE, 'YYYY-MM-DD"T"HH24:MI:SS"Z"')
+                    SELECT p.DOCNUMBER, 
+                           TO_CHAR(p.CREATION_DATE, 'YYYY-MM-DD"T"HH24:MI:SS"Z"'),
+                           (SELECT SUM(FILE_SIZE) FROM COMPONENTS c WHERE c.DOCNUMBER = p.DOCNUMBER) as FILE_SIZE
                     FROM PROFILE p
                     WHERE p.DOCNUMBER IN ({in_clause})
                 """
@@ -587,10 +589,10 @@ async def get_metadata_for_docs(doc_ids):
                 try:
                     cursor.execute(sql, bind_params)
                     rows = cursor.fetchall()
-                    for doc_id, c_date in rows:
+                    for doc_id, c_date, f_size in rows:
                         metadata_map[str(doc_id)] = {
                             'date': c_date,
-                            'size': 0
+                            'size': f_size if f_size is not None else 0
                         }
                 except Exception as e:
                     logging.error(f"Error executing metadata query: {e}")

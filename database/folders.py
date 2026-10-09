@@ -157,7 +157,8 @@ async def get_folder_files(folder_docnumber: str) -> list:
             # Query files where PARENT = folder_docnumber
             # PARENT stores the DOCNUMBER of the parent folder
             await cursor.execute(
-                """SELECT fi.SYSTEM_ID, fi.DOCNUMBER, fi.DISPLAYNAME, p.DOCNAME
+                """SELECT fi.SYSTEM_ID, fi.DOCNUMBER, fi.DISPLAYNAME, p.DOCNAME,
+                          (SELECT SUM(FILE_SIZE) FROM COMPONENTS c WHERE c.DOCNUMBER = fi.DOCNUMBER) as FILE_SIZE
                    FROM FOLDER_ITEM fi
                    LEFT JOIN PROFILE p ON fi.DOCNUMBER = p.DOCNUMBER
                    WHERE fi.PARENT = :parent_docnumber 
@@ -183,7 +184,7 @@ async def get_folder_files(folder_docnumber: str) -> list:
 
             files = []
             for row in rows:
-                system_id, docnumber, display_name, docname = row
+                system_id, docnumber, display_name, docname, filesize = row
                 file_name = display_name or docname or f'Document {docnumber}'
 
                 # Get media type from resolved map, default to 'file'
@@ -194,7 +195,8 @@ async def get_folder_files(folder_docnumber: str) -> list:
                     'system_id': str(system_id),
                     'name': file_name,
                     'type': 'file',
-                    'media_type': media_type
+                    'media_type': media_type,
+                    'size': filesize or 0
                 })
 
             return files
