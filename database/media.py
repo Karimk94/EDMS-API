@@ -8,6 +8,11 @@ import uuid
 import oracledb
 from datetime import datetime
 from PIL import Image
+try:
+    import pillow_heif
+    pillow_heif.register_heif_opener()
+except ImportError:
+    pass
 import fitz
 from moviepy.video.io.VideoFileClip import VideoFileClip
 from zeep import Client, Settings
@@ -18,12 +23,12 @@ from database.connection import get_connection, get_async_connection
 APPS_BUCKET_TTL_SECONDS = int(os.getenv('APPS_CACHE_TTL_SECONDS', '600'))
 ORACLE_IN_CLAUSE_LIMIT = 900
 
-IMAGE_EXTS = {'jpg', 'jpeg', 'png', 'gif', 'bmp', 'tif', 'tiff', 'webp', 'heic', 'ico', 'jfif'}
-VIDEO_EXTS = {'mp4', 'mov', 'avi', 'mkv', 'wmv', 'flv', 'webm', 'm4v', '3gp', 'ts', 'mts', '3g2'}
+IMAGE_EXTS = {'jpg', 'jpeg', 'png', 'gif', 'bmp', 'tif', 'tiff', 'webp', 'heic', 'heif', 'ico', 'jfif'}
+VIDEO_EXTS = {'mp4', 'mov', 'avi', 'mkv', 'wmv', 'flv', 'webm', 'm4v', '3gp', 'ts', 'mts', '3g2', 'hevc'}
 PDF_EXTS = {'pdf', 'doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx', 'txt', 'rtf', 'csv', 'zip', 'rar', '7z'}
 
-DOC_IMAGE_EXTS = {'jpg', 'jpeg', 'png', 'gif', 'bmp', 'tif', 'tiff', 'webp', 'heic'}
-DOC_VIDEO_EXTS = {'mp4', 'mov', 'avi', 'wmv', 'mkv', 'flv', 'webm', '3gp'}
+DOC_IMAGE_EXTS = {'jpg', 'jpeg', 'png', 'gif', 'bmp', 'tif', 'tiff', 'webp', 'heic', 'heif'}
+DOC_VIDEO_EXTS = {'mp4', 'mov', 'avi', 'wmv', 'mkv', 'flv', 'webm', '3gp', 'm4v', 'hevc'}
 DOC_PDF_EXTS = {'pdf'}
 DOC_WORD_EXTS = {'doc', 'docx'}
 DOC_EXCEL_EXTS = {'xls', 'xlsx', 'ods', 'xlsm'}
@@ -246,10 +251,10 @@ async def get_media_info_from_dms(dst, doc_number):
         if media_type == 'file':
             video_extensions = [
                 '.mp4', '.mov', '.avi', '.mkv', '.wmv', '.flv', '.webm',
-                '.m4v', '.3gp', '.mts', '.ts', '.3g2'
+                '.m4v', '.3gp', '.mts', '.ts', '.3g2', '.hevc'
             ]
             pdf_extensions = ['.pdf']
-            image_extensions = ['.jpg', '.jpeg', '.png', '.gif', '.bmp', '.tif', '.tiff', '.webp', '.heic']
+            image_extensions = ['.jpg', '.jpeg', '.png', '.gif', '.bmp', '.tif', '.tiff', '.webp', '.heic', '.heif']
             text_extensions = ['.txt', '.csv', '.json', '.xml', '.log', '.md', '.yml', '.yaml', '.ini', '.conf']
             excel_extensions = ['.xls', '.xlsx', '.ods', '.xlsm']
             ppt_extensions = ['.ppt', '.pptx', '.odp', '.pps', '.ppsx']

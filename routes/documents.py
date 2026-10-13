@@ -439,6 +439,37 @@ async def get_document_file(docnumber: int, request: Request, user=Depends(get_c
         if not file_bytes:
             raise HTTPException(status_code=404, detail="Document not found")
 
+        # For HEIC/HEIF images viewed inline in browser, standard browsers (Chrome/Edge/Firefox)
+        # cannot decode HEIF natively. Convert to high-quality JPEG on-the-fly using pillow_heif.
+        clean_ext = (file_ext or '').lower().replace('.', '')
+        if disposition == 'inline' and clean_ext in ('heic', 'heif'):
+            preview_cache_path = os.path.join(db_connector.thumbnail_cache_dir, f"preview_{docnumber}.jpg")
+            if os.path.exists(preview_cache_path):
+                return FileResponse(
+                    preview_cache_path,
+                    media_type="image/jpeg",
+                    headers={
+                        "Content-Disposition": build_content_disposition(f"{os.path.splitext(filename)[0]}.jpg", disposition),
+                        "Access-Control-Expose-Headers": "Content-Disposition",
+                        "Accept-Ranges": "bytes"
+                    }
+                )
+            try:
+                from PIL import Image as PILImage
+                with PILImage.open(io.BytesIO(file_bytes)) as pil_img:
+                    pil_img.convert("RGB").save(preview_cache_path, "JPEG", quality=95)
+                    return FileResponse(
+                        preview_cache_path,
+                        media_type="image/jpeg",
+                        headers={
+                            "Content-Disposition": build_content_disposition(f"{os.path.splitext(filename)[0]}.jpg", disposition),
+                            "Access-Control-Expose-Headers": "Content-Disposition",
+                            "Accept-Ranges": "bytes"
+                        }
+                    )
+            except Exception as conv_err:
+                logging.warning(f"Failed to convert {file_ext} to JPEG for inline display (doc {docnumber}): {conv_err}")
+
         return StreamingResponse(
             io.BytesIO(file_bytes),
             media_type=mimetype,

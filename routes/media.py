@@ -34,7 +34,17 @@ async def api_get_image(doc_id: int, user=Depends(get_current_user)):
 
     image_data = await db_connector.get_media_content_from_dms_async(dst, doc_id)
     if image_data:
-        return Response(content=bytes(image_data), media_type='image/jpeg')
+        data_bytes = bytes(image_data)
+        try:
+            from PIL import Image as PILImage
+            with PILImage.open(io.BytesIO(data_bytes)) as pil_img:
+                if getattr(pil_img, 'format', None) in ('HEIF', 'HEIC'):
+                    out_io = io.BytesIO()
+                    pil_img.convert("RGB").save(out_io, format="JPEG", quality=95)
+                    return Response(content=out_io.getvalue(), media_type='image/jpeg')
+        except Exception as e:
+            logging.debug(f"Pillow check/conversion in api_get_image for doc {doc_id}: {e}")
+        return Response(content=data_bytes, media_type='image/jpeg')
     raise HTTPException(status_code=404, detail='Image not found in EDMS.')
 
 @router.get('/api/pdf/{doc_id}')

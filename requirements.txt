@@ -16,3 +16,4 @@ marshmallow>=3.26.1
 posthog>=5.4.0
 slowapi>=0.1.9
 starlette>=0.48.0
+pillow-heif>=1.0.0

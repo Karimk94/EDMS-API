@@ -603,9 +603,9 @@ def parse_binary_result_buffer(buffer):
             'pdf': 'pdf', 'doc': 'pdf', 'docx': 'pdf', 'txt': 'pdf', 'xls': 'pdf', 'xlsx': 'pdf', 'ppt': 'pdf',
             'pptx': 'pdf',
             'jpg': 'image', 'jpeg': 'image', 'png': 'image', 'gif': 'image', 'bmp': 'image', 'tif': 'image',
-            'tiff': 'image', 'webp': 'image',
+            'tiff': 'image', 'webp': 'image', 'heic': 'image', 'heif': 'image',
             'mp4': 'video', 'mov': 'video', 'avi': 'video', 'wmv': 'video', 'mkv': 'video', 'flv': 'video',
-            'webm': 'video', '3gp': 'video'
+            'webm': 'video', '3gp': 'video', 'm4v': 'video', 'hevc': 'video'
         }
 
         i = 0

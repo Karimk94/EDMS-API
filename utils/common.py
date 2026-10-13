@@ -16,11 +16,17 @@ def get_mimetype_for_media(media_type: str, file_ext: str = '') -> tuple[str, st
     Returns (mimetype, disposition) for a given media_type and file extension.
     Centralizes MIME logic that was previously duplicated in 3+ route handlers.
     """
-    ext_clean = file_ext.replace('.', '') if file_ext else ''
+    ext_clean = file_ext.replace('.', '').lower() if file_ext else ''
+    video_mime = 'video/mp4'
+    if ext_clean == 'mov':
+        video_mime = 'video/quicktime'
+    elif ext_clean in ('webm', 'avi', 'mkv', 'flv', 'wmv', '3gp'):
+        video_mime = f'video/{ext_clean}'
+
     mapping = {
         'pdf': ('application/pdf', 'inline'),
         'image': (f'image/{ext_clean}' if ext_clean else 'image/jpeg', 'inline'),
-        'video': (f'video/{ext_clean}' if ext_clean else 'video/mp4', 'inline'),
+        'video': (video_mime, 'inline'),
         'text': ('text/plain', 'inline'),
         'zip': ('application/zip', 'attachment'),
         'excel': ('application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', 'attachment'),

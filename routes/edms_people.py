@@ -1,5 +1,5 @@
 from fastapi import APIRouter, HTTPException, Request, Query, Depends
-from typing import List, Optional, Any, Dict
+from typing import List, Optional, Any, Dict, Union
 from pydantic import BaseModel
 from routes.ems_admin import check_admin_access
 from database import edms_people
@@ -16,7 +16,7 @@ class EdmsUserCreate(BaseModel):
     primary_group: int
     allow_login: str
     disabled: str
-    secid: int
+    secid: Optional[Union[int, str]] = 0
     additional_groups: List[int]
     network_aliases: List[str]
     hr_login: Optional[str] = None
@@ -30,7 +30,7 @@ class EdmsUserUpdate(BaseModel):
     primary_group: int
     allow_login: str
     disabled: str
-    secid: int
+    secid: Optional[Union[int, str]] = None
     additional_groups: List[int]
     network_aliases: List[str]
 

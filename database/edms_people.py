@@ -1,5 +1,5 @@
 import logging
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Union
 import db_connector
 import hashlib
 import base64
@@ -416,13 +416,13 @@ async def update_edms_person(
     system_id: int,
     full_name: str,
     email: str,
-    password_plain: str,
-    primary_group: int,
-    allow_login: str,
-    disabled: str,
-    secid: int,
-    additional_groups: List[int],
-    network_aliases: List[str]
+    password_plain: Optional[str] = None,
+    primary_group: int = 0,
+    allow_login: str = "Y",
+    disabled: str = "N",
+    secid: Optional[Union[int, str]] = None,
+    additional_groups: Optional[List[int]] = None,
+    network_aliases: Optional[List[str]] = None
 ) -> tuple[bool, str]:
     """Update an existing user in EDMS (PEOPLE, PEOPLEGROUPS, NETWORK_ALIASES)."""
     connection = None
@@ -430,23 +430,52 @@ async def update_edms_person(
         connection = await db_connector.get_async_connection()
 
         with connection.cursor() as cursor:
+            # Check existing SECID - do not overwrite if it already has a value
+            await cursor.execute("SELECT SECID FROM PEOPLE WHERE SYSTEM_ID = :1", [system_id])
+            user_row = await cursor.fetchone()
+            if not user_row:
+                return False, f"User with SYSTEM_ID {system_id} not found."
+
+            existing_secid = user_row[0]
+            has_existing_secid = (
+                existing_secid is not None
+                and str(existing_secid).strip() != ""
+                and str(existing_secid).strip() != "0"
+            )
+
+            if has_existing_secid:
+                final_secid = existing_secid
+                logging.info(
+                    f"User {system_id} already has SECID={existing_secid}; preserving existing SECID."
+                )
+            else:
+                final_secid = secid
+
             if password_plain:
                 await cursor.execute("""
                     UPDATE PEOPLE SET
                         FULL_NAME = :1, EMAIL_ADDRESS = :2, USER_PASSWORD = :3,
                         ALLOW_LOGIN = :4, DISABLED = :5, PRIMARY_GROUP = :6,
-                        SECID = :7, LAST_UPDATE = SYSDATE
+                        SECID = CASE
+                            WHEN SECID IS NOT NULL AND TRIM(TO_CHAR(SECID)) NOT IN ('', '0') THEN SECID
+                            ELSE :7
+                        END,
+                        LAST_UPDATE = SYSDATE
                     WHERE SYSTEM_ID = :8
                 """, [full_name, email, hash_password(password_plain),
-                      allow_login, disabled, primary_group, secid, system_id])
+                      allow_login, disabled, primary_group, final_secid, system_id])
             else:
                 await cursor.execute("""
                     UPDATE PEOPLE SET
                         FULL_NAME = :1, EMAIL_ADDRESS = :2,
                         ALLOW_LOGIN = :3, DISABLED = :4, PRIMARY_GROUP = :5,
-                        SECID = :6, LAST_UPDATE = SYSDATE
+                        SECID = CASE
+                            WHEN SECID IS NOT NULL AND TRIM(TO_CHAR(SECID)) NOT IN ('', '0') THEN SECID
+                            ELSE :6
+                        END,
+                        LAST_UPDATE = SYSDATE
                     WHERE SYSTEM_ID = :7
-                """, [full_name, email, allow_login, disabled, primary_group, secid, system_id])
+                """, [full_name, email, allow_login, disabled, primary_group, final_secid, system_id])
 
             # Rebuild groups
             await cursor.execute("DELETE FROM PEOPLEGROUPS WHERE PEOPLE_SYSTEM_ID = :1", [system_id])
