@@ -4,6 +4,8 @@ from pydantic import BaseModel
 import logging
 import oracledb
 import re
+from collections import deque
+from datetime import datetime
 import wsdl_client
 from wsdl_client.auth import dms_system_login
 from wsdl_client.documents import force_checkin_document_soap
@@ -20,6 +22,24 @@ from services.processing_queue import processing_queue, set_worker_paused, is_wo
 import db_connector
 
 router = APIRouter()
+
+# ---------------------------------------------------------------------------
+# Oracle Session Monitor — Pydantic models
+# ---------------------------------------------------------------------------
+class OracleKillRequest(BaseModel):
+    sid: int
+    serial: int
+
+class OracleKillBatchRequest(BaseModel):
+    targets: List[dict]
+    reason: Optional[str] = "filtered-bulk-kill"
+
+class OracleKillAllRequest(BaseModel):
+    threshold_minutes: int = 0
+    idle_threshold_minutes: int = 60
+
+# In-memory audit log of killed Oracle sessions (last 500 entries)
+_oracle_kill_log: deque = deque(maxlen=500)
 
 # Allowlist of usernames that can access admin panel regardless of security level
 # Add usernames in lowercase
@@ -813,3 +833,175 @@ async def force_checkin_documents(
         "failed": failed,
         "total": len(results),
     }
+
+
+# =============================================================================
+# Oracle Session Monitor — Routes
+# =============================================================================
+
+@router.get("/api/admin/oracle-sessions")
+async def get_oracle_sessions(request: Request):
+    """
+    Returns all active Oracle user sessions from V$SESSION with timing info.
+    Requires admin access.
+    """
+    if not check_admin_access(request):
+        raise HTTPException(status_code=403, detail="Access denied. Admin privileges required.")
+
+    try:
+        sessions = await admin_db.get_oracle_sessions()
+        return {"sessions": sessions, "total": len(sessions)}
+    except Exception as ex:
+        logging.error(f"[OracleSessions] Error fetching sessions: {ex}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Failed to query Oracle sessions: {ex}")
+
+
+@router.post("/api/admin/oracle-sessions/kill")
+async def kill_oracle_session_route(request: Request, body: OracleKillRequest):
+    """
+    Kill a specific Oracle session by SID and SERIAL#.
+    Requires admin access. Action is logged to in-memory audit log.
+    """
+    if not check_admin_access(request):
+        raise HTTPException(status_code=403, detail="Access denied. Admin privileges required.")
+
+    user_info = request.session.get("user", {})
+    killed_by = user_info.get("username", getattr(request.client, "host", "unknown"))
+
+    try:
+        result = await admin_db.kill_oracle_session(body.sid, body.serial)
+    except Exception as ex:
+        logging.error(f"[OracleKill] Failed SID={body.sid}: {ex}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Database error killing session: {ex}")
+
+    log_entry = {
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "sid": body.sid,
+        "serial": body.serial,
+        "killed_by": killed_by,
+        "reason": "manual",
+        "success": result["success"],
+        "message": result["message"],
+    }
+    _oracle_kill_log.appendleft(log_entry)
+    admin_db.record_oracle_kill_audit(log_entry)
+
+    if not result["success"]:
+        raise HTTPException(status_code=500, detail=result["message"])
+    return result
+
+
+@router.post("/api/admin/oracle-sessions/kill-batch")
+async def kill_oracle_sessions_batch_route(request: Request, body: OracleKillBatchRequest):
+    """
+    Kill an explicit list of Oracle sessions (e.g. filtered by machine, user, or selection).
+    Requires admin access. Each kill is audited to persistent storage.
+    """
+    if not check_admin_access(request):
+        raise HTTPException(status_code=403, detail="Access denied. Admin privileges required.")
+
+    if not body.targets:
+        return {"killed": 0, "failed": 0, "total": 0, "results": [], "message": "No session targets provided."}
+
+    user_info = request.session.get("user", {})
+    killed_by = user_info.get("username", getattr(request.client, "host", "unknown"))
+
+    try:
+        results = await admin_db.kill_oracle_sessions_batch(body.targets, killed_by=killed_by)
+    except Exception as ex:
+        logging.error(f"[OracleKill] Batch error: {ex}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Failed to kill batch: {ex}")
+
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    for r in results:
+        entry = {
+            "timestamp": now_str,
+            "sid": r["sid"],
+            "serial": r["serial"],
+            "username": r.get("username"),
+            "machine": r.get("machine"),
+            "program": r.get("program"),
+            "minutes_connected": r.get("minutes_connected"),
+            "minutes_idle": r.get("minutes_idle"),
+            "killed_by": killed_by,
+            "reason": body.reason or "filtered-bulk-kill",
+            "success": r["success"],
+            "message": r["message"],
+        }
+        _oracle_kill_log.appendleft(entry)
+        admin_db.record_oracle_kill_audit(entry)
+
+    killed = sum(1 for r in results if r["success"])
+    failed = len(results) - killed
+    logging.warning(f"[OracleKill] Batch: {killed}/{len(results)} killed by {killed_by}")
+
+    return {
+        "killed": killed,
+        "failed": failed,
+        "total": len(results),
+        "results": results,
+        "message": f"Successfully killed {killed} of {len(results)} session(s)." if failed == 0 else f"Killed {killed} session(s), {failed} failed.",
+    }
+
+
+@router.post("/api/admin/oracle-sessions/kill-all-long")
+async def kill_all_long_oracle_sessions(request: Request, body: OracleKillAllRequest):
+    """
+    Kill all inactive Oracle sessions idle longer than body.idle_threshold_minutes.
+    Requires admin access.
+    """
+    if not check_admin_access(request):
+        raise HTTPException(status_code=403, detail="Access denied. Admin privileges required.")
+
+    user_info = request.session.get("user", {})
+    killed_by = user_info.get("username", getattr(request.client, "host", "unknown"))
+
+    try:
+        results = await admin_db.kill_long_oracle_sessions(
+            threshold_minutes=body.threshold_minutes,
+            idle_threshold_minutes=body.idle_threshold_minutes,
+        )
+    except Exception as ex:
+        logging.error(f"[OracleKill] Error during bulk kill: {ex}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Failed to kill idle sessions: {ex}")
+
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    for r in results:
+        entry = {
+            "timestamp": now_str,
+            "sid": r["sid"],
+            "serial": r["serial"],
+            "username": r.get("username"),
+            "machine": r.get("machine"),
+            "program": r.get("program"),
+            "minutes_connected": r.get("minutes_connected"),
+            "minutes_idle": r.get("minutes_idle"),
+            "killed_by": killed_by,
+            "reason": "bulk-kill-idle",
+            "success": r["success"],
+            "message": r["message"],
+        }
+        _oracle_kill_log.appendleft(entry)
+        admin_db.record_oracle_kill_audit(entry)
+
+    killed = sum(1 for r in results if r["success"])
+    failed = len(results) - killed
+    logging.warning(f"[OracleKill] Bulk: {killed}/{len(results)} killed by {killed_by}")
+
+    return {
+        "killed": killed,
+        "failed": failed,
+        "total": len(results),
+        "message": f"Killed {killed}/{len(results)} abandoned inactive sessions (idle >= {body.idle_threshold_minutes} min)." if results else "No idle inactive sessions found to kill.",
+    }
+
+
+@router.get("/api/admin/oracle-sessions/kill-log")
+async def get_oracle_kill_log(request: Request):
+    """Returns persistent audit log of killed Oracle sessions."""
+    if not check_admin_access(request):
+        raise HTTPException(status_code=403, detail="Access denied. Admin privileges required.")
+
+    logs = admin_db.get_oracle_kill_audit_logs()
+    return {"log": logs}
+

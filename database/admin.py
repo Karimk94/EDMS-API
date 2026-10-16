@@ -1,5 +1,8 @@
 import oracledb
 import logging
+import os
+import json
+import re
 from datetime import datetime, timezone, timedelta
 from database.connection import get_async_connection
 
@@ -793,3 +796,322 @@ async def fetch_checked_out_docs(days: int = 1, date_from: str = None, date_to: 
     finally:
         if conn:
             await conn.close()
+
+
+# =============================================================================
+# Oracle Session Management
+# =============================================================================
+ORACLE_SESSION_QUERY = """
+SELECT
+    s.SID,
+    s.SERIAL#,
+    s.STATUS,
+    s.USERNAME,
+    s.SCHEMANAME,
+    s.OSUSER,
+    s.MACHINE,
+    s.PROGRAM,
+    s.MODULE,
+    s.ACTION,
+    s.SQL_ID,
+    s.EVENT,
+    s.WAIT_CLASS,
+    s.SECONDS_IN_WAIT,
+    s.STATE,
+    TO_CHAR(s.LOGON_TIME, 'YYYY-MM-DD HH24:MI:SS') AS LOGON_TIME,
+    ROUND((SYSDATE - s.LOGON_TIME) * 24 * 60, 2)   AS MINUTES_CONNECTED,
+    s.LAST_CALL_ET                                 AS SECONDS_IDLE,
+    ROUND(s.LAST_CALL_ET / 60.0, 2)              AS MINUTES_IDLE,
+    s.BLOCKING_SESSION,
+    s.BLOCKING_INSTANCE,
+    s.CLIENT_INFO,
+    s.SERVICE_NAME
+FROM V$SESSION s
+WHERE s.TYPE = 'USER'
+  AND s.USERNAME IS NOT NULL
+ORDER BY MINUTES_CONNECTED DESC NULLS LAST
+FETCH FIRST 500 ROWS ONLY
+"""
+
+
+async def get_oracle_sessions() -> list:
+    """Fetches user sessions from V$SESSION with connection and idle timing metrics."""
+    conn = await get_async_connection()
+    if not conn:
+        return []
+    try:
+        async with conn.cursor() as cursor:
+            await cursor.execute(ORACLE_SESSION_QUERY)
+            cols = [d[0] for d in cursor.description]
+            rows = await cursor.fetchall()
+            results = []
+            for row in rows:
+                d = {}
+                for col, val in zip(cols, row):
+                    if val is None:
+                        d[col] = None
+                    elif hasattr(val, "strftime"):
+                        d[col] = val.strftime("%Y-%m-%d %H:%M:%S")
+                    else:
+                        d[col] = val
+                results.append(d)
+            return results
+    finally:
+        if conn:
+            await conn.close()
+
+
+async def kill_oracle_session(sid: int, serial: int) -> dict:
+    """Issues ALTER SYSTEM KILL SESSION IMMEDIATE on the specified Oracle session."""
+    conn = await get_async_connection()
+    if not conn:
+        raise Exception("Database connection unavailable")
+    success = False
+    message = ""
+    try:
+        async with conn.cursor() as cursor:
+            await cursor.execute(f"ALTER SYSTEM KILL SESSION '{sid},{serial}' IMMEDIATE")
+        await conn.commit()
+        success = True
+        message = f"Session SID={sid} SERIAL#={serial} killed successfully."
+    except oracledb.Error as ex:
+        err, = ex.args
+        if err.code == 31:  # ORA-00031: session marked for kill
+            success = True
+            message = f"Session SID={sid} SERIAL#={serial} marked for kill (ORA-00031)."
+        elif err.code == 30:  # ORA-00030: User session does not exist
+            success = True
+            message = f"Session SID={sid} SERIAL#={serial} already terminated (ORA-00030)."
+        else:
+            message = f"ORA-{err.code:05d}: {err.message}"
+            logging.error(f"[OracleKill] Failed SID={sid}: {message}")
+    except Exception as ex:
+        message = str(ex)
+        logging.error(f"[OracleKill] Unexpected error SID={sid}: {message}")
+    finally:
+        if conn:
+            await conn.close()
+    return {"success": success, "message": message, "sid": sid, "serial": serial}
+
+
+async def kill_long_oracle_sessions(threshold_minutes: int = 0, idle_threshold_minutes: int = 60) -> list:
+    """
+    Finds and terminates user sessions that exceed the idle threshold (default: >= 60 min)
+    and optional connection threshold. Only terminates INACTIVE sessions and excludes system users.
+    Returns a list of result dictionaries with session details and termination outcome.
+    """
+    conn = await get_async_connection()
+    if not conn:
+        raise Exception("Database connection unavailable")
+
+    results = []
+    try:
+        targets = []
+        async with conn.cursor() as cursor:
+            await cursor.execute(ORACLE_SESSION_QUERY)
+            cols = [d[0] for d in cursor.description]
+            rows = await cursor.fetchall()
+            for row in rows:
+                d = {col: val for col, val in zip(cols, row)}
+                mins_conn = d.get("MINUTES_CONNECTED") or 0.0
+                mins_idle = d.get("MINUTES_IDLE") or 0.0
+                status = (d.get("STATUS") or "").upper()
+                username = (d.get("USERNAME") or "").upper()
+
+                # Safety: Exclude core Oracle system schemas
+                if username in ("SYS", "SYSTEM", "DBSNMP", "SYSMAN", "AUDSYS", "OUTLN", "WMSYS", "XDB"):
+                    continue
+
+                # Filter: Must meet idle criteria (and connection duration if specified)
+                # Only target INACTIVE sessions to safeguard in-flight transactions
+                idle_ok = mins_idle >= idle_threshold_minutes if idle_threshold_minutes > 0 else True
+                conn_ok = mins_conn >= threshold_minutes if threshold_minutes > 0 else True
+
+                if idle_ok and conn_ok and status == "INACTIVE":
+                    targets.append(d)
+
+        for s in targets:
+            sid = s["SID"]
+            serial = s["SERIAL#"]
+            success = False
+            message = ""
+            try:
+                async with conn.cursor() as cursor:
+                    await cursor.execute(f"ALTER SYSTEM KILL SESSION '{sid},{serial}' IMMEDIATE")
+                await conn.commit()
+                success = True
+                message = f"Session SID={sid} SERIAL#={serial} killed successfully."
+            except oracledb.Error as ex:
+                err, = ex.args
+                if err.code in (30, 31):
+                    success = True
+                    message = f"Session SID={sid} SERIAL#={serial} marked for kill or already terminated (ORA-{err.code:05d})."
+                else:
+                    message = f"ORA-{err.code:05d}: {err.message}"
+                    logging.error(f"[OracleKill] Failed SID={sid}: {message}")
+            except Exception as ex:
+                message = str(ex)
+                logging.error(f"[OracleKill] Unexpected error SID={sid}: {message}")
+
+            results.append({
+                "sid": sid,
+                "serial": serial,
+                "username": s.get("USERNAME"),
+                "machine": s.get("MACHINE"),
+                "program": s.get("PROGRAM"),
+                "minutes_connected": s.get("MINUTES_CONNECTED"),
+                "minutes_idle": s.get("MINUTES_IDLE"),
+                "success": success,
+                "message": message,
+            })
+    finally:
+        if conn:
+            await conn.close()
+    return results
+
+
+async def kill_oracle_sessions_batch(targets: list, killed_by: str = "admin") -> list:
+    """
+    Terminates a specific list of session targets [{sid, serial, ...}] in a single connection.
+    Returns result dictionaries with status for each session.
+    """
+    if not targets:
+        return []
+
+    conn = await get_async_connection()
+    if not conn:
+        raise Exception("Database connection unavailable")
+
+    results = []
+    try:
+        for t in targets:
+            sid = t.get("sid") or t.get("SID")
+            serial = t.get("serial") or t.get("SERIAL#")
+            if not sid or not serial:
+                continue
+
+            success = False
+            message = ""
+            try:
+                async with conn.cursor() as cursor:
+                    await cursor.execute(f"ALTER SYSTEM KILL SESSION '{sid},{serial}' IMMEDIATE")
+                await conn.commit()
+                success = True
+                message = f"Session SID={sid} SERIAL#={serial} killed successfully."
+            except oracledb.Error as ex:
+                err, = ex.args
+                if err.code in (30, 31):
+                    success = True
+                    message = f"Session SID={sid} SERIAL#={serial} marked for kill or already terminated (ORA-{err.code:05d})."
+                else:
+                    message = f"ORA-{err.code:05d}: {err.message}"
+                    logging.error(f"[OracleKill] Failed SID={sid}: {message}")
+            except Exception as ex:
+                message = str(ex)
+                logging.error(f"[OracleKill] Unexpected error SID={sid}: {message}")
+
+            results.append({
+                "sid": sid,
+                "serial": serial,
+                "username": t.get("username") or t.get("USERNAME"),
+                "machine": t.get("machine") or t.get("MACHINE"),
+                "program": t.get("program") or t.get("PROGRAM"),
+                "minutes_connected": t.get("minutes_connected") or t.get("MINUTES_CONNECTED"),
+                "minutes_idle": t.get("minutes_idle") or t.get("MINUTES_IDLE"),
+                "success": success,
+                "message": message,
+            })
+    finally:
+        if conn:
+            await conn.close()
+    return results
+
+
+# Persistent kill audit log file
+_ORACLE_KILL_LOG_FILE = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "logs", "oracle_kills.jsonl"
+)
+
+
+def record_oracle_kill_audit(entry: dict):
+    """Persists a kill audit log entry to logs/oracle_kills.jsonl."""
+    try:
+        log_dir = os.path.dirname(_ORACLE_KILL_LOG_FILE)
+        os.makedirs(log_dir, exist_ok=True)
+        with open(_ORACLE_KILL_LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry) + "\n")
+    except Exception as ex:
+        logging.error(f"[OracleKillAudit] Error persisting log entry: {ex}")
+
+
+def get_oracle_kill_audit_logs(limit: int = 500) -> list:
+    """
+    Loads persisted kill audit records from logs/oracle_kills.jsonl and
+    parses any available oracle_kill_sessions.log from scheduled runs.
+    """
+    entries = []
+
+    # 1. Read structured JSONL records
+    if os.path.exists(_ORACLE_KILL_LOG_FILE):
+        try:
+            with open(_ORACLE_KILL_LOG_FILE, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        try:
+                            entries.append(json.loads(line))
+                        except Exception:
+                            pass
+        except Exception as ex:
+            logging.error(f"[OracleKillAudit] Error reading log file: {ex}")
+
+    # 2. Check for scheduled utility text logs (from edms_oracle_kill_sessions.exe)
+    candidates = [
+        os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "logs", "oracle_kill_sessions.log"),
+        os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "..", "Oracle Session Monitor", "logs", "oracle_kill_sessions.log"),
+        r"C:\EDMS\EDMS Oracle Kill Sessions\logs\oracle_kill_sessions.log",
+    ]
+    seen_keys = {f"{e.get('timestamp')}_{e.get('sid')}_{e.get('serial')}" for e in entries}
+
+    for log_path in candidates:
+        if os.path.exists(log_path):
+            try:
+                with open(log_path, "r", encoding="utf-8", errors="ignore") as f:
+                    for line in f:
+                        if "[KILLED]" in line or "[FAILED]" in line:
+                            match = re.search(
+                                r"(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}).*?\[(KILLED|FAILED)\]\s+SID=(\d+)\s+SERIAL#=(\d+)(?:\s+USER=([^\s]+))?.*?(?:->\s*(.*))?$",
+                                line
+                            )
+                            if match:
+                                ts = match.group(1)
+                                is_killed = match.group(2) == "KILLED"
+                                sid = int(match.group(3))
+                                serial = int(match.group(4))
+                                user = match.group(5) or "UNKNOWN"
+                                msg = (match.group(6) or "").strip() or ("Session killed." if is_killed else "Failed to kill session.")
+
+                                key = f"{ts}_{sid}_{serial}"
+                                if key not in seen_keys:
+                                    seen_keys.add(key)
+                                    entries.append({
+                                        "timestamp": ts,
+                                        "sid": sid,
+                                        "serial": serial,
+                                        "username": user,
+                                        "machine": "SERVER",
+                                        "program": "Task Scheduler (.exe)",
+                                        "killed_by": "Scheduler Job",
+                                        "reason": "scheduled-job",
+                                        "success": is_killed,
+                                        "message": msg,
+                                    })
+            except Exception as ex:
+                logging.debug(f"Could not parse external log {log_path}: {ex}")
+
+    # Sort descending by timestamp
+    entries.sort(key=lambda x: x.get("timestamp") or "", reverse=True)
+    return entries[:limit]
+
+
+
