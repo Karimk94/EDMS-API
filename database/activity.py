@@ -46,7 +46,9 @@ async def ensure_activity_types():
 async def get_or_create_viewer_person(viewer_email: str) -> int:
     """
     Returns the PEOPLE.SYSTEM_ID for the shared link viewer.
-    The name is formatted as "<HR Full Name of DMS_USER> (<viewer_email>)".
+    The name is formatted as "<viewer_email> (via service account <DMS_USER>)"
+    so the document history clearly shows both the service account used to
+    access the DMS and the RTA user (email) that actually viewed/downloaded.
     If it doesn't exist, it is created.
     """
     connection = None
@@ -55,7 +57,17 @@ async def get_or_create_viewer_person(viewer_email: str) -> int:
         
         connection = await get_async_connection()
         with connection.cursor() as cursor:
-            # 1. Get Full Name of DMS_USER from HR table
+            # 0. Reuse an existing viewer entry for this email (any naming format)
+            #    so history stays consistent across format changes.
+            await cursor.execute(
+                "SELECT SYSTEM_ID FROM PEOPLE WHERE UPPER(USER_ID) = UPPER(:1) AND ALLOW_LOGIN = 'N'",
+                [viewer_email[:50]]
+            )
+            row = await cursor.fetchone()
+            if row:
+                return row[0]
+
+            # 1. Get Full Name of DMS_USER from HR table (for context in the name)
             await cursor.execute(
                 "SELECT FULLNAME_EN FROM LKP_HR_EMPLOYEES WHERE UPPER(LOGIN) = UPPER(:1) FETCH FIRST 1 ROW ONLY",
                 [dms_user]
@@ -63,8 +75,9 @@ async def get_or_create_viewer_person(viewer_email: str) -> int:
             row = await cursor.fetchone()
             dms_full_name = row[0] if row else dms_user
             
-            # Format the virtual user's full name
-            virtual_full_name = f"{dms_full_name} ({viewer_email})"
+            # Format the virtual user's full name so the history shows that the
+            # document was accessed with the service account by the RTA user.
+            virtual_full_name = f"{viewer_email} (via service account {dms_user} - {dms_full_name})"
             
             # 2. Check if this virtual person already exists in PEOPLE
             await cursor.execute(

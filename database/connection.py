@@ -48,10 +48,14 @@ def _get_sync_pool():
         if not all([user, password, dsn]):
             raise DatabaseConnectionError("Database connection details missing in environment variables.")
         try:
+            min_conn = int(os.getenv('DB_POOL_MIN_SYNC', '1'))
+            max_conn = int(os.getenv('DB_POOL_MAX_SYNC', '10'))
+            inc = int(os.getenv('DB_POOL_INC_SYNC', '1'))
+            timeout = int(os.getenv('DB_POOL_TIMEOUT', '120'))
             _sync_pool = oracledb.create_pool(
                 user=user, password=password, dsn=dsn,
-                min=5, max=50, increment=5,
-                timeout=120, getmode=oracledb.POOL_GETMODE_TIMEDWAIT, wait_timeout=30000
+                min=min_conn, max=max_conn, increment=inc,
+                timeout=timeout, getmode=oracledb.POOL_GETMODE_TIMEDWAIT, wait_timeout=30000
             )
         except oracledb.Error as ex:
             error, = ex.args
@@ -68,10 +72,14 @@ async def _get_async_pool():
         if not all([user, password, dsn]):
             raise DatabaseConnectionError("Database connection details missing in environment variables.")
         try:
+            min_conn = int(os.getenv('DB_POOL_MIN_ASYNC', '2'))
+            max_conn = int(os.getenv('DB_POOL_MAX_ASYNC', '20'))
+            inc = int(os.getenv('DB_POOL_INC_ASYNC', '2'))
+            timeout = int(os.getenv('DB_POOL_TIMEOUT', '120'))
             _async_pool = oracledb.create_pool_async(
                 user=user, password=password, dsn=dsn,
-                min=5, max=50, increment=5,
-                timeout=120, getmode=oracledb.POOL_GETMODE_TIMEDWAIT, wait_timeout=30000
+                min=min_conn, max=max_conn, increment=inc,
+                timeout=timeout, getmode=oracledb.POOL_GETMODE_TIMEDWAIT, wait_timeout=30000
             )
         except oracledb.Error as ex:
             error, = ex.args

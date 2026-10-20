@@ -417,6 +417,14 @@ async def get_shared_folder_contents(
         folder_info = await folders_db.get_folder_by_id(current_folder_id)
         contents = await folders_db.get_folder_contents(current_folder_id)
 
+        # Log the view activity so the folder's history shows who browsed it
+        try:
+            viewer_sys_id = await get_or_create_viewer_person(viewer_email)
+            if viewer_sys_id:
+                await log_activity(int(current_folder_id), 'View Shared Link', viewer_sys_id)
+        except Exception as e:
+            logging.error(f"Failed to log folder view activity: {e}")
+
         # Build breadcrumb path
         breadcrumbs = await folders_db.build_breadcrumb_path(root_folder_id, current_folder_id)
 
@@ -438,7 +446,8 @@ async def get_shared_folder_contents(
 @router.get('/api/share/stream/{token}')
 async def stream_shared_document(
         token: str,
-        req: SharedDocumentDownloadRequest = Depends()
+        req: SharedDocumentDownloadRequest = Depends(),
+        request: Request = None
 ):
     """
     Streams a shared document without watermark for viewing.
@@ -493,6 +502,19 @@ async def stream_shared_document(
         if file_ext and not filename.lower().endswith(file_ext.lower()):
             filename = f"{filename}{file_ext}"
 
+        # Log the view activity for inline viewing via the shared link.
+        # Skip follow-up Range requests from video players so playback does not
+        # flood the history; only the initial request is logged.
+        range_header = (request.headers.get('range') if request else None) or ''
+        range_header = range_header.replace(' ', '')
+        if not range_header or range_header.startswith('bytes=0-'):
+            try:
+                viewer_sys_id = await get_or_create_viewer_person(viewer_email)
+                if viewer_sys_id:
+                    await log_activity(int(document_id), 'View Shared Link', viewer_sys_id)
+            except Exception as e:
+                logging.error(f"Failed to log stream view activity: {e}")
+
         # 7. For Video: Cache RAW (no watermark) and serve FileResponse
         if media_type == 'video':
             # Create a separate cache for raw shared videos
@@ -546,7 +568,8 @@ async def stream_shared_document(
 @router.get('/api/share/download/{token}')
 async def download_shared_document(
         token: str,
-        req: SharedDocumentDownloadRequest = Depends()
+        req: SharedDocumentDownloadRequest = Depends(),
+        request: Request = None
 ):
     """
     Downloads a shared document after OTP verification.
@@ -702,13 +725,17 @@ async def download_shared_document(
             mimetype, _ = get_mimetype_for_media(media_type, file_ext)
 
         # 9. Log the download
-        await sharing_db.log_share_access(share_info['share_id'], viewer_email)
-        try:
-            viewer_sys_id = await get_or_create_viewer_person(viewer_email)
-            if viewer_sys_id:
-                await log_activity(int(document_id), 'Download', viewer_sys_id)
-        except Exception as e:
-            logging.error(f"Failed to log download activity: {e}")
+        # Skip the 'bytes=0-0' probe request the frontend restore flow sends
+        # before the real download, so each view is logged only once.
+        range_header = (request.headers.get('range') if request else None) or ''
+        if range_header.replace(' ', '') != 'bytes=0-0':
+            await sharing_db.log_share_access(share_info['share_id'], viewer_email)
+            try:
+                viewer_sys_id = await get_or_create_viewer_person(viewer_email)
+                if viewer_sys_id:
+                    await log_activity(int(document_id), 'Download', viewer_sys_id)
+            except Exception as e:
+                logging.error(f"Failed to log download activity: {e}")
 
         # 10. Return the watermarked file
         return StreamingResponse(

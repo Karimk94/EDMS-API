@@ -208,7 +208,10 @@ async def api_upload_document(request: Request, file: UploadFile = File(...), do
         "filename": original_filename,
         "doc_date": doc_date_taken,
         "event_id": parsed_event_id,
-        "app_source": x_app_source
+        "app_source": x_app_source,
+        # The actual logged-in user — used as AUTHOR_ID / TYPIST_ID in the DMS
+        # so the document history shows the real uploader, not the service account.
+        "author_id": username,
     }
 
     # --- Cancellation support for the (potentially long) DMS transfer ---

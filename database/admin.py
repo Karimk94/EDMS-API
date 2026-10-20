@@ -359,7 +359,7 @@ async def get_document_history(docnumber: int):
                     'typist': row[2],
                     'docname': row[3],
                     'author': row[4],
-                    'start_date': row[5].isoformat() if row[5] else None,
+                    'start_date': (row[5].replace(tzinfo=None) + timedelta(hours=4)).isoformat() if row[5] else None,  # shift +4h (GST), same as checkout tab
                     'form_name': row[6]
                 })
     except oracledb.Error as e:
@@ -575,7 +575,7 @@ async def get_document_history(docnumber: int):
                     'typist': row[2],
                     'docname': row[3],
                     'author': row[4],
-                    'start_date': row[5].isoformat() if row[5] else None,
+                    'start_date': (row[5].replace(tzinfo=None) + timedelta(hours=4)).isoformat() if row[5] else None,  # shift +4h (GST), same as checkout tab
                     'form_name': row[6]
                 })
     except oracledb.Error as e:

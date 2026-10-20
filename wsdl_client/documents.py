@@ -68,6 +68,12 @@ async def upload_document_to_dms(dst, file_stream, metadata, parent_id=None, can
         string_array_type = svc_client.get_type(
             '{http://schemas.microsoft.com/2003/10/Serialization/Arrays}ArrayOfstring')
 
+        # AUTHOR_ID / TYPIST_ID must reflect the actual logged-in user who is
+        # uploading the document, not the service account. Fall back to the
+        # service account only when no user identity is available.
+        uploading_user = metadata.get('author_id') or metadata.get('user_id') or DMS_USER
+        logging.info(f"Uploading document '{metadata.get('docname')}' as user '{uploading_user}'")
+
         property_names_list = [
             '%TARGET_LIBRARY', '%RECENTLY_USED_LOCATION', 'DOCNAME', 'TYPE_ID', 'AUTHOR_ID',
             'ABSTRACT', 'APP_ID', 'TYPIST_ID', 'SECURITY'
@@ -78,10 +84,10 @@ async def upload_document_to_dms(dst, file_stream, metadata, parent_id=None, can
             xsd.AnyObject(string_type, 'DOCSOPEN!L\\RTA_MAIN'),
             xsd.AnyObject(string_type, metadata['docname']),
             xsd.AnyObject(string_type, 'DEFAULT'),
-            xsd.AnyObject(string_type, DMS_USER),
+            xsd.AnyObject(string_type, uploading_user),
             xsd.AnyObject(string_type, metadata['abstract']),
             xsd.AnyObject(string_type, metadata['app_id']),
-            xsd.AnyObject(string_type, DMS_USER),
+            xsd.AnyObject(string_type, uploading_user),
             xsd.AnyObject(string_type, '1')
         ]
 
