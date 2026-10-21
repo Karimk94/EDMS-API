@@ -32,8 +32,12 @@ async def search_events_by_name(search_term, app_source='unknown'):
                 SELECT DISTINCT e.SYSTEM_ID, e.EVENT_NAME
                 FROM LKP_PHOTO_EVENT e
                 JOIN LKP_EVENT_DOC de ON e.SYSTEM_ID = de.EVENT_ID AND de.DISABLED = '0'
+                JOIN PROFILE p ON de.DOCNUMBER = p.DOCNUMBER
                 WHERE UPPER(e.EVENT_NAME) LIKE :search_term
                 AND (e.DISABLED = '0' OR e.DISABLED IS NULL)
+                AND p.FORM = 2740
+                AND p.RTA_TEXT1 = 'edms-media'
+                AND EXISTS (SELECT 1 FROM FOLDER_ITEM fi WHERE fi.DOCNUMBER = p.DOCNUMBER AND fi.NODE_TYPE = 'D')
                 ORDER BY e.EVENT_NAME
             """
             await cursor.execute(query, search_term=f"%{search_term.upper()}%")
@@ -64,7 +68,12 @@ async def get_event_folder_docnumbers(event_id):
             query = """
                 SELECT de.DOCNUMBER
                 FROM LKP_EVENT_DOC de
-                WHERE de.EVENT_ID = :event_id AND de.DISABLED = '0'
+                JOIN PROFILE p ON de.DOCNUMBER = p.DOCNUMBER
+                WHERE de.EVENT_ID = :event_id 
+                  AND de.DISABLED = '0'
+                  AND p.FORM = 2740
+                  AND p.RTA_TEXT1 = 'edms-media'
+                  AND EXISTS (SELECT 1 FROM FOLDER_ITEM fi WHERE fi.DOCNUMBER = p.DOCNUMBER AND fi.NODE_TYPE = 'D')
             """
             await cursor.execute(query, event_id=event_id)
             rows = await cursor.fetchall()
@@ -96,7 +105,7 @@ async def get_events(page=1, page_size=20, search=None, fetch_all=False):
     total_rows = 0
     offset = (page - 1) * page_size
     base_params = {}
-    where_clauses = []
+    where_clauses = ["(e.DISABLED = '0' OR e.DISABLED IS NULL)"]
 
     if search:
         where_clauses.append("UPPER(e.EVENT_NAME) LIKE :search_term")
@@ -352,7 +361,13 @@ async def get_documents_for_event(event_id, page=1, page_size=1):
                 SELECT COUNT(de.DOCNUMBER)
                 FROM LKP_EVENT_DOC de
                 JOIN LKP_PHOTO_EVENT e ON de.EVENT_ID = e.SYSTEM_ID
-                WHERE de.EVENT_ID = :event_id AND de.DISABLED = '0' AND e.DISABLED = '0'
+                JOIN PROFILE p ON de.DOCNUMBER = p.DOCNUMBER
+                WHERE de.EVENT_ID = :event_id 
+                  AND de.DISABLED = '0' 
+                  AND (e.DISABLED = '0' OR e.DISABLED IS NULL)
+                  AND p.FORM = 2740
+                  AND p.RTA_TEXT1 = 'edms-media'
+                  AND EXISTS (SELECT 1 FROM FOLDER_ITEM fi WHERE fi.DOCNUMBER = p.DOCNUMBER AND fi.NODE_TYPE = 'D')
             """
             await cursor.execute(count_query, event_id=event_id)
             count_result = await cursor.fetchone()
@@ -365,7 +380,11 @@ async def get_documents_for_event(event_id, page=1, page_size=1):
                 SELECT p.DOCNUMBER, p.ABSTRACT, p.AUTHOR, p.RTADOCDATE as DOC_DATE, p.DOCNAME
                 FROM PROFILE p
                 JOIN LKP_EVENT_DOC de ON p.DOCNUMBER = de.DOCNUMBER
-                WHERE de.EVENT_ID = :event_id AND de.DISABLED = '0'
+                WHERE de.EVENT_ID = :event_id 
+                  AND de.DISABLED = '0'
+                  AND p.FORM = 2740
+                  AND p.RTA_TEXT1 = 'edms-media'
+                  AND EXISTS (SELECT 1 FROM FOLDER_ITEM fi WHERE fi.DOCNUMBER = p.DOCNUMBER AND fi.NODE_TYPE = 'D')
                 ORDER BY p.RTADOCDATE DESC NULLS LAST, p.DOCNUMBER DESC
                 OFFSET :offset ROWS FETCH NEXT :page_size ROWS ONLY
             """

@@ -645,6 +645,9 @@ async def api_update_abstract(data: UpdateAbstractRequest, user=Depends(get_curr
 
 @router.put('/api/document/{doc_id}/event')
 async def link_document_event(doc_id: int, data: LinkEventRequest, user=Depends(get_current_user)):
+    security_level = (user.get('security_level') or '').strip().lower()
+    if security_level == 'viewer':
+        raise HTTPException(status_code=403, detail="Viewers are not permitted to modify document events.")
     success, message = await db_connector.link_document_to_event(doc_id, data.event_id)
     if success:
         return {"message": message}

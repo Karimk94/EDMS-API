@@ -14,6 +14,9 @@ class ThemeUpdateRequest(BaseModel):
 class ViewModeUpdateRequest(BaseModel):
     view_mode: str
 
+class ProfileViewModeUpdateRequest(BaseModel):
+    profile_view_mode: str
+
 class User(BaseModel):
     username: str
     token: str

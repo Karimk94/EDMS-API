@@ -7,7 +7,7 @@ import uuid
 import db_connector
 import wsdl_client
 from wsdl_client import users as wsdl_users
-from schemas.auth import LoginRequest, LangUpdateRequest, ThemeUpdateRequest, ViewModeUpdateRequest, GroupMember, TrusteeResponse, Group
+from schemas.auth import LoginRequest, LangUpdateRequest, ThemeUpdateRequest, ViewModeUpdateRequest, ProfileViewModeUpdateRequest, GroupMember, TrusteeResponse, Group
 from typing import List
 from services import processor
 from utils.common import get_current_user, get_session_token
@@ -272,6 +272,8 @@ async def login(
             'dms_security_level': security_level,  # Numeric for logic
             'lang': db_prefs.get('lang', 'en') if db_prefs else 'en',
             'theme': db_prefs.get('theme', 'light') if db_prefs else 'light',
+            'view_mode': db_prefs.get('view_mode', 'grid') if db_prefs else 'grid',
+            'profile_view_mode': db_prefs.get('profile_view_mode', 'grid') if db_prefs else 'grid',
             'tab_permissions': tab_permissions,
             **group_flags,
         }
@@ -398,6 +400,24 @@ async def api_update_user_view_mode(request: Request, data: ViewModeUpdateReques
         return {"message": "View mode updated"}
     else:
         raise HTTPException(status_code=500, detail="Failed to update view mode")
+
+@router.put('/api/user/profile-view-mode')
+async def api_update_user_profile_view_mode(request: Request, data: ProfileViewModeUpdateRequest):
+    user = request.session.get('user')
+    if not user:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    if data.profile_view_mode not in ['grid', 'list']:
+        raise HTTPException(status_code=400, detail="Invalid view mode")
+
+    username = user['username']
+    success = await db_connector.update_user_profile_view_mode(username, data.profile_view_mode)
+    if success:
+        user['profile_view_mode'] = data.profile_view_mode
+        request.session['user'] = user
+        return {"message": "Profile view mode updated"}
+    else:
+        raise HTTPException(status_code=500, detail="Failed to update profile view mode in database. Make sure PROFILE_VIEW_MODE column exists.")
 
 # --- Groups & Security Endpoints (Updated to use Session) ---
 

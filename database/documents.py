@@ -82,19 +82,19 @@ async def fetch_documents_from_oracle(page=1, page_size=20, search_term=None, da
 
     async def fetch_folder_doc_ids():
         if scope == 'folders':
-            return await wsdl_client.get_recursive_doc_ids(dst, media_type)
+            return await wsdl_client.get_recursive_doc_ids(dst, media_type, username=user_id)
         return None
 
     async def fetch_root_doc_ids():
         if scope != 'folders' and app_source == 'edms-media':
             from wsdl_client.config import SMART_EDMS_ROOT_ID
-            return await wsdl_client.get_recursive_doc_ids(dst, media_type_filter=None, start_node=SMART_EDMS_ROOT_ID)
+            return await wsdl_client.get_recursive_doc_ids(dst, media_type_filter=None, start_node=SMART_EDMS_ROOT_ID, username=user_id)
         return None
 
     async def fetch_event_data():
         evt_doc_ids = []
         evt_folder_names = {}
-        if search_term and app_source == 'edms-media' and scope != 'folders':
+        if search_term and app_source == 'edms-media':
             try:
                 from database.events import search_events_by_name, get_event_folder_docnumbers
                 matching_events = await search_events_by_name(search_term, app_source)
@@ -167,6 +167,15 @@ async def fetch_documents_from_oracle(page=1, page_size=20, search_term=None, da
             folder_doc_ids = folder_doc_ids[:10000]
         in_clause = build_in_clause("p.DOCNUMBER", folder_doc_ids, "fid", params)
         where_clauses.append(in_clause)
+        # Guardrail: only return documents that are genuinely present in the
+        # active folder hierarchy (FOLDER_ITEM table, node_type='D' means document).
+        # This prevents orphaned PROFILE rows (deleted, moved out, or belonging to
+        # a different system scope) from appearing in folder search results.
+        where_clauses.append(
+            "EXISTS (SELECT 1 FROM FOLDER_ITEM fi WHERE fi.DOCNUMBER = p.DOCNUMBER AND fi.NODE_TYPE = 'D')"
+        )
+        if app_source == 'edms-media':
+            where_clauses.append("p.RTA_TEXT1 = 'edms-media'")
     else:
         if app_source == 'edms-media':
             if root_doc_ids and len(root_doc_ids) > 0:
@@ -588,6 +597,26 @@ async def fetch_documents_from_oracle(page=1, page_size=20, search_term=None, da
 
             await cursor.execute(fetch_query, params)
             rows = await cursor.fetchall()
+
+            if rows and app_source == 'edms-media':
+                try:
+                    page_doc_ids = [r[0] for r in rows if r[0] not in event_folder_names]
+                    if page_doc_ids:
+                        async with conn.cursor() as evt_cur:
+                            binds = [f":edoc_{i}" for i in range(len(page_doc_ids))]
+                            evt_params = {f"edoc_{i}": did for i, did in enumerate(page_doc_ids)}
+                            await evt_cur.execute(f"""
+                                SELECT de.DOCNUMBER, e.EVENT_NAME
+                                FROM LKP_EVENT_DOC de
+                                JOIN LKP_PHOTO_EVENT e ON de.EVENT_ID = e.SYSTEM_ID
+                                WHERE de.DOCNUMBER IN ({','.join(binds)})
+                                  AND de.DISABLED = '0'
+                                  AND (e.DISABLED = '0' OR e.DISABLED IS NULL)
+                            """, evt_params)
+                            for edoc_id, ev_name in await evt_cur.fetchall():
+                                event_folder_names[edoc_id] = ev_name
+                except Exception as e:
+                    logging.warning(f"Could not batch-fetch event names for documents: {e}")
 
             for row in rows:
                 doc_id, abstract, author, doc_date, docname, is_favorite = row

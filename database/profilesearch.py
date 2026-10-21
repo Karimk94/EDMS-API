@@ -540,7 +540,8 @@ async def search_documents_multi(
     date_from=None,
     date_to=None,
     page=1,
-    page_size=20
+    page_size=20,
+    extra_columns=None
 ):
     """
     Multi-criteria search: each item in criteria list adds an AND condition.
@@ -589,6 +590,7 @@ async def search_documents_multi(
 
             # --- Process each criterion as an AND condition ---
             display_field_to_use = 'DOCNAME'
+            extra_display_fields = []
             for idx, crit in enumerate(criteria):
                 field_name = crit.get('field_name', '')
                 keyword = crit.get('keyword', '')
@@ -597,6 +599,10 @@ async def search_documents_multi(
 
                 if idx == 0 and disp and re.match(r'^[A-Z0-9_]+$', disp.upper()):
                     display_field_to_use = disp
+
+                if disp and re.match(r'^[A-Z0-9_]+$', disp.upper()) and disp.upper() not in ['DOCNUMBER', 'DOCNAME', 'ABSTRACT', 'CREATION_DATE', 'TYPIST']:
+                    if disp.upper() not in [f.upper() for f in extra_display_fields]:
+                        extra_display_fields.append(disp)
 
                 # Resolve compound field names
                 clean_field = field_name
@@ -667,10 +673,19 @@ async def search_documents_multi(
             params['offset'] = offset
             params['page_size'] = page_size
 
+            # Include any requested custom/form columns from the column chooser
+            if extra_columns:
+                for ec in extra_columns:
+                    if ec and re.match(r'^[A-Z0-9_]+$', ec.upper()) and ec.upper() not in ['DOCNUMBER', 'DOCNAME', 'ABSTRACT', 'CREATION_DATE', 'TYPIST']:
+                        if ec.upper() not in [f.upper() for f in extra_display_fields]:
+                            extra_display_fields.append(ec)
+
+            extra_cols_sql = "".join([f", p.{f} as EF_{i}" for i, f in enumerate(extra_display_fields)])
+
             sql = f"""
             SELECT /*+ FIRST_ROWS({page_size}) */
                 p.DOCNUMBER, p.ABSTRACT, p.DOCNAME, p.CREATION_DATE, p.TYPIST,
-                a.DEFAULT_EXTENSION, p.{display_field_to_use} as DISPLAY_VAL
+                a.DEFAULT_EXTENSION, p.{display_field_to_use} as DISPLAY_VAL{extra_cols_sql}
             FROM PROFILE p
             LEFT JOIN APPS a ON p.APPLICATION = a.SYSTEM_ID
             WHERE {' AND '.join(where_clauses)}
@@ -682,8 +697,18 @@ async def search_documents_multi(
                 await cursor.execute(sql, params)
             except oracledb.Error as col_err:
                 if 'ORA-00904' in str(col_err):
-                    logging.warning(f"Column error in multi-search: {col_err}. Retrying with DOCNAME.")
-                    sql = sql.replace(f"p.{display_field_to_use} as DISPLAY_VAL", "p.DOCNAME as DISPLAY_VAL")
+                    logging.warning(f"Column error in multi-search: {col_err}. Retrying without extra fields and with DOCNAME.")
+                    extra_display_fields = []
+                    sql = f"""
+                    SELECT /*+ FIRST_ROWS({page_size}) */
+                        p.DOCNUMBER, p.ABSTRACT, p.DOCNAME, p.CREATION_DATE, p.TYPIST,
+                        a.DEFAULT_EXTENSION, p.DOCNAME as DISPLAY_VAL
+                    FROM PROFILE p
+                    LEFT JOIN APPS a ON p.APPLICATION = a.SYSTEM_ID
+                    WHERE {' AND '.join(where_clauses)}
+                    ORDER BY p.CREATION_DATE DESC
+                    OFFSET :offset ROWS FETCH NEXT :page_size ROWS ONLY
+                    """
                     display_field_to_use = 'DOCNAME'
                     await cursor.execute(sql, params)
                 else:
@@ -693,7 +718,7 @@ async def search_documents_multi(
 
             documents = []
             for row in rows:
-                doc_id, abstract, docname, date, typist, ext, display_val = row
+                doc_id, abstract, docname, date, typist, ext, display_val = row[:7]
                 date_str = date.strftime('%Y-%m-%d') if date else ""
                 media_type = 'unknown'
                 ext_str = (str(ext) if ext else "").lower().replace('.', '')
@@ -706,6 +731,12 @@ async def search_documents_multi(
                 elif ext_str in ['msg', 'eml']: media_type = 'email'
                 elif ext_str in ['mp4', 'avi']: media_type = 'video'
 
+                form_values = {}
+                for i, f in enumerate(extra_display_fields):
+                    idx = 7 + i
+                    if len(row) > idx:
+                        form_values[f] = row[idx]
+
                 documents.append({
                     "doc_id": doc_id,
                     "title": abstract or docname,
@@ -715,6 +746,7 @@ async def search_documents_multi(
                     "media_type": media_type,
                     "extension": ext_str,
                     "display_value": display_val,
+                    "form_values": form_values,
                     "thumbnail_url": f"temp_thumbnail/{doc_id}" if media_type in ['image', 'video', 'pdf'] else ""
                 })
 

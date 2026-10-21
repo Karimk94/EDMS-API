@@ -59,7 +59,7 @@ async def get_user_details(username):
 
                 # Now, get details from the EDMS security and data tables
                 query = """
-                    SELECT sl.NAME, us.LANG, us.THEME, us.VIEW_MODE, us.LARGE_DOWNLOADS,
+                    SELECT sl.NAME, us.LANG, us.THEME, us.VIEW_MODE, us.PROFILE_VIEW_MODE, us.LARGE_DOWNLOADS,
                            COALESCE(ud.QUOTA, 1073741824), 
                            COALESCE(ud.REMAINING_QUOTA, COALESCE(ud.QUOTA, 1073741824)),
                            p.FULL_NAME
@@ -69,11 +69,38 @@ async def get_user_details(username):
                     JOIN PEOPLE p ON us.USER_ID = p.SYSTEM_ID
                     WHERE us.USER_ID = :user_id
                 """
-                await cursor.execute(query, user_id=user_id)
-                details_result = await cursor.fetchone()
+                try:
+                    await cursor.execute(query, user_id=user_id)
+                    details_result = await cursor.fetchone()
+                    has_profile_col = True
+                except oracledb.DatabaseError as db_err:
+                    err_obj, = db_err.args
+                    if hasattr(err_obj, 'code') and err_obj.code == 904:
+                        # Fallback for when PROFILE_VIEW_MODE column is not yet created in Oracle
+                        legacy_query = """
+                            SELECT sl.NAME, us.LANG, us.THEME, us.VIEW_MODE, us.LARGE_DOWNLOADS,
+                                   COALESCE(ud.QUOTA, 1073741824), 
+                                   COALESCE(ud.REMAINING_QUOTA, COALESCE(ud.QUOTA, 1073741824)),
+                                   p.FULL_NAME
+                            FROM LKP_EDMS_USR_SECUR us
+                            JOIN LKP_EDMS_SECURITY sl ON us.SECURITY_LEVEL_ID = sl.SYSTEM_ID
+                            LEFT JOIN LKP_EDMS_USR_DATA ud ON us.SYSTEM_ID = ud.USER_ID
+                            JOIN PEOPLE p ON us.USER_ID = p.SYSTEM_ID
+                            WHERE us.USER_ID = :user_id
+                        """
+                        await cursor.execute(legacy_query, user_id=user_id)
+                        details_result = await cursor.fetchone()
+                        has_profile_col = False
+                    else:
+                        raise
 
                 if details_result:
-                    security_level, lang, theme, view_mode, LARGE_DOWNLOADS, quota, remaining_quota, full_name = details_result
+                    if has_profile_col:
+                        security_level, lang, theme, view_mode, profile_view_mode, LARGE_DOWNLOADS, quota, remaining_quota, full_name = details_result
+                    else:
+                        security_level, lang, theme, view_mode, LARGE_DOWNLOADS, quota, remaining_quota, full_name = details_result
+                        profile_view_mode = 'grid'
+
                     # Also fetch the security_level_id for tab permissions lookup
                     await cursor.execute(
                         "SELECT SECURITY_LEVEL_ID FROM LKP_EDMS_USR_SECUR WHERE USER_ID = :user_id",
@@ -91,6 +118,7 @@ async def get_user_details(username):
                         'lang': lang or 'en',
                         'theme': theme or 'light',
                         'view_mode': view_mode or 'grid',
+                        'profile_view_mode': profile_view_mode or 'grid',
                         'quota': quota,
                         'remaining_quota': remaining_quota,
                         'LARGE_DOWNLOADS': LARGE_DOWNLOADS == '1' if LARGE_DOWNLOADS is not None else False
@@ -107,6 +135,45 @@ async def get_user_details(username):
             await conn.close()
 
     return user_details
+
+async def update_user_profile_view_mode(username, profile_view_mode):
+    """Updates the profile search view mode preference for a user."""
+    conn = await get_async_connection()
+    if not conn:
+        return False
+
+    try:
+        async with conn.cursor() as cursor:
+            await cursor.execute("SELECT SYSTEM_ID FROM PEOPLE WHERE UPPER(USER_ID) = UPPER(:username)", username=username)
+            user_result = await cursor.fetchone()
+
+            if not user_result:
+                logging.error(f"Cannot update profile view mode. User '{username}' not found in PEOPLE table.")
+                return False
+
+            user_id = user_result[0]
+
+            update_query = """
+                UPDATE LKP_EDMS_USR_SECUR
+                SET PROFILE_VIEW_MODE = :profile_view_mode
+                WHERE USER_ID = :user_id
+            """
+            await cursor.execute(update_query, profile_view_mode=profile_view_mode, user_id=user_id)
+
+            if cursor.rowcount == 0:
+                logging.warning(f"No rows updated for user '{username}' (user_id: {user_id}). They may not have a security record.")
+                return False
+
+            await conn.commit()
+            return True
+
+    except oracledb.Error as e:
+        logging.error(f"Oracle Database error in update_user_profile_view_mode for {username}: {e}", exc_info=True)
+        await conn.rollback()
+        return False
+    finally:
+        if conn:
+            await conn.close()
 
 async def update_user_language(username, lang):
     """Updates the language preference for a user."""

@@ -26,6 +26,7 @@ class MultiSearchRequest(BaseModel):
     date_to: Optional[str] = None
     page: int = Field(default=1, ge=1)
     page_size: int = Field(default=20, ge=1, le=50)
+    extra_columns: Optional[List[str]] = None
 
 
 @router.get('/api/profilesearch/scopes')
@@ -115,7 +116,8 @@ async def search_documents_multi(request: Request, body: MultiSearchRequest, use
             date_from=body.date_from,
             date_to=body.date_to,
             page=body.page,
-            page_size=body.page_size
+            page_size=body.page_size,
+            extra_columns=body.extra_columns
         )
 
         total_pages = (total_rows + body.page_size - 1) // body.page_size if total_rows > 0 else 1

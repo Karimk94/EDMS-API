@@ -480,12 +480,12 @@ async def list_folder_contents(dst, parent_id=None, app_source=None, scope=None,
                     (filter_files_only and item.get('media_type') not in IMAGE_VIDEO_TYPES) or
                     (not filter_files_only and item.get('media_type') == media_type)]
             
-            # Combine and deduplicate
-            existing_ids = {item['id'] for item in regular_items}
-            for event_item in event_folder_items:
-                if event_item['id'] not in existing_ids:
-                    regular_items.append(event_item)
-                    existing_ids.add(event_item['id'])
+            # Only attach event_name to documents that already exist in regular_items
+            # (which respects folder permissions, start_node, and DMS security)
+            event_names_by_id = {item['id']: item.get('event_name') for item in event_folder_items if item.get('event_name')}
+            for item in regular_items:
+                if item['id'] in event_names_by_id and not item.get('event_name'):
+                    item['event_name'] = event_names_by_id[item['id']]
         
         return regular_items
 
