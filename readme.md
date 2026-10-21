@@ -1,963 +1,865 @@
-# Smart EDMS — Backend API
+# Smart EDMS — Backend API (Central Orchestrator)
 
-**Smart EDMS API** is a Python-based middleware API built with **FastAPI** that serves as the central processing hub for the Smart EDMS ecosystem. It bridges the frontend application with an **Oracle Database**, an on-premise **SOAP/WSDL Document Management System (DMS)**, and a suite of **AI microservices** for document intelligence (image captioning, OCR, face recognition, video summarization, translation, and semantic search). It also manages user authentication, authorization, folder hierarchies, document sharing, tagging, watermarking, a background processing queue, EDMS user provisioning, eDOCS server cache management, and organizational hierarchy administration.
+[![Platform](https://img.shields.io/badge/Platform-Windows%20Server-0078D6?logo=windows)](https://www.microsoft.com/windows-server)
+[![Python](https://img.shields.io/badge/Python-3.10%20%7C%203.11%20%7C%203.12-3776AB?logo=python&logoColor=white)](https://www.python.org/)
+[![Framework](https://img.shields.io/badge/Framework-FastAPI%20(ASGI)-009688?logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com/)
+[![ASGI Server](https://img.shields.io/badge/ASGI%20Server-Uvicorn%20(4%20Workers)-499848?logo=gunicorn&logoColor=white)](https://www.uvicorn.org/)
+[![Database](https://img.shields.io/badge/Database-Oracle%20Enterprise%2019c-F80000?logo=oracle&logoColor=white)](https://www.oracle.com/database/)
+[![DMS](https://img.shields.io/badge/DMS-OpenText%20eDOCS-005B94?logo=opentext)](https://www.opentext.com/)
+[![Vector Store](https://img.shields.io/badge/Vector%20Store-ChromaDB%20(4096--dim)-FF6B6B)](https://www.trychroma.com/)
+[![AI Infrastructure](https://img.shields.io/badge/AI%20Cloud-GovAI%20LLM%20%26%20Dataiku%20AI%20Center-6366F1)](https://llmapi.govai.ae)
 
----
+The **Smart EDMS API** is the central orchestrator and middleware hub for the **RTA Smart EDMS** (Electronic Document Management System) ecosystem. Built with **FastAPI** and served via **Uvicorn** (under **Windows Server IIS** with `HttpPlatformHandler`), it unifies enterprise web and mobile client applications, on-premise **OpenText eDOCS DM** repository storage, an **Oracle Enterprise Database**, a local **ChromaDB** dense vector store, an asynchronous **SQLite job processing queue**, and a suite of specialized **AI document intelligence microservices**.
 
-## Table of Contents
-
-- [Architecture Overview](#architecture-overview)
-- [Technology Stack](#technology-stack)
-- [Project Structure](#project-structure)
-- [Environment Variables](#environment-variables)
-- [Setup & Installation](#setup--installation)
-- [Running the API](#running-the-api)
-- [API Routes](#api-routes)
-  - [Authentication & Users](#authentication--users)
-  - [Documents](#documents)
-  - [Media](#media)
-  - [Folders](#folders)
-  - [Tags & Persons](#tags--persons)
-  - [Events](#events)
-  - [Favorites](#favorites)
-  - [Memories](#memories)
-  - [Sharing](#sharing)
-  - [Admin Panel](#admin-panel)
-  - [eDOCS Admin](#edocs-admin)
-  - [EMS Admin](#ems-admin)
-  - [EDMS People Management](#edms-people-management)
-  - [Profile Search](#profile-search)
-- [AI Processing Pipeline](#ai-processing-pipeline)
-- [Background Processing Queue](#background-processing-queue)
-- [Worker Process](#worker-process)
-- [Vector Search (ChromaDB)](#vector-search-chromadb)
-- [WSDL / SOAP Client](#wsdl--soap-client)
-- [Database Layer](#database-layer)
-- [Utilities](#utilities)
-- [Middleware Stack](#middleware-stack)
-- [Security](#security)
-- [Deployment](#deployment)
-- [Batch Scripts & Tooling](#batch-scripts--tooling)
-- [Blocklist & Content Filtering](#blocklist--content-filtering)
+Neither client frontends nor downstream AI services interact directly with the underlying Oracle database or OpenText eDOCS repositories. All authentication, security permissions, document streaming, EXIF extraction, digital watermarking, organizational hierarchy management, and background AI extraction pipelines are mediated through this API.
 
 ---
 
-## Architecture Overview
+## 📑 Table of Contents
+
+1. [Executive Summary & Architectural Role](#1-executive-summary--architectural-role)
+2. [System Architecture & Data Pipelines](#2-system-architecture--data-pipelines)
+   - [2.1 High-Level Architecture Diagram](#21-high-level-architecture-diagram)
+   - [2.2 Ingestion & Upload Pipeline](#22-ingestion--upload-pipeline)
+   - [2.3 Hybrid Search Pipeline (Semantic Vector + Lexical RRF)](#23-hybrid-search-pipeline-semantic-vector--lexical-rrf)
+3. [Connected Ecosystem & Sibling Microservices](#3-connected-ecosystem--sibling-microservices)
+   - [3.1 Ecosystem Architecture & Port Reference](#31-ecosystem-architecture--port-reference)
+   - [3.2 User Frontends](#32-user-frontends)
+   - [3.3 AI Microservices Suite](#33-ai-microservices-suite)
+   - [3.4 Enterprise Automation & Task Jobs](#34-enterprise-automation--task-jobs)
+   - [3.5 Enterprise Storage & Core Platforms](#35-enterprise-storage--core-platforms)
+4. [Technology Stack](#4-technology-stack)
+5. [Codebase Structure & Directory Layout](#5-codebase-structure--directory-layout)
+6. [API Endpoints Reference](#6-api-endpoints-reference)
+   - [6.1 Authentication & User Sessions](#61-authentication--user-sessions)
+   - [6.2 Documents & Ingestion](#62-documents--ingestion)
+   - [6.3 Media Streaming & Caching](#63-media-streaming--caching)
+   - [6.4 Folders & Hierarchy Navigation](#64-folders--hierarchy-navigation)
+   - [6.5 Tags, Persons & VIP Recognition](#65-tags-persons--vip-recognition)
+   - [6.6 Events & Timeline Journeys](#66-events--timeline-journeys)
+   - [6.7 Favorites & Memories ("On This Day")](#67-favorites--memories-on-this-day)
+   - [6.8 Secure Sharing & OTP Flow](#68-secure-sharing--otp-flow)
+   - [6.9 System Administration & Queue Management](#69-system-administration--queue-management)
+   - [6.10 eDOCS Server Cache Administration](#610-edocs-server-cache-administration)
+   - [6.11 EMS Organizational Administration](#611-ems-organizational-administration)
+   - [6.12 EDMS People Management & HR Provisioning](#612-edms-people-management--hr-provisioning)
+   - [6.13 Dynamic Profile Search](#613-dynamic-profile-search)
+   - [6.14 Oracle Database Session Monitoring](#614-oracle-database-session-monitoring)
+7. [AI Document Processing Pipeline](#7-ai-document-processing-pipeline)
+8. [Background Processing Queue & Worker Process](#8-background-processing-queue--worker-process)
+9. [Vector Search Engine (ChromaDB)](#9-vector-search-engine-chromadb)
+10. [OpenText eDOCS WSDL / SOAP Client](#10-opentext-edocs-wsdl--soap-client)
+11. [Database Layer & Oracle Connection Management](#11-database-layer--oracle-connection-management)
+12. [Utilities & Media Processing](#12-utilities--media-processing)
+13. [Middleware Stack & Security Headers](#13-middleware-stack--security-headers)
+14. [Security & Access Control Model](#14-security--access-control-model)
+15. [Multi-Node & Load-Balanced Deployment](#15-multi-node--load-balanced-deployment)
+16. [Offline Setup & Air-Gapped Installation](#16-offline-setup--air-gapped-installation)
+17. [Windows IIS Production Deployment (`web2.config`)](#17-windows-iis-production-deployment-web2config)
+18. [Environment Variables Reference (`.env`)](#18-environment-variables-reference-env)
+19. [Troubleshooting & Operational Runbook](#19-troubleshooting--operational-runbook)
+
+---
+
+## 1. Executive Summary & Architectural Role
+
+The **Smart EDMS API** serves as the central nervous system of the RTA Electronic Document Management System. Its core responsibilities include:
+
+1. **Enterprise DMS Integration**: Translates REST requests from modern web and mobile clients into binary-level SOAP/WSDL transactions supported by the legacy OpenText eDOCS DM server (including proprietary zlib-compressed buffer parsing and length-prefixed UTF-16LE string decoding).
+2. **Oracle Database Governance**: Manages connection pooling, transactions, sequence generation, dynamic SQL query generation, quota management, and schema-level synchronization across more than 20 database tables.
+3. **AI Microservice Orchestration**: Directs documents to specialized downstream AI services for optical character recognition (OCR), visual image captioning, VIP facial identification, video summarization, keyword tokenization, and vector embeddings.
+4. **Decoupled Architecture**: Strictly isolates compute-heavy deep learning inference from user-facing web requests. Heavy machine learning tasks are handed off to an asynchronous SQLite queue and processed in a dedicated worker process (`worker.py`).
+5. **Dual Ingestion Paths**: Accommodates both synchronous, immediate end-user uploads through the portal UI and automated, scheduled batch ingestion via the **EDMS Crawler Task** to prevent compute bottlenecks and external API rate limiting.
+6. **Air-Gapped Government Readiness**: Completely self-contained with offline wheel caches (`packages/`), local neural model wrappers, automated batch installers, and hardened IIS configuration for zero-internet production servers.
+
+---
+
+## 2. System Architecture & Data Pipelines
+
+### 2.1 High-Level Architecture Diagram
+
+The system operates across two primary operational pipelines: the **Upload & Ingestion Pipeline** and the **Search Pipeline**.
+
+![Smart EDMS Architecture](diagrams/smart_edms_architecture.jpg)
+
+---
+
+### 2.2 Ingestion & Upload Pipeline
+
+When documents, field photographs, scanned records, or media attachments enter the Smart EDMS platform:
+
+1. **Dual Ingestion Entrypoints**:
+   - **User Uploads File (Real-time Upload)**: End users upload files directly through the [Smart EDMS Web Frontend](file:///d:/projects/new%20EDMS%20py/Smart%20EDMS) or [EDMS Media Frontend](file:///d:/projects/new%20EDMS%20py/EDMS%20Media%20frontend) (`POST /api/upload_document`). The API authenticates the session, verifies user storage quota, inspects MIME types, extracts EXIF creation dates, and sanitizes filenames.
+   - **EDMS Crawler (Scheduled Batch Ingestion)**: Automated background crawler tasks ([EDMS Crawler Task](file:///d:/projects/new%20EDMS%20py/Task%20Jobs/EDMS%20Crawler%20Task%20py)) execute on a 30-minute cadence under Windows Task Scheduler. The crawler authenticates (`POST /api/auth/login`) and triggers `POST /process-batch`, pulling all unprocessed or queued records (`STATUS = 0`) from Oracle DB into the local SQLite processing queue without user intervention.
+2. **Repository & Metadata Storage**:
+   - The API pushes the physical binary file into the **OpenText eDOCS DM Vault** via SOAP/WSDL (`upload_document_to_dms`).
+   - The primary document metadata record is committed to **Oracle Enterprise Database** (`PROFILE` table), recording author, document date, file extension, and initial status (`STATUS = 1` - In Progress).
+3. **Multi-Service AI Document Intelligence Pipeline**:
+   The background worker (`worker.py`) claims jobs from SQLite and routes the media stream:
+   - **OCR Service (Port 5004)**: Extracts Arabic and English text from scanned documents and images. Connects upstream to **GovAI Multimodal Vision LLM** (`qwen3-vl-30b`), with local EasyOCR + Gemma 3 fallback.
+   - **Image Captioning Service (Port 5001)**: Analyzes visual scenes, generates concise captions, and produces descriptive keyword tags via **GovAI Multimodal Vision LLM** (`qwen3-vl-30b`), with local Ollama fallback.
+   - **Video Summarizer (Port 5008)**: Samples keyframes for visual understanding (GovAI `qwen3-vl-30b`), extracts audio tracks with MoviePy, transcribes speech via GovAI Whisper ASR (`whisper_asr`), and forwards extracted face crops.
+   - **Face Recognition Service (Port 5002)**: Receives raw images or pre-cropped video faces. Performs local PIL cropping, draws green bounding boxes, queries local ChromaDB (`faces` collection), and normalizes Arabic identities using GovAI LLM.
+     > [!IMPORTANT]
+     > **Perception Middleware Boundary**: The Face Recognition Service does **not** call GovAI LLM for deep neural inference. Instead, it delegates face detection (RetinaFace) and 4096-dimensional facial embedding computation (VGG-Face) to the **Dataiku Model API (Port 5009 / DSS :13000)**, which runs inside the **Enterprise AI Center** on dedicated compute nodes with pre-cached neural network weights.
+4. **Metadata Enrichment & Abstract Aggregation**:
+   The API consolidates all AI extracts into a structured document `ABSTRACT` (capping captions to 500 characters and the total abstract to 2,000 characters). Extracted English tags are translated to Arabic (without Tashkeel) via the [Translator Rephraser Service](file:///d:/projects/new%20EDMS%20py/Translator%20Rephraser%20py) (`POST /generate`) and committed to Oracle tables `KEYWORD` and `LKP_DOCUMENT_TAGS`. The document status is updated to `STATUS = 3` (Complete).
+5. **Dense Vector Embeddings (ChromaDB Indexing)**:
+   The completed abstract is sent to the [Embedding Service](file:///d:/projects/new%20EDMS%20py/Embedding%20Service) (`POST /embed` on Port 5003), which calls GovAI (`qwen3-embedding-8b`) to generate a 4096-dimensional dense mathematical vector. The vector is committed persistently to **ChromaDB** (`edms_documents` collection) mapped to the document number.
+
+---
+
+### 2.3 Hybrid Search Pipeline (Semantic Vector + Lexical RRF)
+
+When a user executes a natural language search in the interface:
 
 ```
-┌─────────────────┐      ┌──────────────────────────────────────────┐
-│                 │      │         Smart EDMS API (FastAPI)         │
-│   Next.js       │◄────►│                                          │
-│   Frontend      │ REST │  Routes ► Services ► Database Layer      │
-│                 │      │    │          │            │              │
-└─────────────────┘      │    │          │            ├─► Oracle DB  │
-                         │    │          │            ├─► SQLite     │
-                         │    │          │            └─► ChromaDB   │
-                         │    │          │                           │
-                         │    │          ├─► WSDL/SOAP DMS Server   │
-                         │    │          ├─► Image Captioning API    │
-                         │    │          ├─► OCR API                 │
-                         │    │          ├─► Face Recognition API    │
-                         │    │          ├─► Video Summarizer API    │
-                         │    │          ├─► Translator/Rephraser API│
-                         │    │          └─► Embedding API           │
-                         └──────────────────────────────────────────┘
-
-┌─────────────────────────────────────────────┐
-│  worker.py  (Standalone Processing Worker)  │
-│  ┌─────────────────────────────────────┐    │
-│  │  processing_worker_loop()           │    │
-│  │  Claims jobs from SQLite queue      │    │
-│  │  Calls processor.py ► AI services   │    │
-│  │  Updates Oracle + SQLite on result  │    │
-│  └─────────────────────────────────────┘    │
-└─────────────────────────────────────────────┘
+User Query (e.g., "photos of electric buses and charging stations in Dubai")
+       │
+       ▼ (1)
+Smart Search Service (Port 5006) ◄──► GovAI LLM Cloud (qwen3-235b-fp16)
+       │                               ├── Generates Broad Synonyms (EV, green transport)
+       │                               └── Isolates Required Concepts (electric buses AND charging stations)
+       ├──────────────────────────────────────────────┐
+       ▼ (Expanded Query)                             ▼ (SQL Conditions)
+Embedding Service (Port 5003)                  Oracle Enterprise Database
+       │                                              │
+       ▼ (4096-dim Query Vector)                      │
+ChromaDB (edms_documents)                             │
+       │                                              │
+       ▼ (Vector Document IDs + Cosine Ranks)         ▼ (Exact Metadata Matches + Lexical Scores)
+       └──────────────────────┬───────────────────────┘
+                              ▼
+                 Reciprocal Rank Fusion (RRF)
+            1.0 / (60 + VectorRank) + 1.0 / (60 + KeywordRank)
+                              │
+                              ▼
+                Ranked Document Results Returned (< 1.5s)
 ```
 
-The API acts as a **middleware layer** — neither the frontend nor the AI services directly access the Oracle database or the DMS. All interactions flow through this API. The background AI processing runs in a **separate worker process** (`worker.py`) to keep the FastAPI request handling isolated from heavy queue work.
+1. **Natural Language Query Understanding**:
+   The raw search phrase is dispatched to the [Smart Search Service](file:///d:/projects/new%20EDMS%20py/Smart%20Search%20Service) (`POST /tokenize` on Port 5006) **before** an Oracle database connection is acquired. The service prompts GovAI LLM (`qwen3-235b-fp16`) to break the phrase into:
+   - **Expanded Tokens**: Synonyms and related terminology (e.g., `"sea"` ➔ `"water"`, `"ocean"`).
+   - **Required Concepts**: Mandatory constraints that the user explicitly indicated must co-occur (e.g., `"cars and plants"`).
+2. **Parallel Dual-Path Retrieval**:
+   - **Semantic Vector Path**: The enriched query is passed to the [Embedding Service](file:///d:/projects/new%20EDMS%20py/Embedding%20Service) (Port 5003) to generate a query vector. ChromaDB evaluates cosine similarity distance and returns candidate document IDs. Matches exceeding `VECTOR_DISTANCE_THRESHOLD` (e.g., > 1.3) are discarded.
+   - **Lexical Oracle SQL Path**: Dynamic SQL queries execute against `PROFILE`, `KEYWORD`, `LKP_DOCUMENT_TAGS`, and `LKP_PERSON`. Expanded synonyms are combined with broad SQL `OR`, while required concepts are strictly enforced with SQL `AND`.
+3. **Reciprocal Rank Fusion (RRF) Ranking**:
+   Results from ChromaDB (`VECTOR_RANK`) and Oracle keyword scoring (`KEYWORD_RANK`) are fused directly inside Oracle SQL using the standard Reciprocal Rank Fusion formula:
+   $$\text{Score} = \frac{1.0}{60 + \text{VECTOR\_RANK}} + \frac{1.0}{60 + \text{KEYWORD\_RANK}}$$
+   Documents scoring highly across both semantic meaning and lexical keywords rise to the top.
+4. **Zero-Downtime Fallback**: If the Smart Search Service, Embedding Service, or ChromaDB are unreachable, the API logs a warning and falls back to standard Oracle SQL `LIKE` search without throwing errors to the user.
 
 ---
 
-## Technology Stack
+## 3. Connected Ecosystem & Sibling Microservices
 
-| Component | Technology |
-|---|---|
-| **Framework** | FastAPI (async, ASGI) |
-| **ASGI Server** | Uvicorn (multi-worker support) |
-| **Database** | Oracle DB (via `oracledb` thin driver) |
-| **DMS Integration** | SOAP/WSDL via `zeep` (with custom binary buffer parser) |
-| **Vector Store** | ChromaDB (persistent, local) |
-| **Local Queue DB** | SQLite (WAL mode, busy timeout) |
-| **Image Processing** | Pillow, PyMuPDF (fitz) |
-| **Video Processing** | MoviePy, FFmpeg (hardware-accelerated: NVIDIA/AMD/Intel QSV) |
-| **Validation** | Pydantic v2, Marshmallow |
-| **Rate Limiting** | SlowAPI |
-| **Session Management** | Starlette SessionMiddleware (cookie-based, 60-day TTL) |
-| **Analytics** | PostHog |
-| **Password Hashing** | MD5 Base64 (legacy DMS compatibility) |
+### 3.1 Ecosystem Architecture & Port Reference
+
+The Smart EDMS API acts as the orchestrator binding together the following microservices and utilities across `d:\projects\new EDMS py`:
+
+| Service / Project | Host / Port | Core Technology | Architectural Role |
+|:---|:---:|:---|:---|
+| **EDMS API (This Project)** | **5000** | FastAPI · Uvicorn · Oracle thin | **Central Orchestrator, Middleware, eDOCS SOAP client & Database Manager** |
+| **Image Captioning py** | **5001** | FastAPI · GovAI `qwen3-vl-30b` · Ollama | Multimodal scene description, visual tags, zero-disk byte streaming |
+| **Face Recognition py** | **5002** | FastAPI · ChromaDB · Pillow | Face gateway, local PIL crops/annotations, vector search in `faces` |
+| **Embedding Service** | **5003** | FastAPI · GovAI `qwen3-embedding-8b` | Generates 4096-dim vector embeddings for document abstracts & queries |
+| **OCR py** | **5004** | FastAPI · GovAI `qwen3-vl-30b` · EasyOCR | Multilingual Arabic/English text extraction from scanned documents |
+| **Smart Search Service** | **5006** | FastAPI · GovAI `qwen3-235b-fp16` | Natural language intent extraction, synonym expansion, required concepts |
+| **Video Context Summarizer**| **5008** | FastAPI · OpenCV · MoviePy · Whisper | Strategic keyframe vision, speech transcription, face crop extraction |
+| **Dataiku Model API** | **5009** / DSS :13000 | Flask · Waitress · RetinaFace · VGG-Face | **Stateless ML perception middleware for Face Recognition (AI Center)** |
+| **Translator Rephraser py** | **5010** | FastAPI · GovAI `qwen3-235b-fp16` | Arabic Tashkeel removal, EN↔AR translation, abstract shortening (< 2000 ch) |
+| **Smart EDMS Frontend** | **3000** | Next.js 15 · React 19 · TypeScript | Enterprise primary web portal (admin dashboards, viewer, sharing) |
+| **EDMS Media Frontend** | **3000** | Next.js 16 · React 19 · TanStack Query | Media viewer, Next.js server-side API proxy (`/api/[...proxy]`) |
+| **EDMS Mobile** | Native | React Native · Expo | Mobile viewer application for iOS and Android |
+| **EDMS Archiving System** | **5000** / **3000** | Next.js 14 · Flask · Waitress | Public Transport Agency (PTA) compliance & document expiry tracker |
+| **Oracle Session Monitor** | Scheduled | Python · PyInstaller | Reaps hanging Oracle connections (> 3h) during weekend maintenance windows |
+| **EDMS Crawler Task** | Scheduled | Python · PyInstaller (`EDMSCrawlerTask.exe`) | Scheduled 30-min pacing trigger for `POST /process-batch` |
+| **EDMS Auto Check-In Job** | Scheduled | Python · PyInstaller (`edms_auto_checkin.exe`)| Unlocks orphaned checked-out documents in Oracle via eDOCS WSDL |
+| **EDMS Inactive Users Job**| Scheduled | Python · PyInstaller (`disable_inactive_users.exe`)| Deactivates dormant accounts (> 90 days) in `PEOPLE`, shields service users |
+| **EDMS Restart DM Server** | Scheduled | Python · PyInstaller (`restart_edocs_dm.exe`) | Orderly service cycling (`DMServerMonitor`, `DOCSFusion`, `DMSvrService`) |
 
 ---
 
-## Project Structure
+### 3.2 User Frontends
+
+1. **[Smart EDMS Web Frontend](file:///d:/projects/new%20EDMS%20py/Smart%20EDMS)**: Next.js 15 application providing the full user interface: document collage grids, full-screen media modals, interactive folder navigation, document-event journey timelines, tag editors, VIP managers, and administrative control centers.
+2. **[EDMS Media Frontend](file:///d:/projects/new%20EDMS%20py/EDMS%20Media%20frontend)**: Next.js 16 App Router application. Routes all backend requests through a server-side API proxy (`app/api/[...proxy]/route.ts`) with automatic retries, cookie pass-through, and 10-minute timeouts for streaming downloads.
+3. **[EDMS Mobile](file:///d:/projects/new%20EDMS%20py/EDMS%20Mobile)**: Native mobile application built with React Native and Expo for tablets and mobile devices.
+4. **[EDMS Archiving System](file:///d:/projects/new%20EDMS%20py/EDMS%20Archiving%20system)**: Specialized compliance portal for the Public Transport Agency (PTA) enforcing document validity and expiration date tracking.
+
+---
+
+### 3.3 AI Microservices Suite
+
+- **[Image Captioning Service](file:///d:/projects/new%20EDMS%20py/Image%20Captioning%20py)** (`CAPTIONING_API_URL`): Invoked by `api_client.get_captions()` via memory streaming (`POST /process_image_stream`). Employs GovAI `qwen3-vl-30b` to generate scene descriptions and tags, bounded by `_cap_caption()` to guarantee Oracle column compatibility (< 500 chars).
+- **[Face Recognition Service](file:///d:/projects/new%20EDMS%20py/Face%20Recognition%20py)** (`FACE_API_URL`): Invoked by `api_client.recognize_faces()` (`POST /api/analyze_image_stream`) and `api_client.recognize_faces_from_list()` (`POST /api/recognize_faces`). Maintains a local ChromaDB instance (`faces` collection).
+- **[Dataiku Model API](file:///d:/projects/new%20EDMS%20py/Dataiku%20Model%20API)** (`DATAIKU_MODEL_API_URL`): High-throughput machine learning inference engine running on Port 5009 or Dataiku DSS (`rtauevaidss1.rtatestdom.local:13000`). It is 100% stateless and executes RetinaFace face detection and VGG-Face 4096-dimensional vector extraction. **Operates as part of the Enterprise AI Center without utilizing GovAI LLM.**
+- **[Embedding Service](file:///d:/projects/new%20EDMS%20py/Embedding%20Service)** (`EMBEDDING_API_URL`): Invoked by `api_client.get_embedding_from_service()` (`POST /embed`). Delegates to GovAI `qwen3-embedding-8b` to return 4096-dimensional vectors for abstracts and search queries.
+- **[OCR Service](file:///d:/projects/new%20EDMS%20py/OCR%20py)** (`OCR_API_URL`): Invoked by `api_client.get_ocr_text()` (`POST /translate_image_stream`). Performs Arabic & English OCR via GovAI `qwen3-vl-30b` with watermark deduplication, falling back to local OpenCV CLAHE + EasyOCR.
+- **[Smart Search Service](file:///d:/projects/new%20EDMS%20py/Smart%20Search%20Service)** (`SMART_SEARCH_API_URL`): Invoked by `api_client.get_search_intent()` (`POST /tokenize`). Prompts GovAI `qwen3-235b-fp16` to extract domain synonyms and logical required concepts.
+- **[Video Context Summarizer](file:///d:/projects/new%20EDMS%20py/Video%20Context%20Summarizer)** (`VIDEO_SUMMARIZER_API_URL`): Invoked by `api_client.summarize_video()` (`POST /upload_stream`). Samples video keyframes and extracts audio tracks, polling `GET /status/{task_id}` for completion.
+- **[Translator & Rephraser](file:///d:/projects/new%20EDMS%20py/Translator%20Rephraser%20py)** (`TRANSLATOR_REPHRASER_API_URL`): Invoked by `api_client.translate_text()` (`POST /generate`). Removes Tashkeel diacritics, translates tags between Arabic and English, and rephrases abstracts exceeding 2,000 characters.
+
+---
+
+### 3.4 Enterprise Automation & Task Jobs
+
+A fleet of autonomous Windows scheduled tasks support database and server health:
+
+1. **[EDMS Crawler Task](file:///d:/projects/new%20EDMS%20py/Task%20Jobs/EDMS%20Crawler%20Task%20py)**: Compiled executable (`EDMSCrawlerTask.exe`) running under `NT AUTHORITY\SYSTEM` every 30 minutes. Authenticates and triggers `POST /process-batch`, acting as a pacing buffer to protect GPUs and GovAI LLM endpoints from concurrency spikes.
+2. **[EDMS Auto Check-In Job](file:///d:/projects/new%20EDMS%20py/Task%20Jobs/EDMS%20Auto%20Checkin%20Job)**: Standalone utility (`edms_auto_checkin.exe`) that detects locked documents in Oracle `CHECKOUT` (`CHECKIN_DATE IS NULL`) and releases them via eDOCS WSDL (`%STATUS = %UNLOCK`).
+3. **[EDMS Inactive Users Job](file:///d:/projects/new%20EDMS%20py/Task%20Jobs/EDMS%20Inactive%20Users%20Job)**: Nightly governance utility (`disable_inactive_users.exe`) identifying accounts inactive for > 90 days and setting `DISABLED = 'Y'` in `PEOPLE`, while strictly safeguarding service accounts in `LKP_SERVICE_USERS`.
+4. **[EDMS Restart DM Server Job](file:///d:/projects/new%20EDMS%20py/Task%20Jobs/EDMS%20Restart%20DM%20Server%20Job)**: Server maintenance utility (`restart_edocs_dm.exe`) that stops and restarts eDOCS DM Windows services in dependency order, recycles the IIS application pool, and verifies post-restart health via WSDL HTTP probes.
+5. **[Oracle Session Monitor](file:///d:/projects/new%20EDMS%20py/Oracle%20Session%20Monitor)**: Maintenance reaper (`edms_oracle_kill_sessions.exe`) executing on weekends to terminate orphaned Oracle database sessions alive for > 180 minutes, complementing the API's live `/api/admin/oracle-sessions` control routes.
+
+---
+
+### 3.5 Enterprise Storage & Core Platforms
+
+- **OpenText eDOCS DM**: Enterprise document management system accessed via SOAP 1.1 / WSDL. Stores physical binaries, folder security trees, and trustee access control lists.
+- **Oracle Database 19c Enterprise**: Master relational repository storing profiles, tags, events, favorites, user settings, quotas, and organizational structures.
+- **ChromaDB**: On-disk vector database storing 4096-dimensional dense vector embeddings in collection `edms_documents` with Euclidean/Cosine indexing.
+- **GovAI Sovereign AI Cloud**: Sovereign UAE AI platform (`https://llmapi.govai.ae`) hosting foundation models:
+  - `qwen3-235b-fp16`: Natural language query understanding, translation, concept tokenization.
+  - `qwen3-vl-30b`: Multimodal visual comprehension for OCR, image captioning, and video keyframes.
+  - `qwen3-embedding-8b`: 4096-dimensional text vector embeddings.
+  - `whisper_asr`: Audio speech-to-text transcription.
+- **Enterprise AI Center (Dataiku DSS)**: Dedicated on-premise deep learning cluster (`rtauevaidss1.rtatestdom.local:13000`) hosting neural network weights for RetinaFace and VGG-Face.
+
+---
+
+## 4. Technology Stack
+
+| Layer | Component | Description |
+|---|---|---|
+| **API Framework** | FastAPI (ASGI) | Async routing, dependency injection (`Depends`), Pydantic v2 schemas |
+| **ASGI Server** | Uvicorn | High-concurrency async server, multi-worker process manager |
+| **Relational Database** | Oracle Database 19c | Thin driver via `oracledb`, connection pool, parameterized SQL |
+| **DMS Integration** | OpenText eDOCS DM | SOAP/WSDL via `zeep` with custom binary buffer decompression |
+| **Vector Store** | ChromaDB | Persistent local embedded vector database (4096-dim space) |
+| **Queue Database** | SQLite 3 | WAL mode, busy timeout, multi-worker leader-election lease support |
+| **Document Processing** | PyMuPDF (fitz), Pillow | PDF parsing, image normalization, text overlay watermarking |
+| **Video Processing** | MoviePy, FFmpeg | Hardware-accelerated video watermarking (NVIDIA / AMD / Intel QSV) |
+| **Security & Auth** | Starlette SessionMiddleware | HTTP-only cookie sessions (60-day TTL, `SameSite=Lax`), MD5 Base64 hashing |
+| **Rate Limiting** | SlowAPI | Redis-free in-memory rate limiting per endpoint per IP |
+| **Email Delivery** | Python smtplib | SMTP notification delivery for OTP share links with HTML branding |
+| **Process Hosting** | Microsoft IIS | Windows Server IIS reverse-proxying via `HttpPlatformHandler` |
+
+---
+
+## 5. Codebase Structure & Directory Layout
 
 ```
 EDMS API/
-├── app.py                    # FastAPI application entry point, middleware stack & lifespan setup
-├── worker.py                 # Standalone background processing worker (separate process)
-├── db_connector.py           # Central re-export hub for all database functions
-├── api_client.py             # HTTP clients for external AI microservices (sync, stream-based)
-├── vector_client.py          # ChromaDB vector database client & external embedding wrapper
-├── backfill_vectors.py       # Standalone script to backfill vector embeddings for existing docs
+├── app.py                         # FastAPI entry point, middleware stack, lifespan management
+├── worker.py                      # Dedicated background processing worker (standalone daemon)
+├── db_connector.py                # Central re-export hub for all database operations
+├── api_client.py                  # HTTP client interfacing with downstream AI microservices
+├── vector_client.py               # ChromaDB client & ExternalEmbeddingFunction wrapper
+├── backfill_vectors.py            # Standalone batch indexing utility for historical documents
 │
-├── routes/                   # API route handlers (organized by domain)
-│   ├── auth.py               # Authentication, login/logout, user preferences, groups, trustees
-│   ├── documents.py          # Document CRUD, upload, download, watermarked download, metadata
-│   ├── media.py              # Image/PDF/video streaming, thumbnails, cache management
-│   ├── folders.py            # Folder CRUD, move items, download folder as ZIP
-│   ├── tags.py               # Tags, persons, shortlist, batch tag fetching
-│   ├── events.py             # Event CRUD, document-event linking, journey data
-│   ├── favorites.py          # Add/remove/list favorite documents
-│   ├── memories.py           # "On This Day" memories feature
-│   ├── sharing.py            # Shareable links, OTP verification, shared file streaming/download
-│   ├── admin.py              # Admin panel: user management, processing queue control, tab permissions
-│   ├── edocs_admin.py        # eDOCS server cache clearing (background task)
-│   ├── ems_admin.py          # EMS organizational admin: agencies, departments, sections
-│   ├── edms_people.py        # EDMS user provisioning: create/update/export users in PEOPLE table
-│   └── profilesearch.py     # Advanced multi-criteria profile search w/ dynamic scoping
+├── routes/                        # Domain-organized API route handlers
+│   ├── auth.py                    # Login/logout, session user, language/theme, groups, trustees
+│   ├── documents.py               # Document fetch, upload, watermarked download, batch enqueue
+│   ├── media.py                   # Raw image/PDF/video streaming, thumbnails, cache clearing
+│   ├── folders.py                 # Folder tree CRUD, item moves, recursive ZIP download
+│   ├── tags.py                    # Tag/keyword CRUD, batch tag fetching, person additions
+│   ├── events.py                  # Event CRUD, document-event associations, timeline journeys
+│   ├── favorites.py               # Document favorites toggle and listing
+│   ├── memories.py                # "On This Day" historical anniversary queries
+│   ├── sharing.py                 # Shareable links, SMTP OTP verification, shared streaming
+│   ├── admin.py                   # User management, queue pausing/resuming, tab permissions
+│   ├── edocs_admin.py             # Server-side OpenText eDOCS cache clearing
+│   ├── ems_admin.py               # EMS organizational admin: agencies, departments, sections
+│   ├── edms_people.py             # Full CRUD for PEOPLE table, HR employee provisioning
+│   └── profilesearch.py          # Dynamic multi-criteria profile search across Oracle tables
 │
-├── database/                 # Database access layer (Oracle, SQLite)
-│   ├── __init__.py           # Package exports
-│   ├── connection.py         # Oracle connection pool, async wrappers, performance indexes
-│   ├── documents.py          # Document queries: fetch, filter, sort, process status, update
-│   ├── media.py              # DMS media operations: login, get info, stream, thumbnails, cache
-│   ├── folders.py            # Folder hierarchy queries, breadcrumbs, file listing
-│   ├── tags.py               # Tag/keyword CRUD, batch operations, translations
-│   ├── events.py             # Event CRUD, document-event joins, journey data aggregation
-│   ├── favorites.py          # Favorites CRUD (per-user)
-│   ├── memories.py           # "On This Day" query logic, journey data aggregation
-│   ├── users.py              # User details, language/theme preference storage
-│   ├── user_data.py          # EDMS user ID resolution, storage quota management
-│   ├── groups.py             # DMS group queries (sync fallback)
-│   ├── sharing.py            # Share link storage, OTP storage & verification, access logging
-│   ├── admin.py              # Admin user management: add/delete/update EDMS users
-│   ├── ems_admin.py          # EMS organizational data: agencies, departments, EMS sections
-│   ├── edms_people.py        # EDMS user CRUD: PEOPLE table, PEOPLEGROUPS, NETWORK_ALIASES, HR linkage
-│   ├── tab_permissions.py    # Per-user tab visibility permissions
-│   ├── profilesearch.py     # Multi-criteria dynamic SQL builder for profile search
-│   └── processing_queue.sqlite3  # SQLite database for local processing queue
+├── database/                      # Data access layer (Oracle DB & SQLite)
+│   ├── connection.py              # Oracle connection pooling, async wrappers, blocklist loading
+│   ├── documents.py               # Complex filtered document fetch, hybrid search, RRF ranking
+│   ├── media.py                   # DMS media streaming, thumbnail generators, app-bucket caching
+│   ├── folders.py                 # Folder hierarchy queries, breadcrumb generators
+│   ├── tags.py                    # Tag/person CRUD, batch queries, English↔Arabic persistence
+│   ├── events.py                  # Event CRUD and timeline journey data aggregation
+│   ├── favorites.py               # Per-user favorites queries
+│   ├── memories.py                # "On This Day" date matching logic
+│   ├── users.py                   # User profile data, theme/language preferences
+│   ├── user_data.py               # User storage quota deduction and restoration
+│   ├── groups.py                  # DMS group queries and membership validation
+│   ├── sharing.py                 # Share link storage, OTP verification, access logging
+│   ├── admin.py                   # Admin operations: add/update/delete EDMS users
+│   ├── ems_admin.py               # EMS organizational hierarchy data management
+│   ├── edms_people.py             # PEOPLE table, PEOPLEGROUPS, NETWORK_ALIASES, HR linkage
+│   ├── tab_permissions.py         # Tab visibility permissions per user
+│   ├── profilesearch.py          # Dynamic SQL builder for multi-criteria form searches
+│   └── processing_queue.sqlite3   # Persistent SQLite queue database (WAL mode)
 │
-├── schemas/                  # Pydantic/Marshmallow request/response schemas
-│   ├── auth.py               # Login, user update, group, trustee, EDMS user CRUD schemas
-│   ├── documents.py          # Document upload, metadata update, security schemas
-│   ├── folders.py            # Folder create, rename, move schemas
-│   ├── sharing.py            # Share link, OTP, folder contents, download schemas
-│   ├── tags.py               # Tag, person, processing status schemas
-│   ├── events.py             # Event creation schema
-│   └── edocs_cache.py        # eDOCS cache clear request/response schemas
+├── schemas/                       # Pydantic v2 validation models & request/response schemas
+│   ├── auth.py                    # Login credentials, user preferences, trustee schemas
+│   ├── documents.py               # Document upload, metadata update, security schemas
+│   ├── folders.py                 # Folder creation, rename, move schemas
+│   ├── sharing.py                 # Share links, OTP verification, folder content schemas
+│   ├── tags.py                    # Tag creation, person registration schemas
+│   ├── events.py                  # Event creation and linking schemas
+│   └── edocs_cache.py             # eDOCS cache clearing request/response schemas
 │
-├── services/                 # Business logic & background processing
-│   ├── processor.py          # AI document processing pipeline (caption, OCR, face, video)
-│   ├── processing_queue.py   # SQLite-backed local processing queue, worker loop & mode control
-│   └── edocs_cache.py        # OpenText eDOCS DM server cache clearing (passive, non-destructive)
+├── services/                      # Core business logic & processing engines
+│   ├── processor.py               # AI orchestration engine (caption, OCR, face, video, vector)
+│   ├── processing_queue.py        # SQLite queue manager, worker loop, mode audit trail
+│   └── edocs_cache.py             # Passive OpenText eDOCS DM server cache purger
 │
-├── utils/                    # Shared utilities
-│   ├── common.py             # Auth helpers, MIME detection, email sending (OTP & share links),
-│   │                         #   text cleaning, Content-Disposition builder, company logo loader
-│   ├── watermark.py          # Image/PDF/video watermarking (FFmpeg HW-accelerated + MoviePy fallback)
-│   ├── sanitize.py           # XSS prevention: input text & filename sanitization
-│   ├── cache_eviction.py     # Periodic video cache cleanup (LRU eviction by file age)
-│   ├── log_cleanup.py        # IIS/application log file cleanup (age-based deletion, 14-day default)
-│   └── ttl_cache.py          # In-memory TTL cache for frequently-requested metadata
+├── utils/                         # Shared utilities
+│   ├── common.py                  # Auth dependencies (`get_current_user`), SMTP email sender
+│   ├── watermark.py               # Digital watermarking (FFmpeg HW acceleration + PyMuPDF)
+│   ├── sanitize.py                # Input text and filename sanitization (stored XSS defense)
+│   ├── cache_eviction.py          # LRU video cache cleanup background task
+│   ├── log_cleanup.py             # 14-day rolling IIS/application log file purger
+│   └── ttl_cache.py               # Thread-safe in-memory cache for search metadata
 │
-├── wsdl_client/              # SOAP/WSDL DMS integration layer
-│   ├── __init__.py           # Package exports
-│   ├── config.py             # WSDL URL and DMS credential configuration
-│   ├── base.py               # Core SOAP client initialization & helpers
-│   ├── auth.py               # DMS authentication (user login, system login with 30-min TTL cache)
-│   ├── documents.py          # DMS document operations (upload, download, stream, delete, set security)
-│   ├── folders.py            # DMS folder operations (create, rename, move, list, delete)
-│   ├── users.py              # DMS user/group queries (groups for user, all groups, group members)
-│   └── utils.py              # DMS binary buffer parsing (zlib decompression, UTF-16LE string extraction,
-│                             #   user/group result normalization, folder content parsing)
+├── wsdl_client/                   # OpenText eDOCS SOAP / WSDL integration adapter
+│   ├── config.py                  # WSDL endpoints and system credentials
+│   ├── base.py                    # Zeep client factory and error wrappers
+│   ├── auth.py                    # User authentication and cached system login (30-min TTL)
+│   ├── documents.py               # DMS binary upload, download, streaming, security ACL
+│   ├── folders.py                 # DMS folder creation, rename, move, recursive delete
+│   ├── users.py                   # DMS group queries, membership queries
+│   └── utils.py                   # Binary buffer parser (6-strategy zlib decompression, UTF-16LE)
 │
-├── chroma_db/                # ChromaDB persistent vector store data directory
-├── thumbnail_cache/          # Persistent thumbnail image cache
-├── temp_thumbnail_cache/     # Ephemeral thumbnail cache (24h TTL)
-├── video_cache/              # Cached video files (LRU evicted every 6 hours)
-├── download_cache/           # Cached file downloads for watermarking
-├── static/                   # Static files served by FastAPI (e.g., company logo)
-│   └── images/               # Logo and brand assets for email templates
-├── blocklist.json            # Content filtering: stop words, profanity, meaningless characters
-├── requirements.txt          # Python dependencies
-├── .env                      # Environment variables (credentials, URLs, timeouts)
-├── setup.bat                 # Windows setup script (venv + pip install)
-├── run_api.bat               # Windows startup script (Uvicorn with 4 workers)
-├── download_packages.bat     # Downloads pip wheels for offline/air-gapped deployment
-├── install_packages.bat      # Installs packages from local wheel cache (offline)
-├── create_archive.bat        # Creates a deployment archive ZIP (respects .gitignore)
-├── web.config                # IIS deployment configuration (primary)
-└── web2.config               # IIS deployment configuration (alternate)
+├── diagrams/                      # System architecture diagrams
+│   ├── smart_edms_architecture.jpg # Rendered architecture infographic (Ingestion & Search)
+│   ├── render_diagram.html        # HTML/SVG source template for architecture diagram
+│   ├── EDMS_Architecture_High_Level.pdf
+│   └── EDMS_Architecture_Technical_Details.pdf
+│
+├── chroma_db/                     # Persistent on-disk ChromaDB vector store
+├── thumbnail_cache/               # Persistent thumbnail cache directory
+├── temp_thumbnail_cache/          # Ephemeral thumbnail cache (24h TTL)
+├── video_cache/                   # Cached video files for HTTP Range request streaming
+├── download_cache/                # Download staging area for watermark application
+├── static/                        # Static assets (company branding, email logo assets)
+├── blocklist.json                 # Stop words, profanity, and meaningless tag filtering rules
+├── requirements.txt               # Pinned Python package dependencies
+├── .env                           # Active environment variables and service URLs
+├── run_api.bat                    # Production Uvicorn launcher (4 workers)
+├── setup.bat                      # Automated offline virtualenv installer
+├── download_packages.bat          # Online wheel pre-fetcher for air-gapped deployment
+├── install_packages.bat           # Offline wheel installer
+├── create_archive.bat             # Release zip packaging utility
+├── web.config                     # Primary Windows IIS HttpPlatformHandler configuration
+└── web2.config                    # Alternate production IIS configuration with tuning
 ```
 
 ---
 
-## Environment Variables
+## 6. API Endpoints Reference
 
-The `.env` file configures all external connections, secrets, and tuning parameters. The following variables are supported:
+All routes require active session authentication via the `get_current_user` FastAPI dependency, unless explicitly noted.
 
-### Oracle Database
-| Variable | Description |
-|---|---|
-| `DB_HOST` | Oracle database server hostname/IP |
-| `DB_PORT` | Oracle listener port |
-| `DB_SERVICE_NAME` | Oracle service name |
-| `DB_USERNAME` | Database user |
-| `DB_PASSWORD` | Database password |
+### 6.1 Authentication & User Sessions
 
-### SOAP DMS Server
-| Variable | Description |
-|---|---|
-| `WSDL_URL` | WSDL endpoint for the DMS SOAP service |
-| `DMS_USER` | System-level DMS username (for background operations) |
-| `DMS_PASSWORD` | System-level DMS password |
-
-### Email (SMTP)
-| Variable | Description |
-|---|---|
-| `SMTP_SERVER` | SMTP mail server hostname |
-| `SMTP_PORT` | SMTP port (typically 587) |
-| `SMTP_USER` | SMTP authentication username |
-| `SMTP_PASSWORD` | SMTP authentication password |
-| `SMTP_SENDER_EMAIL` | Sender email address |
-| `SMTP_SENDER_NAME` | Display name for sent emails |
-| `COMPANY_NAME` | Company name shown in email templates |
-| `SUPPORT_EMAIL` | Support email in email footer |
-| `EMAIL_PRIMARY_COLOR` | Brand color for HTML email templates |
-| `COMPANY_WEBSITE` | Company website URL in email footer |
-
-### AI Microservice URLs
-| Variable | Description |
-|---|---|
-| `CAPTIONING_API_URL` | Image captioning / object detection service |
-| `OCR_API_URL` | Optical Character Recognition service (images & PDFs) |
-| `FACE_API_URL` | Face recognition / identification service |
-| `VIDEO_SUMMARIZER_API_URL` | Video analysis, transcription & summarization service |
-| `TRANSLATOR_REPHRASER_API_URL` | Text translation (EN↔AR) & tokenization service |
-| `EMBEDDING_API_URL` | Text embedding service (for semantic vector search) |
-
-### Application
-| Variable | Description | Default |
-|---|---|---|
-| `FLASK_SECRET_KEY` | Secret key for session cookie signing (must be cryptographically random) | _required_ |
-| `FRONTEND_URL` | Frontend URL(s) for CORS. Comma-separated for multiple origins | `http://localhost:3000` |
-| `API_BASE_URL` | Self-referencing API base URL (used in email links) | — |
-| `COMPANY_LOGO_FILENAME` | Logo filename in `/static/images/` for emails | `logo.png` |
-
-### Timeout Tuning
-| Variable | Description | Default |
-|---|---|---|
-| `DMS_GROUP_REFRESH_TIMEOUT_SECONDS` | Timeout for DMS group membership refresh on session restore | `5` |
-| `AUTH_DB_TIMEOUT_SECONDS` | Timeout for database lookups during authentication | `5` |
-| `WSDL_LOAD_TIMEOUT_SECONDS` | Timeout for initial WSDL schema loading | `10` |
-| `WSDL_OPERATION_TIMEOUT_SECONDS` | Timeout for individual SOAP operation calls | `15` |
-| `PROCESSING_TASK_TIMEOUT_SECONDS` | Maximum time per AI processing task before timeout | `300` (5 min) |
-
-### ChromaDB
-| Variable | Description | Default |
-|---|---|---|
-| `CHROMA_DB_PATH` | Path to the ChromaDB persistent storage directory | `./chroma_db` |
-| `CHROMA_COLLECTION_NAME` | Name of the ChromaDB collection | `edms_documents` |
-
-### Multi-Node / Load-Balanced Deployment
-When running the API behind a load balancer with 2+ nodes, all stateful file-based
-resources **must** point at a single shared network mount (NAS / SMB share) so that
-both nodes read and write the same data. The following environment variables control
-those paths — set them identically on **every** node:
-
-| Variable | Description | Default (single-node) |
-|---|---|---|
-| `CHROMA_DB_PATH` | ChromaDB vector store directory (shared) | `./chroma_db` |
-| `PROCESSING_QUEUE_DB_PATH` | SQLite processing-queue file (shared) | `database/processing_queue.sqlite3` |
-| `IDEMPOTENCY_DB_PATH` | SQLite idempotency-key file (shared) | `database/idempotency.sqlite3` |
-| `THUMBNAIL_CACHE_DIR` | Thumbnail image cache directory (shared) | `./thumbnail_cache` |
-| `VIDEO_CACHE_DIR` | Video cache directory (shared) | `./video_cache` |
-| `TEMP_THUMBNAIL_CACHE_DIR` | Ephemeral thumbnail cache (shared) | `./temp_thumbnail_cache` |
-| `DOWNLOAD_CACHE_DIR` | Download cache directory (shared) | `./download_cache` |
-
-To prevent duplicate background work (document processing, cache cleanup, log
-cleanup) across nodes, a lightweight leader-election mechanism ensures only **one**
-node at a time runs these tasks:
-
-| Variable | Description | Default |
-|---|---|---|
-| `WORKER_ROLE` | `leader` (always run background work), `follower` (never run it), or `auto` (negotiate via shared lease file) | `auto` |
-| `WORKER_LEASE_DIR` | Directory for the lease file (must be on the shared mount) | value of `CHROMA_DB_PATH` |
-| `WORKER_LEASE_FILE` | Full path to the lease JSON file | `<WORKER_LEASE_DIR>/worker_lease.json` |
-| `WORKER_LEASE_TTL` | Seconds before a lease is considered stale (triggers failover) | `30` |
-| `WORKER_LEASE_RENEW_INTERVAL` | How often (seconds) the leader renews its lease | `10` |
-
-> **Note on sessions:** `FLASK_SECRET_KEY` must be **identical** on all nodes so
-> that a session cookie signed by one node is accepted by the other.
+| Method | Endpoint | Description | Rate Limit |
+|---|---|---|---|
+| `POST` | `/api/auth/login` | Authenticates user against eDOCS SOAP DMS. Creates server-side signed cookie session. | 5 / min |
+| `POST` | `/api/auth/logout` | Terminates user session and invalidates cookie. | — |
+| `GET` | `/api/auth/user` | Returns current user details, security level, groups, and tab permissions. | — |
+| `PUT` | `/api/user/language` | Updates UI language preference (`en` / `ar`) in Oracle DB. | — |
+| `PUT` | `/api/user/theme` | Updates UI theme preference (`light` / `dark`) in Oracle DB. | — |
+| `GET` | `/api/groups` | Lists eDOCS DMS groups (Admins view all; standard users view assigned). | — |
+| `GET` | `/api/groups/{group_id}/members` | Lists members belonging to a specific DMS group. | — |
+| `GET` | `/api/groups/search_members` | Searches for specific users within a DMS group. | — |
+| `GET` | `/api/document/{doc_id}/trustees` | Returns access control list (trustees) assigned to a document. | — |
 
 ---
 
-## Setup & Installation
+### 6.2 Documents & Ingestion
 
-### Prerequisites
-- **Python 3.10+**
-- **Oracle Instant Client** libraries (or `oracledb` thin mode)
-- **FFmpeg** (optional, for hardware-accelerated video watermarking)
-
-### Steps
-
-1. **Create a virtual environment:**
-   ```bash
-   python -m venv venv
-   ```
-
-2. **Activate the environment:**
-   ```bash
-   # Windows
-   venv\Scripts\activate
-
-   # Linux/macOS
-   source venv/bin/activate
-   ```
-
-3. **Install dependencies:**
-   ```bash
-   pip install -r requirements.txt
-   ```
-
-4. **Configure environment:** Copy and fill in the `.env` file with your credentials and service URLs.
-
-5. **Run the API:**
-   ```bash
-   python app.py
-   ```
-   Or use the provided batch file on Windows:
-   ```bash
-   setup.bat      # First-time setup (creates venv + installs dependencies)
-   run_api.bat    # Start the API server (Uvicorn with 4 workers)
-   ```
-
-### Offline / Air-Gapped Installation
-
-For servers without internet access:
-
-1. **On a connected machine:** Run `download_packages.bat` to download all pip wheels into `/packages/`.
-2. **Copy** the entire project folder (with `/packages/`) to the air-gapped server.
-3. **On the server:** Run `install_packages.bat` to install from the local wheel cache.
-
-The API starts on `http://localhost:5000` by default.
+| Method | Endpoint | Description | Rate Limit |
+|---|---|---|---|
+| `GET` | `/api/documents` | Hybrid search document fetch. Supports text search, vector search, date filters, person tags, media type, year, sort, and memories mode. | — |
+| `POST` | `/api/upload_document` | Uploads document to eDOCS DMS, extracts EXIF date, inherits parent security, deducts user quota, records row in Oracle DB. | 10 / min |
+| `POST` | `/api/process_uploaded_documents` | Enqueues newly uploaded document numbers into the SQLite processing queue. | — |
+| `POST` | `/process-batch` | **Master Crawler Trigger**: Queries Oracle for unprocessed documents (`STATUS = 0`) and enqueues them for background AI processing. | 3 / min |
+| `GET` | `/api/document/{docnumber}` | Streams raw binary document directly from eDOCS DMS for inline preview. | — |
+| `PUT` | `/api/update_metadata` | Updates a document's abstract, title, and/or date taken in Oracle DB. | — |
+| `GET` | `/api/download_watermarked/{doc_id}` | Downloads document with a personalized watermark (user system ID + timestamp). Watermarks images (Pillow), PDFs (PyMuPDF), and videos (FFmpeg). | — |
+| `POST` | `/api/update_abstract` | Updates a document's abstract with detected VIP names. | — |
+| `PUT` | `/api/document/{doc_id}/event` | Associates a document with an organizational event. | — |
+| `GET` | `/api/document/{doc_id}/event` | Retrieves the event linked to a document. | — |
+| `POST` | `/api/document/{doc_id}/security` | Configures document trustees and access permissions in eDOCS. | — |
 
 ---
 
-## API Routes
-
-### Authentication & Users
+### 6.3 Media Streaming & Caching
 
 | Method | Endpoint | Description |
 |---|---|---|
-| `POST` | `/api/auth/login` | Authenticates user via DMS SOAP service, creates session. Rate limited: 5/min |
-| `POST` | `/api/auth/logout` | Clears the user session |
-| `GET` | `/api/auth/user` | Returns current authenticated user details (refreshes group membership & tab permissions) |
-| `PUT` | `/api/user/language` | Updates user language preference (`en` / `ar`) |
-| `PUT` | `/api/user/theme` | Updates user UI theme preference (`light` / `dark`) |
-| `GET` | `/api/groups` | Lists DMS groups. Admins/supervisors see all groups; regular users see only their own |
-| `GET` | `/api/groups/{group_id}/members` | Lists members of a specific DMS group |
-| `GET` | `/api/groups/search_members` | Searches for users within a specific DMS group |
-| `GET` | `/api/document/{doc_id}/trustees` | Returns the security trustees (access control list) for a document |
-
-**Authentication Flow:**
-1. User submits credentials → API authenticates against SOAP DMS → DMS returns a session token (DST)
-2. API checks that the user exists in the local Smart EDMS database
-3. API fetches the user's DMS group memberships to determine security level (Admin/Editor/Viewer)
-4. Group membership flags (EMS Admin, DOCS Supervisors) are cached in the session
-5. Security level, tab permissions, and DMS token are stored in a server-side session cookie
-6. All subsequent requests use the session cookie for authentication
-7. On session restore (`GET /api/auth/user`), group memberships are refreshed with a configurable timeout fallback
-
-### Documents
-
-| Method | Endpoint | Description |
-|---|---|---|
-| `GET` | `/api/documents` | Fetches paginated, filtered documents. Supports search (text + vector), date range, person/tag filters, media type, year, sort, scope, and "memories" mode |
-| `POST` | `/api/upload_document` | Uploads a document to DMS with metadata. Validates file quota, extracts EXIF date, inherits parent folder security, sanitizes input. Rate limited: 10/min |
-| `POST` | `/api/process_uploaded_documents` | Enqueues newly uploaded documents for AI processing |
-| `POST` | `/process-batch` | Fetches all unprocessed documents from Oracle and enqueues them for AI processing. Rate limited: 3/min |
-| `GET` | `/api/document/{docnumber}` | Streams a document file directly from DMS for inline viewing |
-| `PUT` | `/api/update_metadata` | Updates a document's abstract and/or date taken |
-| `GET` | `/api/download_watermarked/{doc_id}` | Downloads a document with a digital watermark (user system ID + timestamp) applied. Images, PDFs, and videos get watermarks; other files stream directly |
-| `POST` | `/api/update_abstract` | Updates a document's abstract with detected VIP names |
-| `PUT` | `/api/document/{doc_id}/event` | Links a document to an event |
-| `GET` | `/api/document/{doc_id}/event` | Gets the event linked to a document |
-| `POST` | `/api/document/{doc_id}/security` | Sets the trustees (access control) for a document or folder |
-
-### Media
-
-| Method | Endpoint | Description |
-|---|---|---|
-| `GET` | `/api/image/{doc_id}` | Serves a raw image from DMS |
-| `GET` | `/api/pdf/{doc_id}` | Serves a raw PDF from DMS |
-| `GET` | `/api/video/{doc_id}` | Streams a video with caching — uses disk cache for repeat views, otherwise streams from DMS and writes to cache simultaneously |
-| `GET` | `/api/temp_thumbnail/{doc_id}` | Generates and serves a temporary thumbnail (24h TTL) for a document |
-| `GET` | `/cache/{filename}` | Serves a cached thumbnail from the persistent cache |
-| `POST` | `/api/clear_cache` | Clears all thumbnail and video caches (Editor+ required) |
-| `GET` | `/api/media_counts` | Returns counts of images, videos, and files (filtered by app source and scope) |
-
-### Folders
-
-| Method | Endpoint | Description |
-|---|---|---|
-| `GET` | `/api/folders` | Lists folder contents (subfolders + documents) with optional filtering by scope, media type, search term |
-| `POST` | `/api/folders` | Creates a new folder in DMS. Inherits parent folder security and grants creator full control |
-| `PUT` | `/api/folders/{folder_id}` | Renames a folder |
-| `DELETE` | `/api/folders/{folder_id}` | Deletes a folder. If it has referenced child items, automatically performs recursive force-delete. Restores user quota for deleted files |
-| `POST` | `/api/folders/move-items` | Moves multiple items (documents/folders) to a new parent folder |
-| `GET` | `/api/folders/{folder_id}/download-zip` | Downloads all direct files in a folder as a ZIP archive. Enforces 300 MB size limit |
-
-### Tags & Persons
-
-| Method | Endpoint | Description |
-|---|---|---|
-| `GET` | `/api/tags` | Fetches all tags, respecting security level filtering and app source |
-| `GET` | `/api/tags/{doc_id}` | Fetches tags for a specific document |
-| `POST` | `/api/tags/batch` | Fetches tags for multiple documents in a single request (eliminates N+1 queries). Limited to 50 docs |
-| `POST` | `/api/tags/{doc_id}` | Adds a new tag to a document (auto-translates between EN↔AR) |
-| `DELETE` | `/api/tags/{doc_id}/{tag}` | Removes a tag from a document |
-| `POST` | `/api/tags/shortlist` | Toggles a tag's shortlisted status (Editor+ required) |
-| `POST` | `/api/add_person` | Adds a new person to the lookup table (auto-translates name) |
-| `GET` | `/api/persons` | Searches persons with pagination |
-| `POST` | `/api/processing_status` | Checks if documents are still being AI-processed |
-
-### Events
-
-| Method | Endpoint | Description |
-|---|---|---|
-| `GET` | `/api/events` | Lists events with pagination and search. Supports `fetch_all` mode for dropdowns |
-| `POST` | `/api/events` | Creates a new event |
-| `GET` | `/api/events/{event_id}/documents` | Gets documents linked to an event with pagination |
-| `GET` | `/api/journey` | Returns aggregated timeline/journey data |
-
-### Favorites
-
-| Method | Endpoint | Description |
-|---|---|---|
-| `POST` | `/api/favorites/{doc_id}` | Adds a document to user's favorites |
-| `DELETE` | `/api/favorites/{doc_id}` | Removes a document from user's favorites |
-| `GET` | `/api/favorites` | Lists the user's favorited documents with pagination |
-
-### Memories
-
-| Method | Endpoint | Description |
-|---|---|---|
-| `GET` | `/api/memories` | Returns "On This Day" documents — photos/videos from the same month/day in previous years. Supports month/day/limit parameters |
-
-### Sharing
-
-| Method | Endpoint | Description |
-|---|---|---|
-| `POST` | `/api/share/generate` | Generates shareable links for documents or folders. Supports **open mode** (any `@rta.ae` email) and **restricted mode** (specific email recipients). Sends notification emails to restricted recipients. Rate limited: 100/min |
-| `GET` | `/api/share/info/{token}` | Returns share link metadata (restricted vs open, expiry, share type) without authentication |
-| `POST` | `/api/share/request-access/{token}` | Step 1 of OTP flow: validates email domain/target, generates a 6-digit OTP, stores it in DB, and sends via SMTP. Rate limited: 5/min |
-| `POST` | `/api/share/verify-access/{token}` | Step 2 of OTP flow: verifies OTP. Returns document info (file shares) or folder info (folder shares). Logs access |
-| `GET` | `/api/share/folder-contents/{token}` | Returns shared folder contents with subfolder navigation. Validates the requested folder is within the shared hierarchy |
-| `GET` | `/api/share/stream/{token}` | Streams a shared document for inline viewing (no watermark). Optimized for video with Range request support via cache |
-| `GET` | `/api/share/download/{token}` | Downloads a shared document with a watermark containing the viewer's email. Rate limited: 10/min |
-
-**Sharing Security Model:**
-- **Open shares**: Any `@rta.ae` email can request OTP access
-- **Restricted shares**: Only the designated email can access; auto-sends notification with the link
-- **Folder shares**: Validates every subfolder/document access against the root shared folder hierarchy
-- **OTP verification**: Required for all shares — 6-digit code sent via email, stored in Oracle DB with expiry
-- **Watermarking on download**: All downloaded files are watermarked with the viewer's email + timestamp + doc ID
-
-### Admin Panel
-
-| Method | Endpoint | Description |
-|---|---|---|
-| `GET` | `/api/admin/check-access` | Checks if the user is on the admin allowlist |
-| `GET` | `/api/admin/users` | Paginated list of EDMS users with search |
-| `POST` | `/api/admin/users` | Adds a new user to Smart EDMS (from the PEOPLE table) |
-| `PUT` | `/api/admin/users/{id}` | Updates user security level, language, theme, and quota |
-| `DELETE` | `/api/admin/users/{id}` | Removes a user from Smart EDMS |
-| `GET` | `/api/admin/security-levels` | Lists available security levels |
-| `GET` | `/api/admin/search-people` | Searches Oracle PEOPLE table for users not yet in Smart EDMS |
-| `GET` | `/api/admin/processing-queue/status` | Returns queue status (queued/in-progress/completed/failed counts), recent failures, Oracle pending count, worker mode |
-| `POST` | `/api/admin/processing-queue/worker/pause` | Pauses the background processing worker |
-| `POST` | `/api/admin/processing-queue/worker/resume` | Resumes the background processing worker |
-| `POST` | `/api/admin/processing-queue/worker/drain` | Gracefully drains: finishes current jobs, then pauses |
-| `POST` | `/api/admin/processing-queue/retry-failed` | Retries all failed processing jobs (resets Oracle attempts) |
-| `POST` | `/api/admin/processing-queue/retry-selected` | Retries specific failed jobs by document number |
-| `DELETE` | `/api/admin/processing-queue/completed` | Purges completed jobs older than N hours |
-| `GET` | `/api/admin/tab-permissions/{user_id}` | Gets tab permissions for a specific user |
-| `PUT` | `/api/admin/tab-permissions` | Creates or updates a tab permission |
-| `POST` | `/api/admin/tab-permissions/init/{user_id}` | Creates default tab permissions for a new user |
-| `DELETE` | `/api/admin/tab-permissions/{id}` | Deletes a specific tab permission |
-
-### eDOCS Admin
-
-Server-side eDOCS DM cache management. Clears metadata, index, echo, and temporary cache files from the OpenText eDOCS local cache directory (`%APPDATA%/OpenText/DM/Cache/`). Requires admin allowlist access.
-
-| Method | Endpoint | Description |
-|---|---|---|
-| `POST` | `/api/admin/edocs/clear-cache` | Triggers a passive eDOCS server cache clear as a background task. Returns `202 Accepted` immediately. Optionally accepts a `user_id` to scope the operation. Skips locked files to preserve active sessions |
-
-**Cache Clear Behavior:**
-- Targets specific cache zones: `Default`, `metadata`, `index`, `echo`, `temp`, `document`
-- **Passive/non-destructive**: Does not kill processes, close applications, or force-delete locked files
-- Cleans files recursively within target zones, then removes empty directories
-- Returns detailed statistics: deleted files count, skipped locked files, removed directories
-
-### EMS Admin
-
-EMS Admin manages the organizational hierarchy: **Agencies → Departments → Sections**. Access requires EMS_ADMIN group membership or Editor/Admin security level.
-
-| Method | Endpoint | Description |
-|---|---|---|
-| `GET` | `/api/ems-admin/check-access` | Checks EMS admin access |
-| `GET` | `/api/departments/agencies` | Lists all active agencies |
-| `GET` | `/api/sections` | Lists companies/sections with pagination and search |
-| `POST` | `/api/sections/add` | Adds a new company/section |
-| `PUT` | `/api/sections/update` | Updates a company/section |
-| `GET` | `/api/departments` | Lists departments with pagination, search, and agency filter |
-| `POST` | `/api/departments/add` | Adds a new department |
-| `PUT` | `/api/departments/update` | Updates a department |
-| `GET` | `/api/ems_sections/departments_by_agency/{id}` | Gets departments filtered by agency |
-| `GET` | `/api/ems_sections` | Lists EMS sections with filters |
-| `POST` | `/api/ems_sections/add` | Adds a new EMS section |
-| `PUT` | `/api/ems_sections/update` | Updates an EMS section |
-
-### EDMS People Management
-
-Full CRUD for DMS user accounts in the PEOPLE table, including group memberships, network aliases, and HR system linkage. Access requires EMS Admin privileges.
-
-| Method | Endpoint | Description |
-|---|---|---|
-| `GET` | `/api/edms-people` | Paginated list of EDMS users (PEOPLE table) with HR hierarchy data. Supports search by username, full name, or email |
-| `GET` | `/api/edms-people/hr-employees` | Searches HR employees (`LKP_HR_EMPLOYEES`) not yet provisioned in EDMS. Returns up to 50 results |
-| `GET` | `/api/edms-people/hr/agencies` | Lists all active agencies for HR dropdown selection |
-| `GET` | `/api/edms-people/hr/departments` | Lists departments filtered by agency for cascading dropdowns |
-| `GET` | `/api/edms-people/hr/sections` | Lists sections filtered by department for cascading dropdowns |
-| `GET` | `/api/edms-people/groups` | Lists all EDMS groups (`GROUPS` table) for group assignment dropdowns |
-| `GET` | `/api/edms-people/{system_id}/details` | Returns detailed info for a user: group memberships, network aliases, and HR hierarchy (agency/department/section) |
-| `POST` | `/api/edms-people` | Creates a new EDMS user: inserts into PEOPLE, assigns groups via PEOPLEGROUPS, creates network aliases, auto-assigns DOCS_USERS group, and marks the HR employee record as provisioned |
-| `PUT` | `/api/edms-people/{system_id}` | Updates an existing EDMS user: modifies PEOPLE fields, rebuilds group memberships, rebuilds network aliases. Password update is optional |
-| `GET` | `/api/edms-people/export` | Exports all active EDMS users with full details (username, name, email, HR hierarchy, group memberships, last login) for Excel download. Filters disabled users |
-
-**User Provisioning Flow:**
-1. Admin searches HR employees not yet in EDMS → selects one
-2. System auto-fills username, name, email from HR record
-3. Admin sets password, primary group, additional groups, security level, and network aliases
-4. On create: system generates a new SYSTEM_ID via Oracle sequence, hashes the password (MD5 Base64), inserts the PEOPLE record, assigns all groups (including auto-assigning `DOCS_USERS`), creates network aliases, and marks the HR record with `IS_EDMS_USR = 'Y'`
-
-### Profile Search
-
-Advanced document search that queries Oracle database tables dynamically based on configured search scopes and types.
-
-| Method | Endpoint | Description |
-|---|---|---|
-| `GET` | `/api/profilesearch/scopes` | Returns available search scopes for the current user (cached 5 min) |
-| `GET` | `/api/profilesearch/types` | Returns available search types, optionally filtered by scope (cached 5 min) |
-| `POST` | `/api/profilesearch/search` | Multi-criteria search: accepts up to 6 criteria (AND logic), scope, date range, and pagination. Dynamically builds SQL against configured Oracle tables |
-| `GET` | `/api/profilesearch/search` | Legacy single-criterion search (backwards compatible) |
-
-**Search Scopes:**
-- **0 (Global)**: Cross-table search across all associated Oracle forms — slower but comprehensive
-- **Specific Form IDs** (e.g., 2572, 3799): Queries only the specific form's Oracle table — significantly faster for targeted searches
+| `GET` | `/api/image/{doc_id}` | Streams an image file from eDOCS with image MIME headers. |
+| `GET` | `/api/pdf/{doc_id}` | Streams a PDF document from eDOCS (configured with CSP headers for iframe viewing). |
+| `GET` | `/api/video/{doc_id}` | Streams video with disk caching and HTTP `Range` request support for seeking. |
+| `GET` | `/api/temp_thumbnail/{doc_id}` | Generates and serves an ephemeral thumbnail (24-hour TTL). |
+| `GET` | `/cache/{filename}` | Serves cached thumbnails from persistent disk storage. |
+| `POST` | `/api/clear_cache` | Purges all thumbnail, temporary, and video caches (Editor/Admin required). |
+| `GET` | `/api/media_counts` | Returns aggregate counts of images, videos, and files filtered by app source. |
 
 ---
 
-## AI Processing Pipeline
+### 6.4 Folders & Hierarchy Navigation
 
-When documents are uploaded or a batch process is triggered, the **Processor Service** (`services/processor.py`) orchestrates AI analysis. All synchronous AI client calls are offloaded to a thread pool via `run_in_threadpool()` to avoid blocking the async event loop.
-
-### For Images:
-1. **Image Captioning** → Generates natural language descriptions + tags (via streaming upload)
-2. **OCR** → Extracts text from images (Arabic + English, via streaming upload)
-3. **Face Recognition** → Detects and identifies known individuals (VIPs, via streaming upload)
-4. Tags are auto-translated (EN↔AR) and inserted into the database
-5. The abstract is enriched with Caption, OCR text, and VIP names
-
-### For Videos:
-1. **Video Summarization** → Analyzes frames for objects, extracts audio transcript, detects faces, performs OCR on frames (async polling with 30-min timeout)
-2. **Face Recognition** → Identifies faces from extracted base64-encoded frames
-3. **Transcript Tokenization** → Extracts keywords from audio transcript (via SSE streaming)
-4. Tags are auto-translated and inserted
-5. The abstract is enriched with all findings
-
-### For PDFs:
-1. **PDF OCR** → Extracts text from all pages (via streaming upload)
-2. **Tokenization** → Extracts keywords from the OCR text (via SSE streaming)
-3. Tags are auto-translated and inserted
-
-### Processing Status Codes:
-- **1** = In progress / partially complete (will be retried)
-- **2** = Failed (max 3 attempts)
-- **3** = Fully complete
+| Method | Endpoint | Description |
+|---|---|---|
+| `GET` | `/api/folders` | Lists folder contents (subfolders + documents) with scope and media filters. |
+| `POST` | `/api/folders` | Creates a new folder in eDOCS DMS, inheriting parent security. |
+| `PUT` | `/api/folders/{folder_id}` | Renames a folder in eDOCS DMS. |
+| `DELETE` | `/api/folders/{folder_id}` | Deletes a folder. If child items exist, performs recursive force-deletion and restores user quota. |
+| `POST` | `/api/folders/move-items` | Moves multiple documents and subfolders to a new parent folder. |
+| `GET` | `/api/folders/{folder_id}/download-zip` | Generates a ZIP archive containing all documents in a folder (enforces 300 MB ceiling). |
 
 ---
 
-## Background Processing Queue
+### 6.5 Tags, Persons & VIP Recognition
 
-The processing queue (`services/processing_queue.py`) is a **SQLite-backed local job queue** that manages AI processing jobs.
+| Method | Endpoint | Description |
+|---|---|---|
+| `GET` | `/api/tags` | Retrieves all active tags respecting user security level and app source. |
+| `GET` | `/api/tags/{doc_id}` | Fetches tags assigned to a specific document. |
+| `POST` | `/api/tags/batch` | Batch-fetches tags for up to 50 documents simultaneously (eliminates N+1 queries). |
+| `POST` | `/api/tags/{doc_id}` | Assigns a new tag to a document (auto-translates between English and Arabic). |
+| `DELETE` | `/api/tags/{doc_id}/{tag}` | Removes a tag association from a document. |
+| `POST` | `/api/tags/shortlist` | Toggles a tag's shortlisted status for quick UI access. |
+| `POST` | `/api/add_person` | Registers a new VIP in `LKP_PERSON` (auto-translates name via GovAI). |
+| `GET` | `/api/persons` | Searches registered VIP persons with pagination. |
+| `POST` | `/api/processing_status` | Returns whether documents are currently undergoing AI processing. |
 
-### Queue Architecture:
-- **SQLite database** (WAL mode, 5-second busy timeout) stores jobs with status tracking
-- **Unique constraint** on `docnumber` prevents duplicate job entries
-- **Index** on `(status, available_at, updated_at)` for efficient job claiming
-- **Async worker loop** continuously claims and processes queued jobs
-- **3 concurrent jobs** are claimed per worker cycle
-- **5-minute task timeout** (configurable via `PROCESSING_TASK_TIMEOUT_SECONDS`) prevents hung tasks from blocking the queue
-- **Automatic retry** with 20-second delay for transient failures
-- **Max 3 attempts** per document before marking as permanently failed
-- **Error truncation**: Error messages are capped at 2,000 characters
+---
 
-### Worker Modes:
-- **Running**: Actively claiming and processing jobs
-- **Paused**: Not claiming new jobs (default on startup)
-- **Draining**: Finishing current jobs, then auto-transitioning to paused
+### 6.6 Events & Timeline Journeys
 
-### Job Lifecycle:
+| Method | Endpoint | Description |
+|---|---|---|
+| `GET` | `/api/events` | Lists organizational events with pagination, search, and dropdown modes. |
+| `POST` | `/api/events` | Creates a new organizational event. |
+| `GET` | `/api/events/{event_id}/documents` | Retrieves all documents tagged under an event with pagination. |
+| `GET` | `/api/journey` | Aggregates chronological journey milestones across documented events. |
+
+---
+
+### 6.7 Favorites & Memories ("On This Day")
+
+| Method | Endpoint | Description |
+|---|---|---|
+| `POST` | `/api/favorites/{doc_id}` | Adds a document to the current user's favorites list (`LKP_FAVORITES_DOC`). |
+| `DELETE` | `/api/favorites/{doc_id}` | Removes a document from favorites. |
+| `GET` | `/api/favorites` | Returns the authenticated user's favorite documents with pagination. |
+| `GET` | `/api/memories` | Returns "On This Day" documents—photographs and media taken on the same month and day in previous years. |
+
+---
+
+### 6.8 Secure Sharing & OTP Flow
+
+| Method | Endpoint | Description | Rate Limit |
+|---|---|---|---|
+| `POST` | `/api/share/generate` | Creates secure share link. Supports **Open mode** (any `@rta.ae` email) and **Restricted mode** (specific recipients). | 100 / min |
+| `GET` | `/api/share/info/{token}` | Public route returning link metadata (restricted vs. open, expiry) without authentication. | — |
+| `POST` | `/api/share/request-access/{token}` | Validates recipient email, generates 6-digit OTP, stores in DB, sends via SMTP. | 5 / min |
+| `POST` | `/api/share/verify-access/{token}` | Validates 6-digit OTP code, issues temporary access token, logs audit trail. | — |
+| `GET` | `/api/share/folder-contents/{token}`| Retrieves shared folder tree, verifying requested path is within shared root. | — |
+| `GET` | `/api/share/stream/{token}` | Streams shared document for inline viewing (no watermark). | — |
+| `GET` | `/api/share/download/{token}` | Downloads file watermarked with the recipient's verified email + timestamp. | 10 / min |
+
+---
+
+### 6.9 System Administration & Queue Management
+
+| Method | Endpoint | Description |
+|---|---|---|
+| `GET` | `/api/admin/check-access` | Verifies whether the authenticated user is on the admin allowlist. |
+| `GET` | `/api/admin/users` | Lists EDMS users with pagination and search. |
+| `POST` | `/api/admin/users` | Registers a new user into Smart EDMS from the `PEOPLE` table. |
+| `PUT` | `/api/admin/users/{id}` | Updates user quota, security level (Admin/Editor/Viewer), language, and theme. |
+| `DELETE` | `/api/admin/users/{id}` | Removes a user from the Smart EDMS platform. |
+| `GET` | `/api/admin/processing-queue/status`| Returns queue metrics: pending, in-progress, completed, failed, and worker mode. |
+| `POST` | `/api/admin/processing-queue/worker/pause` | Pauses background queue workers. |
+| `POST` | `/api/admin/processing-queue/worker/resume`| Resumes background queue workers. |
+| `POST` | `/api/admin/processing-queue/worker/drain` | Drains the queue: finishes running jobs, then transitions to paused. |
+| `POST` | `/api/admin/processing-queue/retry-failed` | Re-queues all failed processing jobs and resets attempt counters. |
+| `POST` | `/api/admin/processing-queue/retry-selected`| Retries specific failed jobs by document numbers. |
+| `DELETE` | `/api/admin/processing-queue/completed` | Purges completed queue records older than N hours. |
+| `GET` | `/api/admin/tab-permissions/{user_id}` | Retrieves tab visibility permissions for a specific user. |
+| `PUT` | `/api/admin/tab-permissions` | Creates or updates a tab permission entry. |
+| `POST` | `/api/admin/tab-permissions/init/{user_id}`| Initializes default tab permissions for a newly provisioned user. |
+
+---
+
+### 6.10 eDOCS Server Cache Administration
+
+| Method | Endpoint | Description |
+|---|---|---|
+| `POST` | `/api/admin/edocs/clear-cache` | Triggers a non-destructive, passive server-side clear of OpenText eDOCS local cache zones (`Default`, `metadata`, `index`, `echo`, `temp`, `document`) under `%APPDATA%/OpenText/DM/Cache/`. Skips locked files. Returns `202 Accepted` immediately. |
+
+---
+
+### 6.11 EMS Organizational Administration
+
+Manages organizational structures: **Agencies ➔ Departments ➔ Sections**.
+
+| Method | Endpoint | Description |
+|---|---|---|
+| `GET` | `/api/ems-admin/check-access` | Validates EMS admin access (requires `EMS_ADMIN` group or Editor+). |
+| `GET` | `/api/departments/agencies` | Lists all active government agencies. |
+| `GET` | `/api/sections` | Lists company sections with pagination and agency filters. |
+| `POST` | `/api/sections/add` | Registers a new company section. |
+| `PUT` | `/api/sections/update` | Updates section properties. |
+| `GET` | `/api/departments` | Lists departments with pagination and agency filtering. |
+| `POST` | `/api/departments/add` | Registers a new department. |
+| `PUT` | `/api/departments/update` | Updates department metadata. |
+| `GET` | `/api/ems_sections` | Lists EMS organizational sections. |
+| `POST` | `/api/ems_sections/add` | Registers an EMS section. |
+| `PUT` | `/api/ems_sections/update` | Updates an EMS section. |
+
+---
+
+### 6.12 EDMS People Management & HR Provisioning
+
+| Method | Endpoint | Description |
+|---|---|---|
+| `GET` | `/api/edms-people` | Lists users in the `PEOPLE` table with HR hierarchy associations. |
+| `GET` | `/api/edms-people/hr-employees` | Searches HR employees (`LKP_HR_EMPLOYEES`) not yet provisioned in EDMS. |
+| `GET` | `/api/edms-people/groups` | Lists all available DMS groups for user assignment. |
+| `GET` | `/api/edms-people/{system_id}/details`| Returns detailed account info: groups, network aliases, and HR hierarchy. |
+| `POST` | `/api/edms-people` | Provisions an EDMS user: creates `PEOPLE` record, assigns groups via `PEOPLEGROUPS`, creates network aliases, auto-assigns `DOCS_USERS`, and flags HR record with `IS_EDMS_USR = 'Y'`. |
+| `PUT` | `/api/edms-people/{system_id}` | Updates existing user details, rebuilds group memberships, updates aliases. |
+| `GET` | `/api/edms-people/export` | Exports all active EDMS users and organizational mappings to Excel (`.xlsx`). |
+
+---
+
+### 6.13 Dynamic Profile Search
+
+| Method | Endpoint | Description |
+|---|---|---|
+| `GET` | `/api/profilesearch/scopes` | Returns available search scopes for the user (cached 5 min). Scope `0` represents Global cross-form search; specific Form IDs (e.g., 2572, 3799) target individual tables. |
+| `GET` | `/api/profilesearch/types` | Returns search fields and data types configured for a scope. |
+| `POST` | `/api/profilesearch/search` | Dynamic multi-criteria search: accepts up to 6 search criteria with `AND` logic, scope, date ranges, and pagination, dynamically building optimized SQL queries. |
+
+---
+
+### 6.14 Oracle Database Session Monitoring
+
+| Method | Endpoint | Description |
+|---|---|---|
+| `GET` | `/api/admin/oracle-sessions` | Inspects active Oracle database sessions from `V$SESSION`, returning session IDs, usernames, machines, programs, logon times, and inactive durations. |
+| `POST` | `/api/admin/oracle-sessions/kill` | Safely terminates an inactive or hanging Oracle session via `ALTER SYSTEM KILL SESSION 'sid,serial' IMMEDIATE`. Rejects system accounts. |
+
+---
+
+## 7. AI Document Processing Pipeline
+
+The central processing engine resides in `services/processor.py` (`process_document()`). All synchronous HTTP client calls to downstream microservices are dispatched to a worker thread via `run_in_threadpool()` to prevent event loop blocking.
+
 ```
-queued → in_progress → completed
-                    → failed (after 3 attempts)
-                    → queued (retried with delay)
+Document Upload / Queue Worker
+       │
+       ├─► Images ───► Image Captioning (5001) ─► Caption + Descriptive Tags (GovAI qwen3-vl-30b)
+       │         ───► OCR Service (5004)        ─► Extracted Arabic/English Text (GovAI qwen3-vl-30b)
+       │         ───► Face Recognition (5002)   ─► PIL Crops ─► Dataiku Model API (5009) ─► AI Center
+       │
+       ├─► Videos ───► Video Summarizer (5008)  ─► Strategic Keyframe Vision (GovAI qwen3-vl-30b)
+       │                                        ─► Audio ASR Transcription (GovAI whisper_asr)
+       │                                        ─► Face Crops ─► Face Recognition (5002) ─► Dataiku
+       │
+       └─► PDFs ─────► PyMuPDF Page Extraction  ─► OCR Service (5004) ─► Text Tokens
+                              │
+                              ▼
+        Consolidate Abstract & Bilingual Translations (Translator :5010)
+                              │
+                              ▼
+            Update Oracle DB (STATUS = 3, Abstract, Tags, VIPs)
+                              │
+                              ▼
+             ChromaDB Vector Indexing (Embedding Service :5003)
 ```
 
-### Worker Mode Audit:
-All mode transitions are recorded in a `worker_mode_audit` SQLite table with:
-- Previous mode, new mode, actor (system/admin), reason, and ISO timestamp
+### Media-Specific Flows:
+
+- **Images**:
+  1. Calls Captioning Service to produce scene description (max 500 characters).
+  2. Calls OCR Service to extract in-image text.
+  3. Calls Face Recognition Service (`/api/analyze_image_stream`) to identify VIP dignitaries.
+  4. Tags are translated to Arabic via Translator Service and saved to `KEYWORD`.
+  5. The consolidated abstract is indexed into ChromaDB.
+- **Videos**:
+  1. Streams video chunks to Video Context Summarizer (`/upload_stream`).
+  2. Polls `/status/{task_id}` for completion.
+  3. Extracted face thumbnails are sent to Face Recognition Service (`/api/recognize_faces`).
+  4. Audio transcripts are tokenized for keywords.
+  5. Findings are merged into the video abstract and tagged in Oracle DB.
+- **PDFs**:
+  1. Renders PDF pages to memory buffers via PyMuPDF.
+  2. Dispatches pages to OCR Service for bilingual text extraction.
+  3. Tokenizes and indexes text into Oracle DB and ChromaDB.
 
 ---
 
-## Worker Process
+## 8. Background Processing Queue & Worker Process
 
-Background AI processing runs in a **dedicated standalone process** (`worker.py`), separate from the FastAPI web server. This architectural decision keeps request handling isolated from heavy CPU/IO-bound AI processing work.
+Heavy AI processing is decoupled from web requests using a local SQLite job queue (`database/processing_queue.sqlite3`):
 
-### Running the Worker:
+- **Database Engine**: SQLite running in **WAL (Write-Ahead Logging)** mode with a 5,000ms busy timeout.
+- **Unique Constraint**: Enforces unique `docnumber` to prevent duplicate concurrent jobs.
+- **Worker Concurrency**: Worker claims up to 3 jobs per cycle (`LIMIT 3`).
+- **Task Timeout**: Guarded by `PROCESSING_TASK_TIMEOUT_SECONDS` (default: 300s / 5 minutes) to prevent hung jobs from blocking execution.
+- **Automated Retries**: Transient failures are retried after a 20-second delay up to **3 maximum attempts**.
+- **Worker Modes**:
+  - `running`: Actively claiming and executing queued jobs.
+  - `paused`: Suspends job claiming (default on initial server boot).
+  - `draining`: Finishes running jobs, then transitions to paused.
+- **Audit Logging**: All mode transitions are logged to table `worker_mode_audit` with timestamp, actor, and reason.
+
+### Running the Worker Process:
+
+In production, run `worker.py` as a supervised Windows Service:
 ```bash
-python worker.py
+venv\Scripts\python.exe worker.py
 ```
 
-### Worker Behavior:
-1. Continuously polls the SQLite queue for available jobs
-2. Claims up to 3 jobs per cycle
-3. Authenticates against DMS using system credentials (for document retrieval)
-4. For each job: fetches document from Oracle, calls `process_document()` with a timeout
-5. On success: marks job as completed in both SQLite and Oracle
-6. On timeout: marks job as failed
-7. On transient error: requeues with a 20-second delay and incremented attempt counter
-8. Supports graceful shutdown via `KeyboardInterrupt`
+---
+
+## 9. Vector Search Engine (ChromaDB)
+
+- **Vector Collection**: `edms_documents` stored on disk at `CHROMA_DB_PATH`.
+- **Vector Dimension**: **4096 dimensions** produced by GovAI `qwen3-embedding-8b`.
+- **Custom Embedding Function**: `vector_client.py` implements `ExternalEmbeddingFunction`, bridging ChromaDB with the Embedding Service microservice.
+- **Distance Cutoff**: Configurable via `VECTOR_DISTANCE_THRESHOLD` (default: 1.3).
+- **Historical Backfill**: Historical records in Oracle DB can be indexed in bulk using `backfill_vectors.py`:
+  ```bash
+  python backfill_vectors.py
+  ```
 
 ---
 
-## Vector Search (ChromaDB)
+## 10. OpenText eDOCS WSDL / SOAP Client
 
-The API maintains a **ChromaDB** persistent vector store for semantic document search:
+The `wsdl_client/` package implements an enterprise adapter over the OpenText eDOCS DM SOAP API:
 
-- **Collection**: `edms_documents` — stores document abstracts as embeddings
-- **Embedding**: Uses an external embedding service (MiniLM L6 v2, 384 dimensions) via `ExternalEmbeddingFunction` — a custom wrapper that implements ChromaDB's `EmbeddingFunction` interface
-- **Distance Threshold**: Results with distance > 1.3 are filtered out as irrelevant
-- **Lazy Initialization**: ChromaDB client is created on first use, not at import time (thread-safe via GIL)
-- **Telemetry Disabled**: ChromaDB's anonymized telemetry is explicitly disabled
-- **Backfill Script**: `backfill_vectors.py` bulk-indexes existing Oracle documents into ChromaDB in batches of 100, with automatic reconnection on database errors
-## Semantic Search & AI Architecture
-
-The Smart EDMS system orchestrates a powerful microservices architecture consisting of two primary flows: the **Ingestion/Upload Pipeline** and the **Search Pipeline**.
-
-![Vector Embedding Lifecycle](/C:/Users/okool_kaabdulwahed/.gemini/antigravity-ide/brain/8edb940e-6cde-418b-b965-647bcaa92fc4/vector_search_lifecycle_1791373975305.jpg)
-
-### 1. Ingestion / Upload Pipeline
-When a user uploads a new document, image, or video, the system performs an asynchronous deep analysis to extract structured metadata:
-1. **Initial Upload & Storage**: The EDMS API acts as the orchestrator. It receives the file, stores the physical binary file in **OpenText eDOCS**, and records the primary row metadata (indicating file location and basic properties) in **Oracle DB**.
-2. **AI Processing Trigger**: The system triggers a parallel background pipeline utilizing several standalone AI microservices (which leverage **GOV AI LLM and Vision Models**):
-   - **OCR Service**: Extracts raw text from documents and images.
-   - **Image Captioning Service**: Uses vision models to describe the visual contents of images.
-   - **Face Recognition Service**: Detects and identifies registered personnel.
-   - **Video Summarizer**: Transcribes and summarizes video content.
-3. **Metadata Storage**: The rich metadata and tags extracted by these AI services are saved back down into **Oracle DB** to enrich the document's record.
-4. **Embedding Generation**: The extracted text, captions, and tags are aggregated into a rich "abstract" and sent to the **Embedding Service**, which generates a 4096-dimensional dense mathematical vector representing the file's conceptual meaning.
-5. **Vector Storage**: This vector is stored persistently in **ChromaDB**, explicitly linked to the document's ID.
-
-### 2. Search Pipeline
-When a user searches (whether in Recents, Favorites, or Folders), the system executes a hybrid semantic and keyword search:
-1. **Smart Search & LLM Query Expansion**: The raw search query is sent to the **Smart Search Service**. This service uses an LLM (GovAI) to analyze the query intent, extract explicitly required concepts, and dynamically generate **synonyms and related concepts** in both Arabic and English (e.g., searching for "sea" will append "water", "ocean").
-2. **Parallel Execution**: The system utilizes `asyncio.gather()` to simultaneously execute:
-   - **Vector Search**: The expanded query (raw text + generated tokens) is sent to the **Embedding Service** to generate a query vector. This vector is queried against **ChromaDB** for semantic similarity (comparing it to the vectors generated during ingestion).
-   - **Oracle Keyword Search**: Traditional SQL `LIKE` and text-matching queries execute on Oracle DB for exact metadata matches.
-   - **Event Database Search**: Searches linked events mapping to documents.
-   - **WSDL Folder Scope (If applicable)**: Gathers document IDs constrained to specific hierarchies.
-3. **Smart Insights**: The generated semantic tokens and required concepts are returned in the API payload under `search_meta`, allowing the frontend to visualize the AI's understanding of the query to the user.
+- **Authentication Cache**: System-level tokens (`dms_system_login`) are cached for 30 minutes with automatic renewal.
+- **Binary Buffer Parser (`wsdl_client/utils.py`)**:
+  OpenText eDOCS returns data in proprietary binary buffers (base64-encoded, optionally zlib-compressed, with length-prefixed UTF-16LE strings). The custom parser implements **6 sequential decompression strategies**:
+  1. Stripping DMS `0xFFFFFFFF` magic markers.
+  2. Standard zlib header decoding.
+  3. Raw DEFLATE without headers (`wbits=-15`).
+  4. Header offset probing (offsets 2, 4, 6, 8).
+  5. Heuristic column detection (identifying `USER_ID` vs. `FULL_NAME` based on whitespace and casing).
+  6. Folder tree item decoding (extracting nodes, folders, and media types).
 
 ---
 
-## WSDL / SOAP Client
+## 11. Database Layer & Oracle Connection Management
 
-The `wsdl_client/` package provides a Python adapter over the on-premise DMS (Document Management System) SOAP service:
+The database layer (`database/`) manages all Oracle interaction via the modern `oracledb` thin client driver:
 
-| Module | Functions |
-|---|---|
-| **auth.py** | `dms_user_login()` — authenticates users; `dms_system_login()` — authenticates with system credentials for background operations (30-minute TTL cache) |
-| **documents.py** | `upload_document_to_dms()`, `get_document_from_dms()`, `get_image_by_docnumber()`, `stream_document_from_dms()`, `delete_document()`, `set_trustees()`, `get_object_trustees()` |
-| **folders.py** | `create_dms_folder()`, `list_folder_contents()`, `rename_folder_display()`, `move_item_to_parent()`, `delete_folder_contents()` |
-| **users.py** | `get_groups_for_user()`, `get_all_groups()`, `get_group_members()`, `search_users_in_group()` |
-| **utils.py** | DMS binary buffer parsing: `parse_dms_buffer()`, `parse_user_result_buffer()`, `parse_groups_buffer()`, `parse_group_members_buffer()`, `parse_binary_result_buffer()` |
-
-### Binary Buffer Parsing (`wsdl_client/utils.py`)
-
-The DMS SOAP service returns result data in a proprietary binary format: base64-encoded, optionally zlib-compressed, with UTF-16LE length-prefixed strings. The `utils.py` module implements a robust multi-strategy parser that:
-
-1. **Decompression**: Tries 6 different zlib decompression strategies (custom DMS `0xFFFFFFFF` marker, standard zlib headers, raw deflate, various header offsets)
-2. **String Extraction**: Reads length-prefixed UTF-16LE strings with null terminators
-3. **Format Detection**: Automatically detects whether data has a row/column header or requires metadata-driven parsing
-4. **User Normalization**: Heuristically determines which columns are USER_ID vs FULL_NAME based on content patterns (spaces, case, digits)
-5. **Folder Parsing**: Extracts folder/file items from binary buffers, identifying item types (Folder/Node) and media types from file extensions
+- **Connection Pool**: Initialized in `database/connection.py` with min/max pool boundaries and automatic session recycling.
+- **Index Bootstrapping**: At application startup, the API automatically executes a best-effort index creation script (30-second budget) ensuring indexes exist on `PROFILE.RTADOCDATE`, `PROFILE.ABSTRACT`, `TAGGING_QUEUE`, and `LKP_DOCUMENT_TAGS`.
+- **Blocklist Filtering**: Loads `blocklist.json` at startup, filtering stop words, profanity, and meaningless single characters from AI tags.
+- **Dynamic SQL Query Builder (`database/profilesearch.py`)**: Assembles parameterized SQL statements based on configured form schema definitions, supporting starts-with, contains, and exact matching without SQL injection risk.
 
 ---
 
-## Database Layer
+## 12. Utilities & Media Processing
 
-The `database/` package contains all Oracle and SQLite query logic:
-
-### Key Modules:
-
-| Module | Purpose |
-|---|---|
-| **connection.py** | Oracle connection pooling (async and sync), `get_async_connection` wrapper, best-effort performance index creation at startup (30-second timeout), blocklist loading from `blocklist.json`, custom `DatabaseConnectionError` exception |
-| **documents.py** | Complex paginated document fetch with 10+ filter dimensions, vector search integration, processing status tracking with robust transaction handling, abstract/metadata updates |
-| **media.py** | DMS media operations: file info resolution, content streaming (sync + async), thumbnail generation (image/PDF/video), media type detection from file extensions, EXIF date extraction, cache path helpers, app-bucket caching |
-| **tags.py** | Full tag lifecycle: create keywords (EN+AR), link to documents, batch fetch (up to 50 docs), shortlist toggle, security-level-aware filtering, tag translation & update |
-| **events.py** | Event CRUD, document-event joins, journey data aggregation |
-| **favorites.py** | Per-user favorites CRUD with pagination |
-| **memories.py** | "On This Day" queries, journey data aggregation |
-| **users.py** | User details fetch, security level queries, language/theme preference updates, system_id lookup |
-| **user_data.py** | User quota management: allocation, deduction on upload, restoration on delete; EDMS user ID resolution |
-| **groups.py** | Synchronous DMS group queries (fallback when async is unavailable) |
-| **profilesearch.py** | Dynamic SQL builder that constructs Oracle queries based on configured form fields, supporting LIKE/exact/startsWith matching, date ranges, multi-criteria AND logic, and fallback hardcoded types |
-| **sharing.py** | Share link CRUD, OTP generation & verification, access logging, email target validation |
-| **admin.py** | Admin-facing user management: add/delete/update EDMS users, security level listing, people search, document history |
-| **ems_admin.py** | EMS organizational data: agencies, departments, sections — CRUD with duplicate checking and sequence-based ID generation |
-| **edms_people.py** | Full EDMS user lifecycle: PEOPLE table CRUD, PEOPLEGROUPS rebuild, NETWORK_ALIASES management, HR employee linkage, password hashing, DOCS_USERS auto-assignment, export with group aggregation |
-| **tab_permissions.py** | Per-user tab visibility: CRUD, default permission initialization, admin full-permissions view |
+- **Digital Watermarking (`utils/watermark.py`)**: Applies user identification and timestamp watermarks to downloaded media:
+  - **Images**: Pillow text overlay (semi-transparent, bottom-right).
+  - **PDFs**: PyMuPDF (`fitz`) text insertion on all pages.
+  - **Videos**: Hardware-accelerated FFmpeg pipeline (auto-detects NVIDIA `h264_nvenc`, AMD `h264_amf`, or Intel `h264_qsv`, with MoviePy CPU fallback). Watermark displays at start, end, and randomized intervals.
+- **Input Sanitization (`utils/sanitize.py`)**: Strips malicious HTML/JavaScript tags and control characters to prevent stored XSS attacks.
+- **Cache Eviction (`utils/cache_eviction.py`)**: Scheduled background task running every 6 hours to purge video cache files older than 24 hours (LRU policy).
+- **Log Purging (`utils/log_cleanup.py`)**: Daily background task purging application and IIS log files older than 14 days.
 
 ---
 
-## Utilities
+## 13. Middleware Stack & Security Headers
 
-### Watermarking (`utils/watermark.py`)
-Applies digital watermarks to downloaded files:
-- **Images**: Pillow-based text overlay (bottom-right, semi-transparent)
-- **PDFs**: PyMuPDF text insertion on every page
-- **Videos**: FFmpeg with hardware acceleration (NVIDIA/AMD/Intel QSV) → MoviePy fallback. Watermark appears at start, end, and random intervals throughout the video. Includes automatic encoder detection and MoviePy FFmpeg path configuration
+HTTP requests pass through the following middleware stack (in execution order):
 
-### Input Sanitization (`utils/sanitize.py`)
-- Strips HTML tags and dangerous characters from user input
-- Prevents stored XSS in document names and abstracts
-
-### Cache Eviction (`utils/cache_eviction.py`)
-- Runs every 6 hours as a background task
-- Evicts old video cache files based on file age (LRU policy)
-
-### Log Cleanup (`utils/log_cleanup.py`)
-- Runs every 24 hours as a background task
-- Deletes IIS/application log files older than 14 days from the `logs/` directory
-- Safely skips files that are locked/in-use by IIS
-- Returns statistics: deleted count and bytes freed
-
-### TTL Cache (`utils/ttl_cache.py`)
-- In-memory cache with configurable TTL (default 5 minutes)
-- Single-process deployment optimized
-- Used for profile search scope/type metadata to avoid redundant DB queries
-
-### Common Utilities (`utils/common.py`)
-- **`get_current_user()`**: FastAPI dependency for session-based authentication
-- **`get_mimetype_for_media()`**: Centralized MIME type mapping for 15+ file types
-- **`build_content_disposition()`**: RFC 5987-compatible Content-Disposition header builder with UTF-8 filename support and ASCII fallback
-- **`load_company_logo_base64()`**: Loads company logo from multiple search paths and returns as base64 data URI for email embedding
-- **`get_otp_email_template()`**: HTML email template for OTP verification codes
-- **`get_share_link_email_template()`**: HTML email template for share link notifications
-- **`send_otp_email()`**: Sends OTP verification emails via SMTP with HTML + plain text fallback
-- **`send_share_link_email()`**: Sends share link notification emails via SMTP
-- **`clean_repeated_words()`**: Deduplicates repeated words in AI-generated text
+1. **Security Headers Middleware**: Enforces `Content-Security-Policy`, `X-Content-Type-Options: nosniff`, `Referrer-Policy: strict-origin-when-cross-origin`, and `X-Frame-Options: DENY` (except `/api/pdf/` routes configured for iframe embedding).
+2. **CORS Middleware**: Configured via `FRONTEND_URL` environment variable; allows credentials for cookie-based session persistence.
+3. **Starlette SessionMiddleware**: Cookie-based encrypted session storage (60-day expiry, `SameSite=Lax`).
+4. **Request Metrics Middleware**: Attaches `X-Request-ID` tracing headers, measures request duration, and emits structured performance telemetry.
 
 ---
 
-## Middleware Stack
+## 14. Security & Access Control Model
 
-The application applies the following middleware (in order of execution):
+### Three-Tier Authorization:
 
-### 1. Security Headers Middleware (`SecurityHeadersMiddleware`)
-- **Content-Security-Policy**: Restricts resource loading to `'self'` with necessary inline script/style exceptions
-- **X-Content-Type-Options**: `nosniff`
-- **X-Frame-Options**: `DENY` (except for `/api/pdf/` routes, which are designed for iframe embedding)
-- **Referrer-Policy**: `strict-origin-when-cross-origin`
+| Level | Rank | Permissions |
+|---|:---:|---|
+| **Admin** | `9` | Full administrative access: user management, queue control, eDOCS cache clearing, tab permissions, system exports. |
+| **Editor** | `5` | Document upload, metadata updates, tag management, folder creation/movement, cache clearing. |
+| **Viewer** | `0` | Read-only access: view documents, stream media, search, and download watermarked copies. |
 
-### 2. CORS Middleware
-- Configured via `FRONTEND_URL` environment variable
-- Supports multiple origins (comma-separated)
-- Credentials enabled for cookie-based sessions
-- Allowed methods: GET, POST, PUT, DELETE, OPTIONS
-- Allowed headers: Content-Type, Authorization, X-App-Source, Cookie
-
-### 3. Session Middleware
-- Starlette SessionMiddleware with cookie-based sessions
-- 60-day session expiry (`max_age=5184000`)
-- `SameSite=Lax` for CSRF protection
-- Session cookie name: `session`
-
-### 4. Request Metrics Middleware (`RequestMetricsMiddleware`)
-- Generates or propagates `X-Request-ID` header for request tracing
-- Measures request duration in milliseconds
-- Captures: method, path, status code, duration, and authenticated username
-- Structured JSON logging (currently disabled but wired up for PostHog/observability)
+- **Elevated Groups**: Users belonging to DMS group `EMS_ADMIN` receive access to organizational hierarchy and EDMS People management. Users in `DOCS_SUPERVISORS` receive global document visibility across private folders.
+- **Document-Level Security**: Enforced via eDOCS trustees (ACL) inherited from parent folders or configured per document.
+- **Rate Limiting**: Enforced via SlowAPI across sensitive endpoints:
+  - Login: 5 requests / min
+  - Document Upload: 10 requests / min
+  - Batch Process Trigger: 3 requests / min
+  - OTP Access Request: 5 requests / min
+  - Share Download: 10 requests / min
 
 ---
 
-## Security
+## 15. Multi-Node & Load-Balanced Deployment
 
-### Authentication
-- **DMS SOAP authentication** validates user credentials against the enterprise DMS
-- Server-side **session cookies** (60-day expiry, `SameSite=Lax`)
-- All API routes (except health check and share info) require authentication via `get_current_user` dependency
-- Session restore includes a timeout-protected group membership refresh
+When running behind a load balancer with multiple API server nodes, all stateful file-based resources must point to a shared network mount (NAS / SMB share):
 
-### Authorization
-- **Three-tier security model**: Admin (9), Editor (5), Viewer (0)
-- Security level determined by DMS group membership at login
-- **Admin allowlist** for admin panel access (hardcoded usernames)
-- **EMS Admin group** for organizational management and EDMS people management access
-- **DOCS Supervisors group** for elevated visibility
-- **Per-user tab permissions** for fine-grained UI access control
-- **Document-level security** via DMS trustees (ACL)
-
-### Rate Limiting
-| Endpoint | Limit |
-|---|---|
-| Login | 5 requests/minute per IP |
-| Upload | 10 requests/minute per IP |
-| Batch process | 3 requests/minute per IP |
-| Share link generation | 100 requests/minute per IP |
-| OTP request | 5 requests/minute per IP |
-| Share download | 10 requests/minute per IP |
-
-### Security Headers
-- Content Security Policy (CSP)
-- X-Content-Type-Options: nosniff
-- X-Frame-Options: DENY (except PDF embeds)
-- Referrer-Policy: strict-origin-when-cross-origin
-
-### CORS
-- Configured via `FRONTEND_URL` environment variable
-- Supports multiple origins (comma-separated)
-- Credentials enabled for cookie-based sessions
-
----
-
-## Deployment
-
-### Development
-```bash
-python app.py
+```ini
+# Shared Network Mount Paths
+CHROMA_DB_PATH=\\nas-server\edms-shared\chroma_db
+PROCESSING_QUEUE_DB_PATH=\\nas-server\edms-shared\processing_queue.sqlite3
+IDEMPOTENCY_DB_PATH=\\nas-server\edms-shared\idempotency.sqlite3
+THUMBNAIL_CACHE_DIR=\\nas-server\edms-shared\thumbnail_cache
+VIDEO_CACHE_DIR=\\nas-server\edms-shared\video_cache
+TEMP_THUMBNAIL_CACHE_DIR=\\nas-server\edms-shared\temp_thumbnail_cache
+DOWNLOAD_CACHE_DIR=\\nas-server\edms-shared\download_cache
 ```
 
-### Production (Uvicorn with Workers)
-```bash
-uvicorn app:app --host 0.0.0.0 --port 5000 --workers 4
-```
-Or use the provided batch file:
-```bash
-run_api.bat
-```
+### Leader Election for Background Tasks:
 
-### Production (IIS with HttpPlatformHandler)
-The `web2.config` file configures deployment on Windows IIS:
-- Uses `HttpPlatformHandler` to proxy requests to Uvicorn
-- Configures environment variables including all timeout tuning parameters
-- Enables stdout logging to `./logs/python-stdout.log`
-- 300-second startup timeout, 20-minute request timeout
-- 4 processes per application
-
-### Multi-Node (Load-Balanced) Deployment
-When running behind a 2+ node load balancer, follow these steps:
-
-> **Local dev / single-node:** The shared folder is at `d:\edms-shared` (already
-> configured in `.env`). For production multi-node, replace it with a NAS/SMB
-> share accessible from both nodes.
-
-1. **Create shared storage outside the project** — all file-based state lives in
-   a single folder **outside** the project directory so that code deployments
-   never wipe the data and both nodes see the same files:
-   - Local dev: `d:\edms-shared`
-   - Production: a NAS/SMB share mounted identically on both nodes (e.g.
-     `\\nas-server\edms-shared` UNC or `Z:\edms-shared` mapped drive)
-
-2. **Point all file-based state at the shared folder** — set these env vars
-   identically on every node (see the *Multi-Node / Load-Balanced Deployment*
-   table in [Environment Variables](#multi-node--load-balanced-deployment)):
-   ```
-   CHROMA_DB_PATH=\\nas-server\edms-shared\chroma_db
-   PROCESSING_QUEUE_DB_PATH=\\nas-server\edms-shared\processing_queue.sqlite3
-   IDEMPOTENCY_DB_PATH=\\nas-server\edms-shared\idempotency.sqlite3
-   THUMBNAIL_CACHE_DIR=\\nas-server\edms-shared\thumbnail_cache
-   VIDEO_CACHE_DIR=\\nas-server\edms-shared\video_cache
-   TEMP_THUMBNAIL_CACHE_DIR=\\nas-server\edms-shared\temp_thumbnail_cache
-   DOWNLOAD_CACHE_DIR=\\nas-server\edms-shared\download_cache
-   WORKER_LEASE_DIR=\\nas-server\edms-shared
-   ```
-   > **Tip:** The shared folder contains: `chroma_db/`, `processing_queue.sqlite3`,
-   > `idempotency.sqlite3`, `thumbnail_cache/`, `video_cache/`,
-   > `temp_thumbnail_cache/`, `download_cache/`, and the auto-created
-   > `worker_lease.json`.
-
-3. **Configure leader election** — leave `WORKER_ROLE=auto` (default) on both
-   nodes. The nodes negotiate via the lease file on the shared mount; only one
-   will run background processing and cleanup. If leadership fails, the other
-   node takes over within `WORKER_LEASE_TTL` seconds (default 30s).
-
-   Alternatively, set `WORKER_ROLE=leader` on the primary node and
-   `WORKER_ROLE=follower` on the secondary for explicit control.
-
-4. **Share the session secret** — `FLASK_SECRET_KEY` must be identical on all
-   nodes so session cookies work across them.
-
-5. **Start both nodes** — each node runs the API normally (`run_api.bat` /
-   `uvicorn`). The background worker loop is built into the API process and is
-   gated by the leader election; you do **not** need to run `worker.py`
-   separately in this mode.
-
-### Background Worker
-The processing worker must be started separately:
-```bash
-python worker.py
-```
-In production, this should be run as a Windows service or supervised process.
+To prevent duplicate queue processing and cache cleanup runs across cluster nodes:
+- `WORKER_ROLE=auto`: Nodes negotiate leadership via a shared lease file (`worker_lease.json`).
+- `WORKER_LEASE_TTL=30`: Lease expires after 30 seconds of inactivity, triggering automated failover.
+- `WORKER_LEASE_RENEW_INTERVAL=10`: Active leader renews its lease every 10 seconds.
+- Session consistency is guaranteed by sharing an identical `FLASK_SECRET_KEY` across all nodes.
 
 ---
 
-## Batch Scripts & Tooling
+## 16. Offline Setup & Air-Gapped Installation
 
-| Script | Purpose |
-|---|---|
-| `setup.bat` | First-time setup: creates virtual environment and installs dependencies |
-| `run_api.bat` | Starts the API server with Uvicorn (4 workers, host `0.0.0.0`, port `5000`) |
-| `download_packages.bat` | Downloads all pip wheels into `/packages/` for offline deployment |
-| `install_packages.bat` | Installs packages from the local `/packages/` wheel cache (no internet required) |
-| `create_archive.bat` | Creates a timestamped ZIP archive of the project, respecting `.gitignore` patterns and excluding `venv/`, `.git/`, and the script itself |
+The repository supports 100% offline installation in secure, air-gapped environments:
+
+```
+[INTERNET-CONNECTED MACHINE]
+   │
+   ├── 1. Run download_packages.bat  ──► Downloads wheels for Python 3.12 (win_amd64) into packages/
+   ├── 2. Run create_archive.bat     ──► Bundles source + wheels into ..\EDMS_API_YYYY-MM-DD.zip
+   │
+[SECURE FILE TRANSFER (SFTP / USB)]
+   │
+   ▼
+[AIR-GAPPED PRODUCTION SERVER]
+   │
+   ├── 3. Extract the ZIP archive
+   ├── 4. Run setup.bat              ──► Creates venv and executes:
+   │                                     pip install --no-index --find-links=packages -r requirements.txt
+   ├── 5. Configure .env with database credentials and microservice URLs
+   └── 6. Launch via run_api.bat or attach to IIS
+```
 
 ---
 
-## Blocklist & Content Filtering
+## 17. Windows IIS Production Deployment (`web2.config`)
 
-The `blocklist.json` file provides content filtering rules used during tag processing and text analysis:
+In Windows Server IIS environments, requests are handled via the `HttpPlatformHandler` module:
 
-| Category | Purpose |
-|---|---|
-| **characters** | Individual characters (A-Z, 0-9, symbols, Arabic letters) that are too short to be meaningful tags |
-| **meaningless_english** | English stop words (articles, prepositions, pronouns, common verbs) filtered from AI-generated tags |
-| **meaningless_arabic** | Arabic stop words filtered from AI-generated tags |
-| **profanity_english** | English profanity words blocked from tags |
-| **profanity_arabic** | Arabic profanity words blocked from tags |
+```xml
+<?xml version="1.0" encoding="utf-8"?>
+<configuration>
+  <system.webServer>
+    <handlers>
+      <add name="httpPlatformHandler" path="*" verb="*" modules="httpPlatformHandler" resourceType="Unspecified" />
+    </handlers>
+    <httpPlatform processPath="venv\Scripts\python.exe"
+                  arguments="-m uvicorn app:app --host 0.0.0.0 --port %HTTP_PLATFORM_PORT% --workers 4"
+                  startupTimeLimit="300"
+                  requestTimeout="00:20:00"
+                  stdoutLogEnabled="true"
+                  stdoutLogFile=".\logs\python-stdout.log">
+      <environmentVariables>
+        <environmentVariable name="PYTHONPATH" value="." />
+      </environmentVariables>
+    </httpPlatform>
+    <security>
+      <requestFiltering>
+        <requestLimits maxAllowedContentLength="1073741824" />
+      </requestFiltering>
+    </security>
+  </system.webServer>
+</configuration>
+```
 
-This file is loaded at startup via `database/connection.py` and used throughout the tag processing pipeline to ensure only meaningful, appropriate tags are stored.
+- **Port Assignment**: Dynamic internal binding via `%HTTP_PLATFORM_PORT%`, reverse-proxied to public port `5000`.
+- **Large Upload Ceiling**: `maxAllowedContentLength="1073741824"` permits uploads up to 1 GB.
+- **Process Supervision**: Spawns 4 concurrent Uvicorn worker processes with a 20-minute request timeout.
+
+---
+
+## 18. Environment Variables Reference (`.env`)
+
+```ini
+# ==============================================================================
+# Oracle Enterprise Database
+# ==============================================================================
+DB_HOST=10.0.0.50
+DB_PORT=1521
+DB_SERVICE_NAME=edmsprod
+DB_USERNAME=docsadmin
+DB_PASSWORD=YourSecurePassword
+
+# ==============================================================================
+# OpenText eDOCS DM Server (SOAP/WSDL)
+# ==============================================================================
+WSDL_URL=http://edocs-server:8080/DOCS/DOCSWS.asmx?WSDL
+DMS_USER=DOCSADM
+DMS_PASSWORD=YourDmsPassword
+
+# ==============================================================================
+# Downstream AI Microservices
+# ==============================================================================
+CAPTIONING_API_URL=http://localhost:5001
+FACE_API_URL=http://localhost:5002
+EMBEDDING_API_URL=http://localhost:5003
+OCR_API_URL=http://localhost:5004
+SMART_SEARCH_API_URL=http://localhost:5006
+VIDEO_SUMMARIZER_API_URL=http://localhost:5008
+TRANSLATOR_REPHRASER_API_URL=http://localhost:5010
+
+# ==============================================================================
+# Vector Store & Shared Paths
+# ==============================================================================
+CHROMA_DB_PATH=./chroma_db
+CHROMA_COLLECTION_NAME=edms_documents
+VECTOR_DISTANCE_THRESHOLD=1.3
+
+# ==============================================================================
+# Application & Session Security
+# ==============================================================================
+FLASK_SECRET_KEY=cryptographically-random-secret-key-must-match-across-nodes
+FRONTEND_URL=http://localhost:3000,http://portal.rta.ae
+API_BASE_URL=http://api.edms.rta.ae
+
+# ==============================================================================
+# SMTP Mail Configuration (OTP Sharing)
+# ==============================================================================
+SMTP_SERVER=mail.rta.ae
+SMTP_PORT=587
+SMTP_USER=edms-notifications@rta.ae
+SMTP_PASSWORD=YourSmtpPassword
+SMTP_SENDER_EMAIL=edms-notifications@rta.ae
+SMTP_SENDER_NAME="Smart EDMS"
+COMPANY_NAME="Roads and Transport Authority"
+SUPPORT_EMAIL=edms-support@rta.ae
+```
+
+---
+
+## 19. Troubleshooting & Operational Runbook
+
+| Symptom / Error | Root Cause | Remediation Procedure |
+|:---|:---|:---|
+| **`HTTP 502 Bad Gateway` on Search** | Smart Search (5006) or Embedding Service (5003) is unreachable. | The API automatically falls back to Oracle SQL `LIKE` search. Verify that microservices are online: `curl http://localhost:5006/health` and `curl http://localhost:5003/health`. |
+| **`Dimension mismatch detected` in ChromaDB** | Collection was created with 384-dim embeddings instead of 4096-dim. | Rename existing `chroma_db` folder to `chroma_db_backup`. Restart the API to initialize the 4096-dim collection, then execute `python backfill_vectors.py`. |
+| **`DatabaseConnectionError: DPI-1047`** | Oracle Instant Client library is missing or incompatible. | Ensure `python-oracledb` is running in thin mode (default), or install Oracle Instant Client 19c+ for thick mode. |
+| **`SOAP Error: LoginSvr5 Failed`** | eDOCS DM service account password changed or DMS monitor service is stopped. | Run `restart_edocs_dm.exe --check-only` from `..\Task Jobs\EDMS Restart DM Server Job` to probe DM service availability. |
+| **`HTTP 429 Too Many Requests` on `/process-batch`** | The batch crawler triggered more than 3 times in 1 minute. | Verify the Windows Task Scheduler cadence in `EDMS Crawler Task` is set to 30 minutes, not 10 seconds. |
+| **Queue jobs stuck in `in_progress`** | Process was forcibly killed midway through an AI task. | Open the Admin Panel (`/api/admin/processing-queue/retry-failed`) or trigger `POST /api/admin/processing-queue/retry-failed` to reset pending attempt counts. |
+| **`Access is denied (0x5)` in IIS** | Application Pool identity lacks file permissions. | Grant `IIS AppPool\<SiteName>` Read, Write, and Execute permissions on `thumbnail_cache/`, `video_cache/`, `download_cache/`, and `database/`. |
