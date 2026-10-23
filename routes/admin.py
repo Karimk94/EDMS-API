@@ -152,7 +152,7 @@ async def check_access(request: Request):
     """Check if current user has admin access. Used by frontend for route protection."""
     user = request.session.get('user')
     if not user:
-        raise HTTPException(status_code=401, detail="Not authenticated")
+        return {"has_access": False, "username": None}
     
     has_access = check_admin_access(request)
     return {"has_access": has_access, "username": user.get('username')}

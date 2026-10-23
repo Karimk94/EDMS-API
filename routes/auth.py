@@ -196,6 +196,132 @@ def _ensure_ems_admin_tab_permission(tab_permissions: list, is_ems_admin_group_m
 
     return permissions
 
+def _extract_sso_username(request: Request, body_username: str | None = None) -> str | None:
+    """
+    Extracts username from incoming SSO headers or payload.
+    Supports Windows Negotiate headers injected by IIS (X-Remote-User / Remote-User / x-iisnode-auth_user),
+    standard reverse proxy headers, and direct payload/param inputs.
+    Strips domain prefixes like RTADOM\\username or user@domain.
+    """
+    candidate = (
+        body_username
+        or request.headers.get("x-remote-user")
+        or request.headers.get("remote-user")
+        or request.headers.get("x-iisnode-auth_user")
+        or request.headers.get("x-iisnode-logon_user")
+        or request.headers.get("x-iisnode-remote_user")
+        or request.headers.get("x-iisnode-unencrypted_user")
+        or request.headers.get("x-forwarded-user")
+        or request.headers.get("x-authenticated-user")
+        or request.headers.get("x-auth-user")
+        or request.headers.get("x-iis-user")
+        or request.headers.get("logon_user")
+        or request.headers.get("auth_user")
+        or request.query_params.get("username")
+        or request.query_params.get("desktop_user")
+    )
+
+    # Local development / loopback fallback only (never in production)
+    if not candidate:
+        allow_dev = os.getenv("ALLOW_DEV_SSO_FALLBACK", "false").lower() in ("true", "1")
+        client_host = request.client.host if request.client else ""
+        if allow_dev and client_host in ("127.0.0.1", "localhost", "::1"):
+            import getpass
+            candidate = os.environ.get("USERNAME") or getpass.getuser()
+
+    if not candidate:
+        return None
+
+    raw = str(candidate).strip()
+    if '\\' in raw:
+        raw = raw.split('\\')[-1]
+    elif '/' in raw:
+        raw = raw.split('/')[-1]
+    elif '@' in raw:
+        raw = raw.split('@')[0]
+    return raw.strip().lower()
+
+
+async def _build_and_store_user_session(
+    request: Request,
+    username: str,
+    db_user: dict,
+    dst: str | None,
+    x_app_source: str,
+    login_type_msg: str = "Login successful",
+) -> dict:
+    """
+    Common helper for both manual DMS and SSO logins to populate user groups,
+    tab permissions, server session, and login logs.
+    """
+    session_id = str(uuid.uuid4())
+    try:
+        from database.login_logs import log_login
+        client_ip = request.client.host if request.client else None
+        await log_login(
+            people_system_id=db_user.get('people_system_id'),
+            session_id=session_id,
+            app_source=x_app_source,
+            ip_address=client_ip,
+        )
+    except Exception as login_log_err:
+        logging.warning(f"Could not log login for {username}: {login_log_err}")
+
+    group_flags = {'is_ems_admin_group_member': False, 'is_docs_supervisor': False}
+    security_str = db_user.get('security_level', 'Viewer')
+    security_level = processor.get_security_level_int(security_str)
+
+    if dst:
+        try:
+            user_groups = await run_in_threadpool(wsdl_client.get_groups_for_user, dst, username)
+            group_flags = _extract_group_membership_flags(user_groups)
+            security_level = processor.determine_security_from_groups(user_groups)
+            security_str = {9: 'Admin', 5: 'Editor', 0: 'Viewer'}.get(security_level, 'Viewer')
+        except Exception as e:
+            logging.error(f"Could not get DMS groups for {username}: {e}")
+            security_str = db_user.get('security_level', 'Viewer')
+            security_level = processor.get_security_level_int(security_str)
+
+    # Tab permissions — admin override bypasses DB
+    if security_str == 'Admin':
+        tab_permissions = db_connector.get_admin_full_permissions()
+    else:
+        people_system_id = db_user.get('people_system_id')
+        if people_system_id:
+            tab_permissions = await db_connector.get_tab_permissions_for_user(people_system_id)
+        else:
+            tab_permissions = []
+
+    tab_permissions = _ensure_ems_admin_tab_permission(
+        tab_permissions,
+        group_flags.get('is_ems_admin_group_member', False)
+    )
+
+    db_prefs = db_user
+
+    user_details = {
+        'username': username,
+        'full_name': db_prefs.get('full_name') if db_prefs else username,
+        'token': dst,
+        'security_level': security_str,
+        'dms_security_level': security_level,
+        'lang': db_prefs.get('lang', 'en') if db_prefs else 'en',
+        'theme': db_prefs.get('theme', 'light') if db_prefs else 'light',
+        'view_mode': db_prefs.get('view_mode', 'grid') if db_prefs else 'grid',
+        'profile_view_mode': db_prefs.get('profile_view_mode', 'grid') if db_prefs else 'grid',
+        'tab_permissions': tab_permissions,
+        **group_flags,
+    }
+
+    request.session['session_id'] = session_id
+    request.session['user'] = user_details
+
+    # Strip internal token before sending to client
+    safe_user = {k: v for k, v in user_details.items() if k != 'token'}
+    safe_user['session_id'] = session_id
+    return {"message": login_type_msg, "user": safe_user}
+
+
 @router.post('/api/auth/login')
 @limiter.limit("255/minute")
 async def login(
@@ -204,89 +330,73 @@ async def login(
     x_app_source: str = Header("unknown", alias="X-App-Source"),
 ):
     dst, error_msg = await run_in_threadpool(wsdl_client.dms_user_login, creds.username, creds.password)
-    if dst:
-        # Mandatory: Check if user exists in Smart EDMS local DB
-        db_user = await db_connector.get_user_details(creds.username)
-        if not db_user:
-            raise HTTPException(status_code=403, detail="User doesn't have smart EDMS account")
+    if not dst:
+        raise HTTPException(status_code=401, detail=error_msg or "Invalid DMS credentials")
 
-        # Generate a server-side session id and persist the session (best-effort,
-        # never block login). The same id is stored in the cookie session so the
-        # SessionValidationMiddleware can enforce termination.
-        session_id = str(uuid.uuid4())
+    # Check if user exists in Smart EDMS local DB (auto-provision if they exist in PEOPLE table)
+    db_user, prov_err = await db_connector.ensure_edms_user(creds.username)
+    if not db_user:
+        raise HTTPException(status_code=403, detail=prov_err or "User doesn't have smart EDMS account")
+
+    return await _build_and_store_user_session(
+        request=request,
+        username=creds.username,
+        db_user=db_user,
+        dst=dst,
+        x_app_source=x_app_source,
+        login_type_msg="Login successful"
+    )
+
+
+@router.api_route('/api/auth/sso', methods=['GET', 'POST'])
+@limiter.limit("255/minute")
+async def sso_login(
+    request: Request,
+    x_app_source: str = Header("SSO", alias="X-App-Source"),
+):
+    """
+    Single Sign-On (SSO) login endpoint.
+    Extracts the authenticated domain user identity (e.g. from IIS Windows Authentication
+    headers like X-Remote-User / Remote-User, or request payload), validates against the
+    PEOPLE table, auto-provisions a minimal EDMS profile if new, and initiates a session.
+    """
+    body_username = None
+    if request.method == "POST":
         try:
-            from database.login_logs import log_login
-            client_ip = request.client.host if request.client else None
-            await log_login(
-                people_system_id=db_user.get('people_system_id'),
-                session_id=session_id,
-                app_source=x_app_source,
-                ip_address=client_ip,
-            )
-        except Exception as login_log_err:
-            logging.warning(f"Could not log login for {creds.username}: {login_log_err}")
+            body = await request.json()
+            if isinstance(body, dict):
+                body_username = body.get("username") or body.get("desktop_user")
+        except Exception:
+            pass
 
-        # Get user's groups from DMS (proven working query)
-        group_flags = {'is_ems_admin_group_member': False}
-        try:
-            user_groups = await run_in_threadpool(wsdl_client.get_groups_for_user, dst, creds.username)
-            # logging.info(f"User {creds.username} belongs to groups: {[g.get('group_id') for g in user_groups]}")
-
-            group_flags = _extract_group_membership_flags(user_groups)
-
-            security_level = processor.determine_security_from_groups(user_groups)
-            security_str = {9: 'Admin', 5: 'Editor', 0: 'Viewer'}.get(security_level, 'Viewer')
-        except Exception as e:
-            logging.error(f"Could not get DMS groups for {creds.username}: {e}")
-            # Fallback to DB security level since DMS failed
-            # db_user is already guaranteed to exist here
-            if 'security_level' not in db_user:
-                raise HTTPException(status_code=401, detail="User not authorized")
-            security_str = db_user.get('security_level', 'Viewer')
-            security_level = processor.get_security_level_int(security_str)
-
-        # Fetch tab permissions — admin override bypasses DB
-        if security_str == 'Admin':
-            tab_permissions = db_connector.get_admin_full_permissions()
-        else:
-            # Get the people_system_id from the DB user record for per-user lookup
-            people_system_id = db_user.get('people_system_id')
-            if people_system_id:
-                tab_permissions = await db_connector.get_tab_permissions_for_user(people_system_id)
-            else:
-                tab_permissions = []
-
-        tab_permissions = _ensure_ems_admin_tab_permission(
-            tab_permissions,
-            group_flags.get('is_ems_admin_group_member', False)
+    username = _extract_sso_username(request, body_username=body_username)
+    if not username:
+        raise HTTPException(
+            status_code=401,
+            detail="No SSO identity detected in request headers (e.g. X-Remote-User) or payload",
+            headers={"WWW-Authenticate": "Negotiate, NTLM"}
         )
 
-        # Use already fetched db_user for preferences
-        db_prefs = db_user
+    # Check if user exists in Smart EDMS local DB (auto-provision if they exist in PEOPLE table)
+    db_user, prov_err = await db_connector.ensure_edms_user(username)
+    if not db_user:
+        raise HTTPException(
+            status_code=403,
+            detail=prov_err or f"User '{username}' is not registered in the organization PEOPLE directory"
+        )
 
-        user_details = {
-            'username': creds.username,
-            'full_name': db_prefs.get('full_name') if db_prefs else creds.username,
-            'token': dst,
-            'security_level': security_str,
-            'dms_security_level': security_level,  # Numeric for logic
-            'lang': db_prefs.get('lang', 'en') if db_prefs else 'en',
-            'theme': db_prefs.get('theme', 'light') if db_prefs else 'light',
-            'view_mode': db_prefs.get('view_mode', 'grid') if db_prefs else 'grid',
-            'profile_view_mode': db_prefs.get('profile_view_mode', 'grid') if db_prefs else 'grid',
-            'tab_permissions': tab_permissions,
-            **group_flags,
-        }
+    # Acquire system DMS token for SOAP operations
+    dst = await run_in_threadpool(wsdl_client.dms_system_login)
 
-        request.session['session_id'] = session_id
-        request.session['user'] = user_details
+    return await _build_and_store_user_session(
+        request=request,
+        username=username,
+        db_user=db_user,
+        dst=dst,
+        x_app_source=x_app_source or "SSO",
+        login_type_msg="SSO login successful"
+    )
 
-        # Strip internal token before sending to client
-        safe_user = {k: v for k, v in user_details.items() if k != 'token'}
-        safe_user['session_id'] = session_id
-        return {"message": "Login successful", "user": safe_user}
-    else:
-        raise HTTPException(status_code=401, detail=error_msg or "Invalid DMS credentials")
 
 @router.post('/api/auth/logout')
 async def logout(request: Request):
@@ -344,9 +454,9 @@ async def get_user(request: Request):
             return {'user': safe_user}
         else:
             request.session.pop('user', None)
-            raise HTTPException(status_code=401, detail='User not found')
+            return {'user': None}
     else:
-        raise HTTPException(status_code=401, detail='Not authenticated')
+        return {'user': None}
 
 @router.put('/api/user/language')
 async def update_user_language(request: Request, data: LangUpdateRequest):

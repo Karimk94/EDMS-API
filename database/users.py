@@ -319,3 +319,136 @@ async def get_user_system_id(username):
         if conn:
             await conn.close()
     return system_id
+
+async def ensure_edms_user(username: str) -> tuple[dict | None, str | None]:
+    """
+    Checks if a user has an active Smart EDMS account.
+    If not, but they exist in the PEOPLE table, automatically provisions a minimal
+    account in LKP_EDMS_USR_SECUR (minimal Viewer level, default quota, no tab permissions).
+    Returns (user_details, None) on success, or (None, error_message) on failure.
+    """
+    cleaned_username = str(username or '').strip()
+    if not cleaned_username:
+        return None, "Username cannot be empty"
+
+    # 1. First attempt to load existing details
+    user_details = await get_user_details(cleaned_username)
+    if user_details:
+        return user_details, None
+
+    # 2. Check if user exists in PEOPLE table
+    conn = await get_async_connection()
+    if not conn:
+        return None, "Database connection failed"
+
+    try:
+        async with conn.cursor() as cursor:
+            await cursor.execute(
+                "SELECT SYSTEM_ID, FULL_NAME FROM PEOPLE WHERE UPPER(USER_ID) = UPPER(:username)",
+                username=cleaned_username
+            )
+            people_row = await cursor.fetchone()
+            if not people_row:
+                return None, f"User '{cleaned_username}' is not registered in the organization directory (PEOPLE table)"
+
+            people_system_id, full_name = people_row[0], people_row[1]
+
+            # 3. Check if LKP_EDMS_USR_SECUR already has this user
+            await cursor.execute(
+                "SELECT SYSTEM_ID FROM LKP_EDMS_USR_SECUR WHERE USER_ID = :user_id",
+                user_id=people_system_id
+            )
+            secur_row = await cursor.fetchone()
+
+            if not secur_row:
+                # Find minimal security level (Viewer)
+                await cursor.execute("SELECT SYSTEM_ID FROM LKP_EDMS_SECURITY WHERE UPPER(NAME) = 'VIEWER'")
+                viewer_row = await cursor.fetchone()
+                if viewer_row:
+                    sec_level_id = viewer_row[0]
+                else:
+                    await cursor.execute("SELECT SYSTEM_ID FROM LKP_EDMS_SECURITY ORDER BY SYSTEM_ID ASC FETCH FIRST 1 ROWS ONLY")
+                    sec_row = await cursor.fetchone()
+                    sec_level_id = sec_row[0] if sec_row else 0
+
+                # Insert into LKP_EDMS_USR_SECUR with minimal privileges and defaults
+                insert_secur_sql = """
+                    INSERT INTO LKP_EDMS_USR_SECUR (
+                        SYSTEM_ID, USER_ID, SECURITY_LEVEL_ID, LANG, THEME, VIEW_MODE, DISABLED, SECTION, LARGE_DOWNLOADS
+                    ) VALUES (
+                        (SELECT NVL(MAX(SYSTEM_ID), 0) + 1 FROM LKP_EDMS_USR_SECUR),
+                        :user_id,
+                        :security_level_id,
+                        'en',
+                        'light',
+                        'grid',
+                        '0',
+                        '0000',
+                        '0'
+                    )
+                """
+                try:
+                    await cursor.execute(
+                        insert_secur_sql,
+                        user_id=people_system_id,
+                        security_level_id=sec_level_id
+                    )
+                except oracledb.DatabaseError as db_err:
+                    err_obj, = db_err.args
+                    if hasattr(err_obj, 'code') and err_obj.code == 904:
+                        # Fallback if VIEW_MODE or LARGE_DOWNLOADS column does not exist
+                        fallback_sql = """
+                            INSERT INTO LKP_EDMS_USR_SECUR (
+                                SYSTEM_ID, USER_ID, SECURITY_LEVEL_ID, LANG, THEME, DISABLED, SECTION
+                            ) VALUES (
+                                (SELECT NVL(MAX(SYSTEM_ID), 0) + 1 FROM LKP_EDMS_USR_SECUR),
+                                :user_id,
+                                :security_level_id,
+                                'en',
+                                'light',
+                                '0',
+                                '0000'
+                            )
+                        """
+                        await cursor.execute(fallback_sql, user_id=people_system_id, security_level_id=sec_level_id)
+                    else:
+                        raise
+
+                # Get the newly created EDMS User ID
+                await cursor.execute("SELECT SYSTEM_ID FROM LKP_EDMS_USR_SECUR WHERE USER_ID = :1", [people_system_id])
+                sec_rec = await cursor.fetchone()
+                if sec_rec:
+                    edms_user_id = sec_rec[0]
+                    # Initialize Quota in LKP_EDMS_USR_DATA (1 GB default)
+                    await cursor.execute("SELECT COUNT(*) FROM LKP_EDMS_USR_DATA WHERE USER_ID = :1", [edms_user_id])
+                    quota_count = (await cursor.fetchone())[0]
+                    if quota_count == 0:
+                        await cursor.execute(
+                            "INSERT INTO LKP_EDMS_USR_DATA (SYSTEM_ID, USER_ID, REMAINING_QUOTA, QUOTA, DISABLED) "
+                            "VALUES ((SELECT NVL(MAX(SYSTEM_ID), 0) + 1 FROM LKP_EDMS_USR_DATA), :1, 1073741824, 1073741824, '0')",
+                            [edms_user_id]
+                        )
+
+                # Commit transaction — minimal levels, no tab permissions created
+                await conn.commit()
+                logging.info(f"Auto-provisioned new EDMS user '{cleaned_username}' (PEOPLE SYSTEM_ID: {people_system_id}) with minimal Viewer access.")
+
+    except oracledb.IntegrityError:
+        # If another concurrent request inserted the row simultaneously, ignore and retrieve
+        if conn:
+            await conn.rollback()
+    except Exception as e:
+        logging.error(f"Error auto-provisioning user '{cleaned_username}': {e}", exc_info=True)
+        if conn:
+            await conn.rollback()
+        return None, f"Failed to auto-provision user: {e}"
+    finally:
+        if conn:
+            await conn.close()
+
+    # 4. Fetch the newly created or existing user details
+    user_details = await get_user_details(cleaned_username)
+    if user_details:
+        return user_details, None
+
+    return None, f"Could not retrieve user details for '{cleaned_username}' after provisioning"

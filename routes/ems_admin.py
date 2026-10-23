@@ -80,7 +80,7 @@ async def check_ems_admin_access(request: Request, response: Response):
     response.headers["Expires"] = "0"
     
     if "user" not in request.session:
-        raise HTTPException(status_code=401, detail="Not authenticated")
+        return {"has_access": False, "username": None}
 
     has_access = await check_admin_access(request)
     user = request.session.get("user", {})

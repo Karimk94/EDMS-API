@@ -24,7 +24,8 @@ from database.tags import (
 )
 from database.users import (
     get_user_security_level, get_user_details, update_user_language,
-    update_user_theme, update_user_view_mode, update_user_profile_view_mode, get_user_system_id
+    update_user_theme, update_user_view_mode, update_user_profile_view_mode, get_user_system_id,
+    ensure_edms_user
 )
 from database.events import (
     get_events, create_event, link_document_to_event,
