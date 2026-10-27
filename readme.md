@@ -103,7 +103,12 @@ When documents, field photographs, scanned records, or media attachments enter t
      > [!IMPORTANT]
      > **Perception Middleware Boundary**: The Face Recognition Service does **not** call GovAI LLM for deep neural inference. Instead, it delegates face detection (RetinaFace) and 4096-dimensional facial embedding computation (VGG-Face) to the **Dataiku Model API (Port 5009 / DSS :13000)**, which runs inside the **Enterprise AI Center** on dedicated compute nodes with pre-cached neural network weights.
 4. **Metadata Enrichment & Abstract Aggregation**:
-   The API consolidates all AI extracts into a structured document `ABSTRACT` (capping captions to 500 characters and the total abstract to 2,000 characters). Extracted English tags are translated to Arabic (without Tashkeel) via the [Translator Rephraser Service](file:///d:/projects/new%20EDMS%20py/Translator%20Rephraser%20py) (`POST /generate`) and committed to Oracle tables `KEYWORD` and `LKP_DOCUMENT_TAGS`. The document status is updated to `STATUS = 3` (Complete).
+   The API consolidates all AI extracts into a structured document `ABSTRACT`. During this stage, the [Translator Rephraser Service](file:///d:/projects/new%20EDMS%20py/Translator%20Rephraser%20py) (Port 5005 / 5010, `POST /generate`) performs four critical tasks:
+   - **Tag Translation**: Translates extracted visual, video, and OCR tags from English to Arabic while stripping all Tashkeel diacritics via regex `[\u064B-\u065F\u0670]`.
+   - **Caption Shortening**: Shortens verbose image captions exceeding 300 characters via `task="shorten"`.
+   - **Abstract Optimization**: Rephrases composite abstracts exceeding 2,000 characters to comply with OpenText eDOCS column limits.
+   - **Speech Transcript Tokenization**: Tokenizes video audio transcripts into structured keyword tags via `task="tokenize"`.
+   Bilingual tag pairs (`KEYWORD_ID` in English and `DESCRIPTION` in Arabic) are committed to Oracle tables `KEYWORD` and `LKP_DOCUMENT_TAGS`. The document status is updated to `STATUS = 3` (Complete).
 5. **Dense Vector Embeddings (ChromaDB Indexing)**:
    The completed abstract is sent to the [Embedding Service](file:///d:/projects/new%20EDMS%20py/Embedding%20Service) (`POST /embed` on Port 5003), which calls GovAI (`qwen3-embedding-8b`) to generate a 4096-dimensional dense mathematical vector. The vector is committed persistently to **ChromaDB** (`edms_documents` collection) mapped to the document number.
 
@@ -143,7 +148,11 @@ ChromaDB (edms_documents)                             │
    - **Required Concepts**: Mandatory constraints that the user explicitly indicated must co-occur (e.g., `"cars and plants"`).
 2. **Parallel Dual-Path Retrieval**:
    - **Semantic Vector Path**: The enriched query is passed to the [Embedding Service](file:///d:/projects/new%20EDMS%20py/Embedding%20Service) (Port 5003) to generate a query vector. ChromaDB evaluates cosine similarity distance and returns candidate document IDs. Matches exceeding `VECTOR_DISTANCE_THRESHOLD` (e.g., > 1.3) are discarded.
-   - **Lexical Oracle SQL Path**: Dynamic SQL queries execute against `PROFILE`, `KEYWORD`, `LKP_DOCUMENT_TAGS`, and `LKP_PERSON`. Expanded synonyms are combined with broad SQL `OR`, while required concepts are strictly enforced with SQL `AND`.
+   - **Lexical Oracle SQL Path & Cross-Lingual Linkage**: Dynamic SQL queries execute against `PROFILE`, `KEYWORD`, `LKP_DOCUMENT_TAGS`, and `LKP_PERSON`. Because the Translator Service stored bilingual keyword pairs during ingestion (`KEYWORD_ID` = English, `DESCRIPTION` = Arabic without Tashkeel), Oracle SQL CTEs instantly match queries across both languages simultaneously:
+     ```sql
+     (UPPER(k.KEYWORD_ID) LIKE UPPER(:token) OR k.DESCRIPTION LIKE :token)
+     ```
+     This cross-lingual linkage enables instant English-to-Arabic and Arabic-to-English retrieval without per-query translation latency.
 3. **Reciprocal Rank Fusion (RRF) Ranking**:
    Results from ChromaDB (`VECTOR_RANK`) and Oracle keyword scoring (`KEYWORD_RANK`) are fused directly inside Oracle SQL using the standard Reciprocal Rank Fusion formula:
    $$\text{Score} = \frac{1.0}{60 + \text{VECTOR\_RANK}} + \frac{1.0}{60 + \text{KEYWORD\_RANK}}$$
@@ -168,7 +177,7 @@ The Smart EDMS API acts as the orchestrator binding together the following micro
 | **Smart Search Service** | **5006** | FastAPI · GovAI `qwen3-235b-fp16` | Natural language intent extraction, synonym expansion, required concepts |
 | **Video Context Summarizer**| **5008** | FastAPI · OpenCV · MoviePy · Whisper | Strategic keyframe vision, speech transcription, face crop extraction |
 | **Dataiku Model API** | **5009** / DSS :13000 | Flask · Waitress · RetinaFace · VGG-Face | **Stateless ML perception middleware for Face Recognition (AI Center)** |
-| **Translator Rephraser py** | **5010** | FastAPI · GovAI `qwen3-235b-fp16` | Arabic Tashkeel removal, EN↔AR translation, abstract shortening (< 2000 ch) |
+| **Translator Rephraser py** | **5005** / 5010 | FastAPI · GovAI `qwen3-235b-fp16` | Arabic Tashkeel removal, EN↔AR tag translation, caption/abstract shortening (< 300 / 2,000 ch), transcript tokenization |
 | **Smart EDMS Frontend** | **3000** | Next.js 15 · React 19 · TypeScript | Enterprise primary web portal (admin dashboards, viewer, sharing) |
 | **EDMS Media Frontend** | **3000** | Next.js 16 · React 19 · TanStack Query | Media viewer, Next.js server-side API proxy (`/api/[...proxy]`) |
 | **EDMS Mobile** | Native | React Native · Expo | Mobile viewer application for iOS and Android |
@@ -199,7 +208,7 @@ The Smart EDMS API acts as the orchestrator binding together the following micro
 - **[OCR Service](file:///d:/projects/new%20EDMS%20py/OCR%20py)** (`OCR_API_URL`): Invoked by `api_client.get_ocr_text()` (`POST /translate_image_stream`). Performs Arabic & English OCR via GovAI `qwen3-vl-30b` with watermark deduplication, falling back to local OpenCV CLAHE + EasyOCR.
 - **[Smart Search Service](file:///d:/projects/new%20EDMS%20py/Smart%20Search%20Service)** (`SMART_SEARCH_API_URL`): Invoked by `api_client.get_search_intent()` (`POST /tokenize`). Prompts GovAI `qwen3-235b-fp16` to extract domain synonyms and logical required concepts.
 - **[Video Context Summarizer](file:///d:/projects/new%20EDMS%20py/Video%20Context%20Summarizer)** (`VIDEO_SUMMARIZER_API_URL`): Invoked by `api_client.summarize_video()` (`POST /upload_stream`). Samples video keyframes and extracts audio tracks, polling `GET /status/{task_id}` for completion.
-- **[Translator & Rephraser](file:///d:/projects/new%20EDMS%20py/Translator%20Rephraser%20py)** (`TRANSLATOR_REPHRASER_API_URL`): Invoked by `api_client.translate_text()` (`POST /generate`). Removes Tashkeel diacritics, translates tags between Arabic and English, and rephrases abstracts exceeding 2,000 characters.
+- **[Translator & Rephraser](file:///d:/projects/new%20EDMS%20py/Translator%20Rephraser%20py)** (`TRANSLATOR_REPHRASER_API_URL`): Invoked by `api_client.translate_text()` (`POST /generate`) on Port 5005 (or 5010). Employs GovAI `qwen3-235b-fp16`. Normalizes Arabic text by strictly stripping Tashkeel diacritics (`[\u064B-\u065F\u0670]`), translates extracted English vision/video tags into Arabic, shortens verbose image captions (> 300 chars), and tokenizes video audio transcripts. Stores bilingual keyword pairs in Oracle `KEYWORD` (`KEYWORD_ID` and `DESCRIPTION`) and `LKP_DOCUMENT_TAGS` to power cross-lingual search.
 
 ---
 
@@ -570,7 +579,8 @@ Document Upload / Queue Worker
        └─► PDFs ─────► PyMuPDF Page Extraction  ─► OCR Service (5004) ─► Text Tokens
                               │
                               ▼
-        Consolidate Abstract & Bilingual Translations (Translator :5010)
+        Consolidate Abstract & Bilingual Translations (Translator Rephraser :5005 / :5010)
+        (Translates tags EN➔AR without Tashkeel, shortens captions >300 ch, caps abstract <2000 ch)
                               │
                               ▼
             Update Oracle DB (STATUS = 3, Abstract, Tags, VIPs)
@@ -582,10 +592,10 @@ Document Upload / Queue Worker
 ### Media-Specific Flows:
 
 - **Images**:
-  1. Calls Captioning Service to produce scene description (max 500 characters).
+  1. Calls Captioning Service to produce scene description (shortened via Translator Service if > 300 characters).
   2. Calls OCR Service to extract in-image text.
   3. Calls Face Recognition Service (`/api/analyze_image_stream`) to identify VIP dignitaries.
-  4. Tags are translated to Arabic via Translator Service and saved to `KEYWORD`.
+  4. Tags are translated to Arabic without Tashkeel via Translator Service (Port 5005) and committed as bilingual pairs (`KEYWORD_ID` + `DESCRIPTION`) to `KEYWORD` and `LKP_DOCUMENT_TAGS`.
   5. The consolidated abstract is indexed into ChromaDB.
 - **Videos**:
   1. Streams video chunks to Video Context Summarizer (`/upload_stream`).
@@ -821,7 +831,7 @@ EMBEDDING_API_URL=http://localhost:5003
 OCR_API_URL=http://localhost:5004
 SMART_SEARCH_API_URL=http://localhost:5006
 VIDEO_SUMMARIZER_API_URL=http://localhost:5008
-TRANSLATOR_REPHRASER_API_URL=http://localhost:5010
+TRANSLATOR_REPHRASER_API_URL=http://localhost:5005  # Port 5005 (or 5010 fallback)
 
 # ==============================================================================
 # Vector Store & Shared Paths
