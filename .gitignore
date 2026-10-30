@@ -27,4 +27,5 @@ wheels/
 packages/
 download_cache/
 diagrams/
+reports/
 web.config

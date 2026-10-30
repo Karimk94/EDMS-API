@@ -144,12 +144,8 @@ async def fetch_documents_from_oracle(page=1, page_size=20, search_term=None, da
     event_doc_ids, event_folder_names = event_data
     vector_doc_ids = parallel_results[3] if not isinstance(parallel_results[3], Exception) else None
     
-    # --- Pre-fetch WSDL data BEFORE acquiring DB connection ---
-    # This is critical to avoid connection pool exhaustion from long-running WSDL calls
-    dst = dms_system_login()
-    if not dst:
-        logging.error("Could not log into DMS. Aborting document fetch.")
-        return [], 0
+    # dst is already valid from the dms_system_login() call above (before asyncio.gather).
+    # The duplicate login call here has been removed to halve login overhead per search.
 
     offset = (page - 1) * page_size
     documents = []
@@ -618,24 +614,38 @@ async def fetch_documents_from_oracle(page=1, page_size=20, search_term=None, da
                 except Exception as e:
                     logging.warning(f"Could not batch-fetch event names for documents: {e}")
 
-            for row in rows:
+            # --- Resolve media info for all rows concurrently ---
+            # Previously this was a sequential per-document loop that made up to
+            # 2 x pageSize WSDL round-trips in series, causing the 504 timeouts.
+            # Now all get_media_info_from_dms calls fire in parallel.
+            row_doc_ids = [r[0] for r in rows]
+            media_info_results = await asyncio.gather(
+                *[get_media_info_from_dms(dst, doc_id) for doc_id in row_doc_ids],
+                return_exceptions=True
+            )
+
+            for row, media_info in zip(rows, media_info_results):
                 doc_id, abstract, author, doc_date, docname, is_favorite = row
                 thumbnail_path = None
                 media_type = 'image'
+                file_ext = ''
+                original_filename = ''
 
                 final_abstract = abstract or ""
 
                 try:
-                    # Async call to resolve media type/filename
-                    original_filename, media_type, file_ext = await get_media_info_from_dms(dst, doc_id)
+                    if isinstance(media_info, Exception):
+                        raise media_info
+                    original_filename, media_type, file_ext = media_info
+
                     cached_thumbnail_file = f"{doc_id}.jpg"
                     cached_path = os.path.join(thumbnail_cache_dir, cached_thumbnail_file)
 
                     if os.path.exists(cached_path):
                         thumbnail_path = f"cache/{cached_thumbnail_file}"
                     else:
-                        # Create thumbnail on-demand if not cached (same as favorites)
-                        media_bytes = get_media_content_from_dms(dst, doc_id)
+                        # Wrap the blocking sync call so it does NOT block the event loop
+                        media_bytes = await asyncio.to_thread(get_media_content_from_dms, dst, doc_id)
                         if media_bytes:
                             thumbnail_path = create_thumbnail(doc_id, media_type, file_ext, media_bytes)
 
@@ -648,6 +658,7 @@ async def fetch_documents_from_oracle(page=1, page_size=20, search_term=None, da
                 
                 documents.append({
                     "doc_id": doc_id,
+                    "docnumber": str(doc_id),
                     "title": final_abstract,
                     "abstract": final_abstract,
                     "docname": docname or "",

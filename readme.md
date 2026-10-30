@@ -203,7 +203,7 @@ The Smart EDMS API acts as the orchestrator binding together the following micro
 
 - **[Image Captioning Service](file:///d:/projects/new%20EDMS%20py/Image%20Captioning%20py)** (`CAPTIONING_API_URL`): Invoked by `api_client.get_captions()` via memory streaming (`POST /process_image_stream`). Employs GovAI `qwen3-vl-30b` to generate scene descriptions and tags, bounded by `_cap_caption()` to guarantee Oracle column compatibility (< 500 chars).
 - **[Face Recognition Service](file:///d:/projects/new%20EDMS%20py/Face%20Recognition%20py)** (`FACE_API_URL`): Invoked by `api_client.recognize_faces()` (`POST /api/analyze_image_stream`) and `api_client.recognize_faces_from_list()` (`POST /api/recognize_faces`). Maintains a local ChromaDB instance (`faces` collection).
-- **[Dataiku Model API](file:///d:/projects/new%20EDMS%20py/Dataiku%20Model%20API)** (`DATAIKU_MODEL_API_URL`): High-throughput machine learning inference engine running on Port 5009 or Dataiku DSS (`rtauevaidss1.rtatestdom.local:13000`). It is 100% stateless and executes RetinaFace face detection and VGG-Face 4096-dimensional vector extraction. **Operates as part of the Enterprise AI Center without utilizing GovAI LLM.**
+- **[Dataiku Model API](file:///d:/projects/new%20EDMS%20py/Dataiku%20Model%20API)** (`DATAIKU_MODEL_API_URL`): High-throughput machine learning inference engine running on Port 5009 or Dataiku DSS (`dataiku-model-api.example.com:13000`). It is 100% stateless and executes RetinaFace face detection and VGG-Face 4096-dimensional vector extraction. **Operates as part of the Enterprise AI Center without utilizing GovAI LLM.**
 - **[Embedding Service](file:///d:/projects/new%20EDMS%20py/Embedding%20Service)** (`EMBEDDING_API_URL`): Invoked by `api_client.get_embedding_from_service()` (`POST /embed`). Delegates to GovAI `qwen3-embedding-8b` to return 4096-dimensional vectors for abstracts and search queries.
 - **[OCR Service](file:///d:/projects/new%20EDMS%20py/OCR%20py)** (`OCR_API_URL`): Invoked by `api_client.get_ocr_text()` (`POST /translate_image_stream`). Performs Arabic & English OCR via GovAI `qwen3-vl-30b` with watermark deduplication, falling back to local OpenCV CLAHE + EasyOCR.
 - **[Smart Search Service](file:///d:/projects/new%20EDMS%20py/Smart%20Search%20Service)** (`SMART_SEARCH_API_URL`): Invoked by `api_client.get_search_intent()` (`POST /tokenize`). Prompts GovAI `qwen3-235b-fp16` to extract domain synonyms and logical required concepts.
@@ -234,7 +234,7 @@ A fleet of autonomous Windows scheduled tasks support database and server health
   - `qwen3-vl-30b`: Multimodal visual comprehension for OCR, image captioning, and video keyframes.
   - `qwen3-embedding-8b`: 4096-dimensional text vector embeddings.
   - `whisper_asr`: Audio speech-to-text transcription.
-- **Enterprise AI Center (Dataiku DSS)**: Dedicated on-premise deep learning cluster (`rtauevaidss1.rtatestdom.local:13000`) hosting neural network weights for RetinaFace and VGG-Face.
+- **Enterprise AI Center (Dataiku DSS)**: Dedicated on-premise deep learning cluster (`dataiku-model-api.example.com:13000`) hosting neural network weights for RetinaFace and VGG-Face.
 
 ---
 
@@ -468,7 +468,7 @@ All routes require active session authentication via the `get_current_user` Fast
 
 | Method | Endpoint | Description | Rate Limit |
 |---|---|---|---|
-| `POST` | `/api/share/generate` | Creates secure share link. Supports **Open mode** (any `@rta.ae` email) and **Restricted mode** (specific recipients). | 100 / min |
+| `POST` | `/api/share/generate` | Creates secure share link. Supports **Open mode** (any authorized company email) and **Restricted mode** (specific recipients). | 100 / min |
 | `GET` | `/api/share/info/{token}` | Public route returning link metadata (restricted vs. open, expiry) without authentication. | — |
 | `POST` | `/api/share/request-access/{token}` | Validates recipient email, generates 6-digit OTP, stores in DB, sends via SMTP. | 5 / min |
 | `POST` | `/api/share/verify-access/{token}` | Validates 6-digit OTP code, issues temporary access token, logs audit trail. | — |
@@ -809,7 +809,7 @@ In Windows Server IIS environments, requests are handled via the `HttpPlatformHa
 # ==============================================================================
 # Oracle Enterprise Database
 # ==============================================================================
-DB_HOST=10.0.0.50
+DB_HOST=192.168.1.50
 DB_PORT=1521
 DB_SERVICE_NAME=edmsprod
 DB_USERNAME=docsadmin
@@ -844,20 +844,20 @@ VECTOR_DISTANCE_THRESHOLD=1.3
 # Application & Session Security
 # ==============================================================================
 FLASK_SECRET_KEY=cryptographically-random-secret-key-must-match-across-nodes
-FRONTEND_URL=http://localhost:3000,http://portal.rta.ae
-API_BASE_URL=http://api.edms.rta.ae
+FRONTEND_URL=http://localhost:3000,http://portal.example.com
+API_BASE_URL=http://api.edms.example.com
 
 # ==============================================================================
 # SMTP Mail Configuration (OTP Sharing)
 # ==============================================================================
-SMTP_SERVER=mail.rta.ae
+SMTP_SERVER=mail.example.com
 SMTP_PORT=587
-SMTP_USER=edms-notifications@rta.ae
+SMTP_USER=edms-notifications@example.com
 SMTP_PASSWORD=YourSmtpPassword
-SMTP_SENDER_EMAIL=edms-notifications@rta.ae
+SMTP_SENDER_EMAIL=edms-notifications@example.com
 SMTP_SENDER_NAME="Smart EDMS"
-COMPANY_NAME="Roads and Transport Authority"
-SUPPORT_EMAIL=edms-support@rta.ae
+COMPANY_NAME="Enterprise EDMS"
+SUPPORT_EMAIL=edms-support@example.com
 ```
 
 ---

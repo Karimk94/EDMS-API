@@ -155,7 +155,9 @@ async def get_favorites(user_id, page=1, page_size=20, app_source='unknown'):
 
                 documents.append({
                     "doc_id": doc_id,
+                    "docnumber": str(doc_id),
                     "title": abstract or "",
+                    "abstract": abstract or "",
                     "docname": docname or "",
                     "author": author or "N/A",
                     "date": doc_date.strftime('%Y-%m-%d %H:%M:%S') if doc_date else "N/A",

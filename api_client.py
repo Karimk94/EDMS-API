@@ -44,7 +44,7 @@ def get_search_intent(text):
         response = requests.post(
             f"{SMART_SEARCH_API_URL.rstrip('/')}/tokenize",
             json={"text": text},
-            timeout=30
+            timeout=10   # Short timeout: raw search works without tokenization
         )
         response.raise_for_status()
         data = response.json()
