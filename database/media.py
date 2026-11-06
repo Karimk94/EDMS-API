@@ -428,55 +428,8 @@ async def get_app_id_from_extension(extension):
     return app_id
 
 async def get_media_type_counts(app_source='unknown', scope=None, username=None):
-    """Counts documents by media type (Async)."""
-    if scope == 'folders':
-        dst = dms_system_login()
-        if dst:
-            return await wsdl_client.get_root_folder_counts(dst, username=username)
-        return {"images": 0, "videos": 0, "files": 0}
-
-    conn = get_connection()
-    if not conn: return None
-
-    doc_filter_sql = "AND p.RTA_TEXT1 = 'edms-media'"
-
-    if app_source == 'edms-media':
-        doc_filter_sql = "AND p.RTA_TEXT1 = 'edms-media'"
-    elif app_source == 'smart-edms':
-        smart_edms_floor = 19662092
-        doc_filter_sql = f"AND p.DOCNUMBER >= {smart_edms_floor} AND (p.RTA_TEXT1 IS NULL OR p.RTA_TEXT1 != 'edms-media')"
-
-    try:
-        with conn.cursor() as cursor:
-            image_app_ids, video_app_ids, pdf_app_ids = _get_cached_app_buckets(cursor)
-
-            def build_app_id_clause(ids):
-                if not ids: return "1=0"
-                id_list = ",".join(f"'{x}'" for x in ids)
-                return f"TRIM(TO_CHAR(p.APPLICATION)) IN ({id_list})"
-
-            img_sql = build_app_id_clause(image_app_ids)
-            vid_sql = build_app_id_clause(video_app_ids)
-            pdf_sql = build_app_id_clause(pdf_app_ids)
-
-            sql = f"""
-                  SELECT 
-                      SUM(CASE WHEN {img_sql} THEN 1 ELSE 0 END) as image_count,
-                      SUM(CASE WHEN {vid_sql} THEN 1 ELSE 0 END) as video_count,
-                      SUM(CASE WHEN {pdf_sql} THEN 1 ELSE 0 END) as pdf_count
-                  FROM PROFILE p
-                  WHERE p.FORM = '2740' 
-                  {doc_filter_sql}
-                  """
-            cursor.execute(sql)
-            result = cursor.fetchone()
-            return {"images": result[0] or 0, "videos": result[1] or 0, "files": result[2] or 0}
-
-    except oracledb.Error as e:
-        logging.error(f"Oracle error in get_media_type_counts: {e}")
-        return None
-    finally:
-        if conn: conn.close()
+    """Media type counts removed per user request."""
+    return {"images": 0, "videos": 0, "files": 0}
 
 async def resolve_media_types_from_db(doc_ids):
     """Queries the database to find the media type (Async)."""

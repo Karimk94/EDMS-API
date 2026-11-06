@@ -116,30 +116,16 @@ async def get_events(page=1, page_size=20, search=None, fetch_all=False):
     try:
         async with conn.cursor() as cursor:
             if fetch_all:
-                count_query = f"SELECT COUNT(e.SYSTEM_ID) FROM LKP_PHOTO_EVENT e {final_where_clause}"
-                await cursor.execute(count_query, base_params)
-                count_result = await cursor.fetchone()
-                total_rows = count_result[0] if count_result else 0
-
-                if total_rows > 0 and offset < total_rows:
-                    fetch_query = f"""
-                        SELECT e.SYSTEM_ID, e.EVENT_NAME
-                        FROM LKP_PHOTO_EVENT e
-                        {final_where_clause}
-                        ORDER BY e.SYSTEM_ID DESC
-                        OFFSET :offset ROWS FETCH NEXT :page_size ROWS ONLY
-                    """
-                    fetch_params = base_params.copy()
-                    fetch_params['offset'] = offset
-                    fetch_params['page_size'] = page_size
-                    await cursor.execute(fetch_query, fetch_params)
-
-                    rows = await cursor.fetchall()
-                    events_list = [{"id": row[0], "name": row[1], "thumbnail_urls": []} for row in rows]
-                    return events_list, total_rows
-                else:
-                    return [], 0
-
+                fetch_query = f"""
+                    SELECT e.SYSTEM_ID, e.EVENT_NAME
+                    FROM LKP_PHOTO_EVENT e
+                    {final_where_clause}
+                    ORDER BY e.EVENT_NAME ASC
+                """
+                await cursor.execute(fetch_query, base_params)
+                rows = await cursor.fetchall()
+                events_list = [{"id": row[0], "name": row[1], "thumbnail_urls": []} for row in rows]
+                return events_list, len(events_list)
             else:
                 count_query = f"""
                     SELECT COUNT(DISTINCT e.SYSTEM_ID)

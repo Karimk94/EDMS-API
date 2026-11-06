@@ -38,6 +38,10 @@ from database.favorites import (
 from database.memories import (
     fetch_memories_from_oracle, fetch_journey_data
 )
+from database.folders import (
+    search_folders_by_name,
+    filter_edms_media_documents
+)
 from database.tab_permissions import (
     get_tab_permissions_for_user, get_tab_permissions_for_user_admin,
     upsert_tab_permission, delete_tab_permission, get_admin_full_permissions,

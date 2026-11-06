@@ -236,9 +236,13 @@ async def api_create_folder(request: Request, data: CreateFolderRequest, user=De
         raise HTTPException(status_code=500, detail="Failed to create folder.")
 
 @router.get('/api/folders/{folder_id}/preview-thumbnails')
-async def api_get_folder_preview_thumbnails(folder_id: str, user=Depends(get_current_user)):
+async def api_get_folder_preview_thumbnails(
+    folder_id: str,
+    x_app_source: str = Header("unknown", alias="X-App-Source"),
+    user=Depends(get_current_user)
+):
     try:
-        preview_ids = await db_folders.get_folder_preview_ids(folder_id, limit=4)
+        preview_ids = await db_folders.get_folder_preview_ids(folder_id, limit=4, app_source=x_app_source)
         return {"thumbnails": preview_ids}
     except Exception as e:
         logging.error(f"Error fetching preview thumbnails for folder {folder_id}: {e}", exc_info=True)
@@ -394,6 +398,7 @@ async def api_move_items_to_folder(data: MoveItemsRequest, request: Request, use
 async def api_download_folder_zip(
         folder_id: str,
         request: Request,
+        x_app_source: str = Header("unknown", alias="X-App-Source"),
         part: Optional[int] = None,
         user=Depends(get_current_user)
 ):
@@ -419,7 +424,7 @@ async def api_download_folder_zip(
 
     # Only collect direct files — subfolders are skipped by design
     try:
-        direct_files = await db_folders.get_folder_files(folder_id)
+        direct_files = await db_folders.get_folder_files(folder_id, app_source=x_app_source)
     except Exception as e:
         logging.error(f"Failed to list files in folder {folder_id}: {e}")
         raise HTTPException(status_code=500, detail='Failed to list folder contents')

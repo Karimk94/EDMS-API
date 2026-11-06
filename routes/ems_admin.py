@@ -219,7 +219,7 @@ async def get_departments_endpoint(
 
 @router.post("/api/departments/add")
 async def add_department_endpoint(request: Request, data: dict):
-    """Add a new department."""
+    """Add a new department with security group and child N/A section."""
     if not await check_admin_access(request):
         raise HTTPException(status_code=403, detail="Access denied")
     
@@ -228,11 +228,12 @@ async def add_department_endpoint(request: Request, data: dict):
         translation = data.get("translation", "")
         short = data.get("short", "")
         agency_system_id = data.get("agency_system_id")
+        dept_id = data.get("dept_id")
         
-        if not name or not agency_system_id:
-            raise HTTPException(status_code=400, detail="Department name and agency are required")
+        if not name or not translation or not short or not agency_system_id:
+            raise HTTPException(status_code=400, detail="Department name, Arabic translation, EMS ID, and agency are required")
         
-        success, message = await add_department(name, translation, short, agency_system_id)
+        success, message = await add_department(name, translation, short, agency_system_id, dept_id)
         
         if not success:
             return {"success": False, "error": message}

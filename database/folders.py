@@ -1,5 +1,6 @@
 from .connection import get_async_connection
 from .media import resolve_media_types_from_db
+from wsdl_client.config import SMART_EDMS_ROOT_ID
 import logging
 import oracledb
 
@@ -140,11 +141,12 @@ async def get_folder_children(folder_docnumber: str) -> list:
     finally:
         await conn.close()
 
-async def get_folder_files(folder_docnumber: str) -> list:
+async def get_folder_files(folder_docnumber: str, app_source: str = 'unknown') -> list:
     """
     Gets all files/documents in a given folder.
     folder_docnumber is the DOCNUMBER of the folder.
     Uses resolve_media_types_from_db for accurate media type detection.
+    When app_source is 'edms-media', only selects documents uploaded to edms-media (FORM=2740, RTA_TEXT1='edms-media').
 
     Note: PARENT column in FOLDER_ITEM contains the parent's DOCNUMBER, not SYSTEM_ID.
     """
@@ -156,13 +158,15 @@ async def get_folder_files(folder_docnumber: str) -> list:
         async with conn.cursor() as cursor:
             # Query files where PARENT = folder_docnumber
             # PARENT stores the DOCNUMBER of the parent folder
+            media_filter = "AND p.FORM = 2740 AND p.RTA_TEXT1 = 'edms-media'" if app_source == 'edms-media' else ""
             await cursor.execute(
-                """SELECT fi.SYSTEM_ID, fi.DOCNUMBER, fi.DISPLAYNAME, p.DOCNAME,
+                f"""SELECT fi.SYSTEM_ID, fi.DOCNUMBER, fi.DISPLAYNAME, p.DOCNAME,
                           (SELECT SUM(FILE_SIZE) FROM COMPONENTS c WHERE c.DOCNUMBER = fi.DOCNUMBER) as FILE_SIZE
                    FROM FOLDER_ITEM fi
                    LEFT JOIN PROFILE p ON fi.DOCNUMBER = p.DOCNUMBER
                    WHERE fi.PARENT = :parent_docnumber 
                    AND fi.NODE_TYPE = :node_type
+                   {media_filter}
                    ORDER BY NVL(fi.DISPLAYNAME, p.DOCNAME)""",
                 {'parent_docnumber': folder_docnumber, 'node_type': NODE_TYPE_DOCUMENT}
             )
@@ -367,10 +371,11 @@ async def get_folders_processing_summary_batch(folder_docnumbers: list) -> dict:
         await conn.close()
 
 
-async def get_folder_preview_ids(folder_docnumber: str, limit: int = 4) -> list:
+async def get_folder_preview_ids(folder_docnumber: str, limit: int = 4, app_source: str = 'unknown') -> list:
     """
     Gets up to `limit` document IDs from the folder that are images, videos, or PDFs
     to be used as folder thumbnail previews.
+    When app_source is 'edms-media', only selects documents uploaded to edms-media (FORM=2740, RTA_TEXT1='edms-media').
     """
     conn = await get_async_connection()
     if not conn:
@@ -381,13 +386,15 @@ async def get_folder_preview_ids(folder_docnumber: str, limit: int = 4) -> list:
             # Query files where PARENT = folder_docnumber and have correct extensions
             # DOSEXTENSION in PROFILE can be used, or just fetch all and resolve
             # We fetch up to a reasonable number to check extensions
-            query_sql = """
+            media_filter = "AND p.FORM = 2740 AND p.RTA_TEXT1 = 'edms-media'" if app_source == 'edms-media' else ""
+            query_sql = f"""
                 SELECT fi.DOCNUMBER, a.DEFAULT_EXTENSION, p.DOCNAME
                 FROM FOLDER_ITEM fi
                 LEFT JOIN PROFILE p ON fi.DOCNUMBER = p.DOCNUMBER
                 LEFT JOIN APPS a ON p.APPLICATION = a.SYSTEM_ID
                 WHERE fi.PARENT = :parent_docnumber 
                 AND fi.NODE_TYPE = :node_type
+                {media_filter}
                 ORDER BY fi.DOCNUMBER DESC
             """
             try:
@@ -397,13 +404,14 @@ async def get_folder_preview_ids(folder_docnumber: str, limit: int = 4) -> list:
                 )
             except oracledb.DatabaseError as db_err:
                 if 'ORA-00904' in str(db_err):
-                    fallback_sql = """
+                    fallback_sql = f"""
                         SELECT fi.DOCNUMBER, a.DEFAULT_EXTENSION, p.DOCNAME
                         FROM FOLDER_ITEM fi
                         LEFT JOIN PROFILE p ON fi.DOCNUMBER = p.DOCNUMBER
                         LEFT JOIN APPS a ON p.APPLICATION = a.APPLICATION
                         WHERE fi.PARENT = :parent_docnumber 
                         AND fi.NODE_TYPE = :node_type
+                        {media_filter}
                         ORDER BY fi.DOCNUMBER DESC
                     """
                     await cursor.execute(
@@ -671,3 +679,210 @@ async def _build_breadcrumb_path_fallback(root_folder_docnumber: str, current_fo
         current_docnumber = parent_docnumber
 
     return path if path else [{'id': root_folder_docnumber, 'name': 'Shared Folder'}]
+
+
+async def filter_edms_media_documents(doc_ids: list) -> set[str]:
+    """
+    Given a list of document IDs (DOCNUMBERs), queries Oracle DB PROFILE to
+    verify which ones were uploaded through the edms-media application to form 2740.
+    Returns a set of document ID strings that have FORM = 2740 and RTA_TEXT1 = 'edms-media'.
+    """
+    if not doc_ids:
+        return set()
+
+    # Normalize to unique non-empty numeric strings
+    valid_ids = list({str(d).strip() for d in doc_ids if str(d).strip().isdigit()})
+    if not valid_ids:
+        return set()
+
+    conn = await get_async_connection()
+    if not conn:
+        logging.error("Failed to get DB connection in filter_edms_media_documents.")
+        return set()
+
+    matched_ids = set()
+    CHUNK_SIZE = 900
+
+    try:
+        async with conn.cursor() as cursor:
+            for i in range(0, len(valid_ids), CHUNK_SIZE):
+                chunk = valid_ids[i:i + CHUNK_SIZE]
+                bind_params = {f"id_{idx}": int(doc_id) for idx, doc_id in enumerate(chunk)}
+                placeholders = ", ".join(f":id_{idx}" for idx in range(len(chunk)))
+                query = f"""
+                    SELECT p.DOCNUMBER
+                    FROM PROFILE p
+                    WHERE p.DOCNUMBER IN ({placeholders})
+                      AND p.FORM = 2740
+                      AND p.RTA_TEXT1 = 'edms-media'
+                """
+                await cursor.execute(query, bind_params)
+                rows = await cursor.fetchall()
+                for r in rows:
+                    if r and r[0]:
+                        matched_ids.add(str(r[0]))
+        return matched_ids
+    except Exception as e:
+        logging.error(f"Error filtering edms-media documents in filter_edms_media_documents: {e}")
+        return set()
+    finally:
+        if conn:
+            await conn.close()
+
+
+async def search_folders_by_name(search_term: str, app_source: str = 'unknown') -> list:
+    """
+    Searches for folders matching the search_term in FOLDER_ITEM.
+    Also finds folders corresponding to events matching the search_term in LKP_PHOTO_EVENT.
+    When app_source is 'edms-media', strictly scopes results to folders belonging to
+    edms-media (under SMART_EDMS_ROOT_ID, or containing edms-media documents/events).
+    Returns a list of dicts:
+        {
+            'id': str(docnumber),
+            'system_id': str(system_id),
+            'name': folder_name,
+            'type': 'folder',
+            'media_type': 'folder',
+            'is_standard': False,
+            'event_name': event_name (or None)
+        }
+    """
+    if not search_term or not search_term.strip():
+        return []
+
+    conn = await get_async_connection()
+    if not conn:
+        logging.error("Failed to get DB connection in search_folders_by_name.")
+        return []
+
+    term = f"%{search_term.strip().upper()}%"
+    folders = []
+    seen_docnumbers = set()
+
+    try:
+        async with conn.cursor() as cursor:
+            # 1. Search folders where DISPLAYNAME or DOCNAME matches,
+            # and detect if any match an event in LKP_PHOTO_EVENT.
+            # If app_source is 'edms-media', strictly scope to folders belonging to edms-media:
+            # - Descendant of SMART_EDMS_ROOT_ID
+            # - Or containing documents with FORM = 2740 and RTA_TEXT1 = 'edms-media'
+            # - Or matched with an event containing edms-media documents
+            scope_filter = ""
+            params = {'term': term}
+            if app_source == 'edms-media':
+                params['root_id'] = str(SMART_EDMS_ROOT_ID)
+                scope_filter = """
+                  AND (
+                      fi.DOCNUMBER IN (
+                          SELECT fi_tree.DOCNUMBER
+                          FROM FOLDER_ITEM fi_tree
+                          START WITH fi_tree.DOCNUMBER = :root_id
+                          CONNECT BY PRIOR fi_tree.DOCNUMBER = fi_tree.PARENT
+                      )
+                      OR EXISTS (
+                          SELECT 1 FROM FOLDER_ITEM fi_child
+                          JOIN PROFILE p_child ON fi_child.DOCNUMBER = p_child.DOCNUMBER
+                          WHERE fi_child.PARENT = fi.DOCNUMBER
+                            AND fi_child.NODE_TYPE = 'D'
+                            AND p_child.FORM = 2740
+                            AND p_child.RTA_TEXT1 = 'edms-media'
+                      )
+                      OR EXISTS (
+                          SELECT 1 FROM LKP_EVENT_DOC de_ev
+                          JOIN PROFILE p_ev ON de_ev.DOCNUMBER = p_ev.DOCNUMBER
+                          WHERE de_ev.EVENT_ID = e.SYSTEM_ID
+                            AND de_ev.DISABLED = '0'
+                            AND p_ev.FORM = 2740
+                            AND p_ev.RTA_TEXT1 = 'edms-media'
+                      )
+                  )
+                """
+
+            query = f"""
+                SELECT DISTINCT
+                    fi.DOCNUMBER,
+                    fi.SYSTEM_ID,
+                    NVL(fi.DISPLAYNAME, p.DOCNAME) AS FOLDER_NAME,
+                    e.EVENT_NAME
+                FROM FOLDER_ITEM fi
+                LEFT JOIN PROFILE p ON fi.DOCNUMBER = p.DOCNUMBER
+                LEFT JOIN LKP_PHOTO_EVENT e ON (
+                    UPPER(TRIM(NVL(fi.DISPLAYNAME, p.DOCNAME))) = UPPER(TRIM(e.EVENT_NAME))
+                    AND (e.DISABLED = '0' OR e.DISABLED IS NULL)
+                )
+                WHERE fi.NODE_TYPE = 'F'
+                  AND (
+                      UPPER(fi.DISPLAYNAME) LIKE :term
+                      OR UPPER(p.DOCNAME) LIKE :term
+                      OR (e.EVENT_NAME IS NOT NULL AND UPPER(e.EVENT_NAME) LIKE :term)
+                  )
+                  {scope_filter}
+                ORDER BY NVL(fi.DISPLAYNAME, p.DOCNAME)
+            """
+            await cursor.execute(query, params)
+            rows = await cursor.fetchall()
+            for row in rows:
+                docnumber, system_id, folder_name, event_name = row
+                if not docnumber or str(docnumber) in seen_docnumbers:
+                    continue
+                seen_docnumbers.add(str(docnumber))
+                folders.append({
+                    'id': str(docnumber),
+                    'system_id': str(system_id) if system_id else str(docnumber),
+                    'name': folder_name or f"Folder {docnumber}",
+                    'type': 'folder',
+                    'media_type': 'folder',
+                    'is_standard': False,
+                    'event_name': event_name or None
+                })
+
+            # 2. Also check if search_term matched events whose child documents belong to a folder
+            child_scope_filter = ""
+            if app_source == 'edms-media':
+                child_scope_filter = "AND p_doc.FORM = 2740 AND p_doc.RTA_TEXT1 = 'edms-media'"
+
+            child_query = f"""
+                SELECT DISTINCT
+                    fi_parent.DOCNUMBER,
+                    fi_parent.SYSTEM_ID,
+                    NVL(fi_parent.DISPLAYNAME, p_parent.DOCNAME) AS FOLDER_NAME,
+                    e.EVENT_NAME
+                FROM LKP_PHOTO_EVENT e
+                JOIN LKP_EVENT_DOC de ON e.SYSTEM_ID = de.EVENT_ID AND de.DISABLED = '0'
+                JOIN PROFILE p_doc ON de.DOCNUMBER = p_doc.DOCNUMBER {child_scope_filter}
+                JOIN FOLDER_ITEM fi_doc ON de.DOCNUMBER = fi_doc.DOCNUMBER AND fi_doc.NODE_TYPE = 'D'
+                JOIN FOLDER_ITEM fi_parent ON fi_doc.PARENT = fi_parent.DOCNUMBER AND fi_parent.NODE_TYPE = 'F'
+                LEFT JOIN PROFILE p_parent ON fi_parent.DOCNUMBER = p_parent.DOCNUMBER
+                WHERE (e.DISABLED = '0' OR e.DISABLED IS NULL)
+                  AND UPPER(e.EVENT_NAME) LIKE :term
+            """
+            await cursor.execute(child_query, term=term)
+            child_rows = await cursor.fetchall()
+            for row in child_rows:
+                docnumber, system_id, folder_name, event_name = row
+                if not docnumber:
+                    continue
+                doc_str = str(docnumber)
+                if doc_str in seen_docnumbers:
+                    for f in folders:
+                        if f['id'] == doc_str and not f.get('event_name'):
+                            f['event_name'] = event_name
+                    continue
+                seen_docnumbers.add(doc_str)
+                folders.append({
+                    'id': doc_str,
+                    'system_id': str(system_id) if system_id else doc_str,
+                    'name': folder_name or f"Folder {docnumber}",
+                    'type': 'folder',
+                    'media_type': 'folder',
+                    'is_standard': False,
+                    'event_name': event_name or None
+                })
+
+            return folders
+    except Exception as e:
+        logging.error(f"Error searching folders in search_folders_by_name: {e}", exc_info=True)
+        return []
+    finally:
+        if conn:
+            await conn.close()

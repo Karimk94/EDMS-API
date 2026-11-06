@@ -397,10 +397,13 @@ async def list_folder_contents(dst, parent_id=None, app_source=None, scope=None,
             logging.warning(f"Could not fetch groups for user {username}: {e}")
     user_groups_set = set(user_groups) if user_groups else set()
     
+    ADMIN_GROUPS = {'DOCS_SUPERVISORS', 'ADMINISTRATORS', 'ADMIN'}
+    is_admin_user = bool(user_groups_set & ADMIN_GROUPS)
+
     def user_has_permission(folder_id):
         """Check if user has permission to see this folder based on trustees."""
-        if not username:
-            return True  # No user filtering if username not provided
+        if not username or is_admin_user:
+            return True  # No user filtering if username not provided or user is admin/supervisor
 
         folder_id_str = str(folder_id)
         if folder_id_str in permission_cache:
@@ -430,6 +433,17 @@ async def list_folder_contents(dst, parent_id=None, app_source=None, scope=None,
             permission_cache[folder_id_str] = True
             return True  # On error, allow access
 
+    # --- Folder & Event database search for edms-media ---
+    db_folders = []
+    if search_term and app_source == 'edms-media':
+        try:
+            db_matching_folders = await db_connector.search_folders_by_name(search_term, app_source=app_source)
+            for f in db_matching_folders:
+                if user_has_permission(f['id']):
+                    db_folders.append(f)
+        except Exception as e:
+            logging.error(f"Error searching folders by name in db: {e}")
+
     # --- Event-based folder search for edms-media ---
     # When searching in folders scope with app_source='edms-media', also search LKP_PHOTO_EVENT
     event_folder_items = []
@@ -457,8 +471,26 @@ async def list_folder_contents(dst, parent_id=None, app_source=None, scope=None,
 
     if (scope == 'folders' and media_type) or search_term:
         start_node = target_id
-        regular_items = await get_recursive_doc_ids(dst, media_type_filter=media_type, search_term=search_term,
-                                           start_node=start_node, username=username, user_groups=user_groups)
+        regular_items = []
+        try:
+            regular_items = await get_recursive_doc_ids(dst, media_type_filter=media_type, search_term=search_term,
+                                               start_node=start_node, username=username, user_groups=user_groups)
+        except Exception as e:
+            logging.error(f"Error in get_recursive_doc_ids: {e}")
+            regular_items = []
+
+        # Scope search strictly to edms-media documents (FORM=2740, RTA_TEXT1='edms-media')
+        if app_source == 'edms-media' and regular_items:
+            file_ids = [item['id'] for item in regular_items if item.get('type') == 'file']
+            if file_ids:
+                try:
+                    valid_doc_ids = await db_connector.filter_edms_media_documents(file_ids)
+                    regular_items = [
+                        item for item in regular_items
+                        if item.get('type') != 'file' or item['id'] in valid_doc_ids
+                    ]
+                except Exception as fe:
+                    logging.error(f"Error filtering edms-media documents in search: {fe}")
         
         # Merge event-based items with regular items (only for edms-media)
         if app_source == 'edms-media' and event_folder_items:
@@ -487,25 +519,27 @@ async def list_folder_contents(dst, parent_id=None, app_source=None, scope=None,
                 if item['id'] in event_names_by_id and not item.get('event_name'):
                     item['event_name'] = event_names_by_id[item['id']]
         
-        return regular_items
+        # Combine folders from database with regular items (folders first, deduplicated)
+        combined_items = []
+        seen_ids = set()
+        for folder_item in db_folders:
+            f_id = str(folder_item['id'])
+            if f_id not in seen_ids:
+                seen_ids.add(f_id)
+                combined_items.append(folder_item)
+        for reg_item in regular_items:
+            r_id = str(reg_item['id'])
+            if r_id not in seen_ids:
+                seen_ids.add(r_id)
+                combined_items.append(reg_item)
+
+        return combined_items
 
     is_root_view = (target_id == SMART_EDMS_ROOT_ID)
     if is_root_view and not media_type and not search_term:
-        try:
-            # AWAIT HERE - pass username for permission-filtered counts
-            counts = await db_connector.get_media_type_counts(app_source, scope=scope, username=username)
-
-            def get_cnt(k):
-                return counts.get(k, 0) if counts else 0
-
-            items.append({'id': 'images', 'name': 'Images', 'type': 'folder', 'is_standard': True,
-                          'count': get_cnt('images')})
-            items.append({'id': 'videos', 'name': 'Videos', 'type': 'folder', 'is_standard': True,
-                          'count': get_cnt('videos')})
-            items.append(
-                {'id': 'files', 'name': 'Files', 'type': 'folder', 'is_standard': True, 'count': get_cnt('files')})
-        except Exception:
-            pass
+        items.append({'id': 'images', 'name': 'Images', 'type': 'folder', 'is_standard': True})
+        items.append({'id': 'videos', 'name': 'Videos', 'type': 'folder', 'is_standard': True})
+        items.append({'id': 'files', 'name': 'Files', 'type': 'folder', 'is_standard': True})
 
     try:
         search_client = get_soap_client('BasicHttpBinding_IDMSvc')
@@ -574,6 +608,19 @@ async def list_folder_contents(dst, parent_id=None, app_source=None, scope=None,
         logging.error(f"Error in SOAP call: {e}")
         return items
 
+    # For edms-media, ensure direct folder items only contain files uploaded through edms-media
+    if app_source == 'edms-media' and items:
+        file_ids = [item['id'] for item in items if item.get('type') == 'file']
+        if file_ids:
+            try:
+                valid_doc_ids = await db_connector.filter_edms_media_documents(file_ids)
+                items = [
+                    item for item in items
+                    if item.get('type') != 'file' or item['id'] in valid_doc_ids
+                ]
+            except Exception as fe:
+                logging.error(f"Error filtering edms-media documents in folder contents: {fe}")
+
     folder_docnumbers = []
     for item in items:
         if item.get('type') == 'folder' and item.get('id') and item['id'].isdigit():
@@ -641,49 +688,8 @@ async def list_folder_contents(dst, parent_id=None, app_source=None, scope=None,
     return items
 
 async def get_root_folder_counts(dst, username=None):
-    """
-    Counts documents by media type (images, videos, files) recursively from the root.
-    Only counts items in folders the user has permission to see.
-    """
-    try:
-        # Pass media_type_filter=None to get all docs, with username for permission filtering
-        items = await get_recursive_doc_ids(dst, media_type_filter=None, username=username)
-
-        counts = {'images': 0, 'videos': 0, 'files': 0}
-
-        image_exts = {'jpg', 'jpeg', 'png', 'gif', 'bmp', 'tif', 'tiff', 'webp'}
-        video_exts = {'mp4', 'mov', 'avi', 'wmv', 'mkv', 'flv', 'webm', '3gp'}
-        pdf_exts = {'pdf', 'doc', 'docx', 'txt', 'xls', 'xlsx', 'ppt', 'pptx', 'zip', 'rar', '7z', 'tar', 'gz'}
-
-        for item in items:
-            m_type = item.get('media_type', 'resolve')
-
-            if m_type == 'resolve':
-                item_name = item.get('name', '')
-                if '.' in item_name:
-                    ext = item_name.split('.')[-1].lower()
-                    if ext in image_exts:
-                        m_type = 'image'
-                    elif ext in video_exts:
-                        m_type = 'video'
-                    elif ext in pdf_exts:
-                        m_type = 'pdf'
-                    else:
-                        m_type = 'file'
-
-            # Count based on resolved type
-            if m_type == 'image':
-                counts['images'] += 1
-            elif m_type == 'video':
-                counts['videos'] += 1
-            else:
-                # Group pdf, file, text, excel, powerpoint, etc into 'files'
-                counts['files'] += 1
-
-        return counts
-    except Exception as e:
-        logging.error(f"Error in get_root_folder_counts: {e}")
-        return {'images': 0, 'videos': 0, 'files': 0}
+    """Media counts have been disabled."""
+    return {'images': 0, 'videos': 0, 'files': 0}
 
 async def delete_folder_contents(dst, folder_id, delete_root=True):
     """

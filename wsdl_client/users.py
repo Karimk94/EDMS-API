@@ -11,6 +11,37 @@ GROUPS_CACHE_TTL_SECONDS = int(os.getenv('GROUPS_CACHE_TTL_SECONDS', '180'))
 GROUPS_CACHE_MAX_ENTRIES = int(os.getenv('GROUPS_CACHE_MAX_ENTRIES', '1000'))
 _groups_for_user_cache = {}
 
+TRUSTEES_CACHE_TTL_SECONDS = int(os.getenv('TRUSTEES_CACHE_TTL_SECONDS', '180'))
+TRUSTEES_CACHE_MAX_ENTRIES = int(os.getenv('TRUSTEES_CACHE_MAX_ENTRIES', '2000'))
+_trustees_cache = {}
+
+
+def _get_cached_trustees(doc_id, library):
+    key = f"{library}:{doc_id}"
+    cached = _trustees_cache.get(key)
+    if not cached:
+        return None
+    if cached['expires_at'] <= time.time():
+        _trustees_cache.pop(key, None)
+        return None
+    return [dict(t) for t in cached['value']]
+
+
+def _set_cached_trustees(doc_id, library, trustees):
+    now = time.time()
+    if len(_trustees_cache) >= TRUSTEES_CACHE_MAX_ENTRIES:
+        expired_keys = [k for k, v in _trustees_cache.items() if v['expires_at'] <= now]
+        for k in expired_keys:
+            _trustees_cache.pop(k, None)
+        if len(_trustees_cache) >= TRUSTEES_CACHE_MAX_ENTRIES:
+            oldest = sorted(_trustees_cache.items(), key=lambda item: item[1]['expires_at'])[:50]
+            for k, _ in oldest:
+                _trustees_cache.pop(k, None)
+    _trustees_cache[f"{library}:{doc_id}"] = {
+        'expires_at': now + TRUSTEES_CACHE_TTL_SECONDS,
+        'value': [dict(t) for t in trustees]
+    }
+
 
 def _groups_cache_key(dst, username, library):
     return f"{dst}|{str(username).upper()}|{library}"
@@ -894,6 +925,10 @@ def set_trustees(dst, doc_id, library, trustees, security_enabled="1"):
         return False, str(e)
 
 def get_object_trustees(dst, doc_id, library='RTA_MAIN'):
+    cached = _get_cached_trustees(doc_id, library)
+    if cached is not None:
+        return cached
+
     try:
         svc_client = get_soap_client('BasicHttpBinding_IDMSvc')
         string_type = svc_client.get_type('{http://www.w3.org/2001/XMLSchema}string')
@@ -938,7 +973,9 @@ def get_object_trustees(dst, doc_id, library='RTA_MAIN'):
                         'flag': t_flags[i],
                         'rights': t_rights[i]
                     })
+                _set_cached_trustees(doc_id, library, trustees)
                 return trustees
+        _set_cached_trustees(doc_id, library, [])
         return []
     except Exception:
         return []

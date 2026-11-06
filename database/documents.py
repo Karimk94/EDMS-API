@@ -172,6 +172,7 @@ async def fetch_documents_from_oracle(page=1, page_size=20, search_term=None, da
         )
         if app_source == 'edms-media':
             where_clauses.append("p.RTA_TEXT1 = 'edms-media'")
+            where_clauses.append("p.FORM = 2740")
     else:
         if app_source == 'edms-media':
             if root_doc_ids and len(root_doc_ids) > 0:
@@ -181,6 +182,7 @@ async def fetch_documents_from_oracle(page=1, page_size=20, search_term=None, da
             else:
                 logging.warning(f"[edms-media recents] WSDL returned no IDs, falling back to RTA_TEXT1 filter only")
                 where_clauses.append("p.RTA_TEXT1 = 'edms-media'")
+            where_clauses.append("p.FORM = 2740")
         elif app_source == 'smart-edms':
             smart_edms_floor = 19662092
             where_clauses.append(f"p.DOCNUMBER >= {smart_edms_floor} AND (p.RTA_TEXT1 IS NULL OR p.RTA_TEXT1 != 'edms-media')")
@@ -1100,7 +1102,7 @@ async def check_processing_status(docnumbers):
             SELECT COLUMN_VALUE
             FROM TABLE(SYS.ODCINUMBERLIST({','.join(bind_names)})) input_docs
             WHERE input_docs.COLUMN_VALUE NOT IN (
-                SELECT docnumber FROM TAGGING_QUEUE WHERE docnumber IN ({','.join(bind_names)}) AND STATUS = 3
+                SELECT docnumber FROM TAGGING_QUEUE WHERE docnumber IN ({','.join(bind_names)}) AND (STATUS = 3 OR STATUS = 4 OR ATTEMPTS >= 3)
             )
             """
 

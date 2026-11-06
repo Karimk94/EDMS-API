@@ -211,14 +211,4 @@ async def get_media_counts(
         scope: Optional[str] = None,
         user=Depends(get_current_user)
 ):
-    try:
-        username = user.get('username')
-        
-        counts = await db_connector.get_media_type_counts(app_source=x_app_source, scope=scope, username=username)
-        if counts:
-            return counts
-        else:
-            return {"images": 0, "videos": 0, "files": 0}
-    except Exception as e:
-        logging.error(f"Error in /api/media_counts: {e}")
-        raise HTTPException(status_code=500, detail="Failed to fetch media counts.")
+    return {"images": 0, "videos": 0, "files": 0}

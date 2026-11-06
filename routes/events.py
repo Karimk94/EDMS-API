@@ -15,8 +15,9 @@ async def get_events_route(
         search: Optional[str] = None,
         fetch_all: bool = False
 ):
-    if page < 1: page = 1
-    if pageSize > 100: pageSize = 100
+    if not fetch_all:
+        if page < 1: page = 1
+        if pageSize > 100: pageSize = 100
 
     events_list, total_rows = await db_connector.get_events(
         page=page,
@@ -25,8 +26,8 @@ async def get_events_route(
         fetch_all=fetch_all
     )
 
-    total_pages = (total_rows + pageSize - 1) // pageSize if total_rows > 0 else 1
-    has_more = (page * pageSize) < total_rows
+    total_pages = 1 if fetch_all else ((total_rows + pageSize - 1) // pageSize if total_rows > 0 else 1)
+    has_more = False if fetch_all else ((page * pageSize) < total_rows)
 
     return {
         "events": events_list,

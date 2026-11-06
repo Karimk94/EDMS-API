@@ -407,7 +407,7 @@ async def update_section(system_id: str, name: str, translation: str, disabled: 
 # --- DEPARTMENTS ---
 
 async def get_departments(name: str = "", agency_id: int = None, page: int = 1, per_page: int = 10, fetch_all: bool = False):
-    """Get departments from LKP_DEPT with pagination and search. By default only returns items from the last 2 days unless fetch_all=True."""
+    """Get departments from LKP_DEPT with pagination and search. Joins with LKP_ORG_AGENCY to get agency name."""
     conn = await get_async_connection()
     if not conn:
         return {"departments": [], "total_records": 0, "total_pages": 0, "current_page": 1, "per_page": per_page}
@@ -421,17 +421,21 @@ async def get_departments(name: str = "", agency_id: int = None, page: int = 1, 
             params = {}
             
             if name.strip():
-                search_condition += " AND (UPPER(NAME) LIKE UPPER(:name) OR UPPER(SHORT) LIKE UPPER(:name) OR UPPER(TRANSLATION) LIKE UPPER(:name))"
-                params['name'] = f"%{name}%"
+                search_condition += " AND (UPPER(d.NAME) LIKE UPPER(:name) OR UPPER(d.SHORT) LIKE UPPER(:name) OR UPPER(d.TRANSLATION) LIKE UPPER(:name) OR UPPER(d.DEPTID) LIKE UPPER(:name))"
+                params['name'] = f"%{name.strip()}%"
             elif not fetch_all:
-                search_condition += " AND LAST_UPDATE >= SYSDATE - 2"
+                search_condition += " AND d.LAST_UPDATE >= SYSDATE - 2"
             
             if agency_id is not None:
-                search_condition += " AND AGENCYID = :agency_id"
+                search_condition += " AND d.AGENCYID = :agency_id"
                 params['agency_id'] = agency_id
             
             # Count total
-            count_query = f"SELECT COUNT(*) FROM LKP_DEPT WHERE DISABLED = 'N' {search_condition}"
+            count_query = f"""
+                SELECT COUNT(*) 
+                FROM LKP_DEPT d
+                WHERE d.DISABLED = 'N' {search_condition}
+            """
             await cursor.execute(count_query, params)
             count_result = await cursor.fetchone()
             total = count_result[0] if count_result else 0
@@ -439,20 +443,23 @@ async def get_departments(name: str = "", agency_id: int = None, page: int = 1, 
             # Calculate offset
             offset = (page - 1) * per_page
             
-            # Fetch paginated results
+            # Fetch paginated results with LEFT JOIN to LKP_ORG_AGENCY
             data_query = f"""
                 SELECT * FROM (
                     SELECT 
-                        DEPTID,
-                        NAME,
-                        SHORT,
-                        DISABLED,
-                        LAST_UPDATE,
-                        AGENCYID,
-                        SYSTEM_ID,
-                        ROW_NUMBER() OVER (ORDER BY NAME) as rn
-                    FROM LKP_DEPT
-                    WHERE DISABLED = 'N' {search_condition}
+                        d.DEPTID,
+                        d.NAME,
+                        d.TRANSLATION,
+                        d.SHORT,
+                        d.DISABLED,
+                        d.LAST_UPDATE,
+                        d.AGENCYID,
+                        d.SYSTEM_ID,
+                        a.NAME AS AGENCY_NAME,
+                        ROW_NUMBER() OVER (ORDER BY d.NAME) as rn
+                    FROM LKP_DEPT d
+                    LEFT JOIN LKP_ORG_AGENCY a ON d.AGENCYID = a.SYSTEM_ID
+                    WHERE d.DISABLED = 'N' {search_condition}
                 )
                 WHERE rn > :offset AND rn <= :end_row
             """
@@ -466,11 +473,13 @@ async def get_departments(name: str = "", agency_id: int = None, page: int = 1, 
                 departments.append({
                     'DEPTID': row[0],
                     'NAME': row[1],
-                    'SHORT': row[2],
-                    'DISABLED': row[3],
-                    'LAST_UPDATE': row[4],
-                    'AGENCYID': row[5],
-                    'SYSTEM_ID': row[6]
+                    'TRANSLATION': row[2],
+                    'SHORT': row[3],
+                    'DISABLED': row[4],
+                    'LAST_UPDATE': row[5],
+                    'AGENCYID': row[6],
+                    'SYSTEM_ID': row[7],
+                    'AGENCY_NAME': row[8] or ""
                 })
     except oracledb.Error as ex:
         error, = ex.args
@@ -535,70 +544,250 @@ async def is_department_short_duplicate(short: str) -> bool:
             await conn.close()
 
 
-async def add_department(name: str, translation: str, short: str, agency_system_id: int):
-    """Add a new department to LKP_DEPT. Checks for duplicate name and SHORT first."""
+async def is_department_deptid_duplicate(deptid: str) -> bool:
+    """Check if a DEPTID already exists in LKP_DEPT."""
+    conn = await get_async_connection()
+    if not conn:
+        return False
+    
+    try:
+        async with conn.cursor() as cursor:
+            await cursor.execute(
+                "SELECT COUNT(*) FROM LKP_DEPT WHERE UPPER(DEPTID) = UPPER(:deptid)",
+                deptid=deptid
+            )
+            result = await cursor.fetchone()
+            return result[0] > 0
+    except oracledb.Error as ex:
+        error, = ex.args
+        logging.error(f"Error checking duplicate department DEPTID: {error.message}")
+        return False
+    finally:
+        if conn:
+            await conn.close()
+
+
+async def add_department(name: str, translation: str, short: str, agency_system_id: int, dept_id: str = None):
+    """
+    Add a new department to LKP_DEPT, along with:
+    1. A security group in "GROUPS" named EMS_DPT_{SHORT}
+    2. A default child section in LKP_SECTION named "N/A" (referencing department SYSTEM_ID)
+    
+    All operations are committed in a single atomic database transaction.
+    """
+    name = (name or "").strip()
+    translation = (translation or "").strip()
+    short = (short or "").strip().upper()
+    dept_id = (dept_id or "").strip().upper() if dept_id else None
+
+    if not name:
+        return False, "Department name is required"
+    if not translation:
+        return False, "Arabic name / translation is required"
+    if not short:
+        return False, "EMS Department ID is required"
+    if len(short) > 5:
+        return False, "EMS Department ID cannot exceed 5 characters"
+    if dept_id and len(dept_id) > 5:
+        return False, "Department ID cannot exceed 5 characters"
+    if not agency_system_id:
+        return False, "Agency is required"
+
     # Check for duplicate name
     if await is_department_name_duplicate(name):
         return False, f'Department name "{name}" already exists. Please choose a different name.'
     
     # Check for duplicate SHORT (EMS Department ID)
-    if short and await is_department_short_duplicate(short):
+    if await is_department_short_duplicate(short):
         return False, f'EMS Department ID "{short}" already exists. Please choose a different ID.'
     
+    # Check if custom dept_id is supplied and duplicate
+    if dept_id and await is_department_deptid_duplicate(dept_id):
+        return False, f'Department ID "{dept_id}" already exists. Please choose a different ID.'
+
     conn = await get_async_connection()
     if not conn:
         return False, "Failed to connect to database"
 
     try:
-        # Generate new DEPTID (alphanumeric like D0001)
-        new_deptid = await get_next_deptid()
-        if not new_deptid:
-            return False, "Failed to generate DEPTID"
-        
-        # Note: AGENCYID is used as SYSTEM_ID in LKP_DEPT (as per legacy code)
-        # The SHORT column has a max of 5 characters (validated in frontend)
-        
+        # Generate new DEPTID if not provided
+        if not dept_id:
+            dept_id = await get_next_deptid()
+            if not dept_id:
+                return False, "Failed to generate DEPTID"
+
+        # Generate new SYSTEM_ID from sequence for department
+        dept_system_id = await get_next_system_id_sequence()
+        if dept_system_id is None:
+            return False, "Failed to generate department SYSTEM_ID"
+
+        # Generate new SYSTEM_ID from sequence for security group
+        group_system_id = await get_next_system_id_sequence()
+        if group_system_id is None:
+            return False, "Failed to generate group SYSTEM_ID"
+
+        # Generate new SYSTEM_ID from sequence for child N/A section
+        sec_system_id = await get_next_system_id_sequence()
+        if sec_system_id is None:
+            return False, "Failed to generate section SYSTEM_ID"
+
+        group_id_name = f"EMS_DPT_{short}"
+
         async with conn.cursor() as cursor:
-            # Final existence check within the same connection to prevent race conditions
+            # 1. Final existence check for DEPTID in LKP_DEPT within same connection
             await cursor.execute(
-                "SELECT COUNT(*) FROM LKP_DEPT WHERE DEPTID = :deptid",
-                deptid=new_deptid
+                "SELECT COUNT(*) FROM LKP_DEPT WHERE UPPER(DEPTID) = UPPER(:deptid)",
+                deptid=dept_id
             )
             count_result = await cursor.fetchone()
-            if count_result[0] > 0:
-                return False, f'DEPTID "{new_deptid}" already exists in LKP_DEPT. Please try again.'
+            if count_result and count_result[0] > 0:
+                return False, f'DEPTID "{dept_id}" already exists in LKP_DEPT. Please try again.'
             
-            query = """
-                INSERT INTO LKP_DEPT (DEPTID, NAME, TRANSLATION, SHORT, DISABLED, AGENCYID, LAST_UPDATE)
-                VALUES (:deptid, :name, :translation, :short, 'N', :agency_system_id, SYSDATE)
+            # 2. Insert into LKP_DEPT (AGENCYID = agency_system_id, SYSTEM_ID = dept_system_id)
+            dept_insert_query = """
+                INSERT INTO LKP_DEPT (
+                    DEPTID, NAME, TRANSLATION, DISABLED, AGENCYID, SYSTEM_ID, SHORT, LAST_UPDATE
+                ) VALUES (
+                    :deptid, :name, :translation, 'N', :agency_system_id, :dept_system_id, :short, SYSDATE
+                )
             """
             await cursor.execute(
-                query,
-                deptid=new_deptid,
+                dept_insert_query,
+                deptid=dept_id,
                 name=name,
                 translation=translation,
-                short=short,
-                agency_system_id=agency_system_id
+                agency_system_id=agency_system_id,
+                dept_system_id=dept_system_id,
+                short=short
             )
+
+            # 3. Insert Security Group into "GROUPS"
+            groups_insert_query = """
+                INSERT INTO "GROUPS" (
+                    FORCE_CHECKIN, MBL_EDITCOPY, MBL_OVERWRITE, AUTOCLEAN, SHADOW_DOCS, SHADOW_PROFILES, 
+                    SHADOW_SEC_DOCS, DISABLE_NATIVE, MAKE_READ_ONLY, REMOVE_READ_ONLY, MAKE_VER_READONLY, 
+                    MAKE_VER_WRITABLE, PUBLISH_VERSION, UNPUBLISH_VERSION, DATE_FORMAT, TIME_FORMAT, 
+                    DEFAULT_VIEWER, MANAGE_PRF, MANAGE_CYD, ALLOW_APPINT, ALLOW_USRSETTINGS, ALLOW_DOC_CREATE, 
+                    CREATE_FOLDER, ROOT_FOLDER, CREATE_RELATION, SHOW_RELATED, REMOVE_RELATION, ALLOW_NOTIF, 
+                    ALLOW_PREVIEW, WARN_UPDATE_AVAIL, ENABLE_WORKSPACE, GROUP_ID, NETWORK_ID, GROUP_NAME, 
+                    DISABLED, ALLOW_LOGIN, DELETE_VERSIONS, EDIT_PREVIOUS_VER, NEW_VERSIONS, SAVE_TO_REM_LIB, 
+                    PRECONNECT_LIBS, NV_AUTHOR_EDIT, NV_ENTERED_BY, NV_BILLABLE, DISPLAY_VER_LIST, 
+                    MV_DOCS_IF_CHNG, CHECKOUT, OTHER_CHECKIN, CHECKIN_REMINDER, RESET_STATUS, COPY_IN_USE, 
+                    TEMPLATE_MANAGER, MASS_UPD_PROFILES, AUTO_LOGIN, VIEW_UNSECURED, PROMPT_PAGES, 
+                    NONBILL_PAGES, GET_EDIT_INFO, VISIT_AUTHOR_EDIT, VISIT_ENTERED_BY, LCP_RUN, EDIT_VTS, 
+                    EDIT_LIBPARMS, EDIT_WS_PARAMS, EDIT_USER_DEFAULTS, MANAGE_GROUPS, DI_RUN, MBLINST_RUN, 
+                    DI_MANAGE, CR_RUN, SM_RUN, DD_RUN, DB_EDIT, DBI_RUN, INDEXER_RUN, INTERCHANGE_RUN, 
+                    PROFSEC, ALLOW_DOC_DELETE, ALLOW_CONTENT_DEL, ALLOW_QUEUE_DEL, ACL_DEFAULTS, 
+                    REMOVE_MON_LIST, DISPLAY_MON_LIST, WARN_SECURE, ONLY_READONLY, MIN_DISKFREE, 
+                    DEF_SHAD_RETENTION, DEFAULT_FT_INDEX, ITEM_MAX, PAGE_MAX, DPACKAGE, PROFILE_FORM, 
+                    SYSTEM_ID, UNIV_ACCESS, MAX_VERSIONS, MAX_SUBVERSIONS, DEFAULT_PAGES, HITLIST_FORM, 
+                    LAST_UPDATE, PROFILE_DEFAULTS, DECLARE_RECORD, UNDECLARE_RECORD, SU_CHNGE_PROF_EDIT, 
+                    SU_CHNGE_PROF_SAVE, SU_SHOW_SEC_PANEL, SU_SHOW_LEFT_PANE, SU_USE_MODERN, SU_CHANGE_STYLE, 
+                    SU_RECENT_COUNT, SU_USE_LAST_LOC, SU_BROWSE_TO_LOC, MANAGE_LOOKUP_SEC
+                ) VALUES (
+                    'D','D','D','D','D','D',
+                    'D','D','D','D','D',
+                    'D','D','D','D/M/Y','H:M',
+                    'FULVIEW','D','D','D','D','D',
+                    'D','D','D','D','D','D',
+                    'D','D','D',:group_id,NULL,:group_name,
+                    'N','D','D','D','D','D',
+                    'D','D','D','D','D',
+                    'D','D','D','D','D','D',
+                    'D','D','D','D','D',
+                    NULL,'D','D','D','D','D',
+                    NULL,NULL,'D','D','D','D',
+                    'D','D','D','D','D','D','D','D',
+                    'D',NULL,'D','D','D',
+                    'D','D','D','D',5,
+                    30,0,25,20,NULL,0,
+                    :group_system_id,0,99,0,0,0,
+                    SYSDATE,NULL,'D','D','D',
+                    'D','D','D','D','D',
+                    10,'D','D',NULL
+                )
+            """
+            await cursor.execute(
+                groups_insert_query,
+                group_id=group_id_name,
+                group_name=group_id_name,
+                group_system_id=group_system_id
+            )
+
+            # 4. Determine SECID for child "N/A" section
+            # Check if dept_id is available as SECID in LKP_SECTION
+            await cursor.execute(
+                "SELECT COUNT(*) FROM LKP_SECTION WHERE UPPER(SECID) = UPPER(:secid)",
+                secid=dept_id
+            )
+            sec_res = await cursor.fetchone()
+            if sec_res and sec_res[0] == 0:
+                na_secid = dept_id
+            else:
+                na_secid = await get_next_secid()
+                if not na_secid:
+                    na_secid = dept_id
+
+            # 5. Insert child "N/A" section into LKP_SECTION (DEPTID = dept_system_id)
+            section_insert_query = """
+                INSERT INTO LKP_SECTION (
+                    SECID, SYSTEM_ID, DISABLED, NAME, TRANSLATION, DEPTID, LAST_UPDATE
+                ) VALUES (
+                    :secid, :system_id, 'N', 'N/A', 'N/A', :parent_dept_system_id, SYSDATE
+                )
+            """
+            await cursor.execute(
+                section_insert_query,
+                secid=na_secid,
+                system_id=sec_system_id,
+                parent_dept_system_id=dept_system_id
+            )
+
+            # Commit the atomic transaction
             await conn.commit()
-            return True, f"Department created with ID {new_deptid}"
+            return True, f"Department created with ID {dept_id}"
+
     except oracledb.Error as ex:
+        if conn:
+            await conn.rollback()
         error, = ex.args
         logging.error(f"Error adding department: {error.message}")
         return False, str(error.message)
+    except Exception as e:
+        if conn:
+            await conn.rollback()
+        logging.error(f"Unexpected error adding department: {str(e)}")
+        return False, str(e)
     finally:
         if conn:
             await conn.close()
 
 
 async def update_department(system_id: int, name: str, translation: str):
-    """Update an existing department in LKP_DEPT by SYSTEM_ID."""
+    """Update an existing department in LKP_DEPT by SYSTEM_ID. Only name and translation can be updated."""
+    name = (name or "").strip()
+    translation = (translation or "").strip()
+    if not name:
+        return False, "Department name is required"
+    if not translation:
+        return False, "Arabic name / translation is required"
+
     conn = await get_async_connection()
     if not conn:
         return False, "Failed to connect to database"
 
     try:
         async with conn.cursor() as cursor:
+            # Check if new name already exists on another department
+            await cursor.execute(
+                "SELECT COUNT(*) FROM LKP_DEPT WHERE UPPER(NAME) = UPPER(:name) AND SYSTEM_ID != :system_id",
+                name=name,
+                system_id=system_id
+            )
+            dup_result = await cursor.fetchone()
+            if dup_result and dup_result[0] > 0:
+                return False, f'Department name "{name}" is already used by another department.'
+
             query = """
                 UPDATE LKP_DEPT
                 SET NAME = :name, TRANSLATION = :translation, LAST_UPDATE = SYSDATE
